@@ -2,7 +2,8 @@
  * ESM module -- dynamic-imported via chrome.runtime.getURL('ui/drawer.js').
  *
  * export function initDrawer(callbacks) -> controller
- *   callbacks = { onScanAll(), onRowClick(w2w_id), onConnectCalendar() }
+ *   callbacks = { onScanAll(), onRowClick(w2w_id), onConnectCalendar(),
+ *                 onOpenSetup() }
  *   controller.update(state) fully rerenders the drawer from `state`.
  *
  * Mounting: a single fixed-position host <div> is appended to
@@ -148,6 +149,35 @@ function statsHtml(stats) {
   </div>`;
 }
 
+/**
+ * The stats strip in the de-confidence (no-calendar-blocks) state. Only the
+ * first tile carries a real number — OPEN, the count of open shifts. The other
+ * three are dashed and muted on purpose: without a blocking calendar there is
+ * no honest BLOCKED / BEST / ≥47H to report, so we show "—" rather than a
+ * number that looks like a real ranking. (REJECTED's own header count can still
+ * be non-zero here — those rejects come from the user's own W2W schedule, not a
+ * calendar — so it too is muted below.)
+ */
+function mutedStatsHtml(openCount) {
+  return `<div class="stats">
+    <div class="stat-tile stat-open"><b>${escapeHtml(openCount)}</b><span>OPEN</span></div>
+    <div class="stat-tile stat-muted"><b>—</b><span>BLOCKED</span></div>
+    <div class="stat-tile stat-muted"><b>—</b><span>BEST</span></div>
+    <div class="stat-tile stat-muted"><b>—</b><span>≥47H</span></div>
+  </div>`;
+}
+
+/** The red "we are not checking your calendar" block, shown above the stats
+ * whenever the drawer is connected but no calendar is set to block. Its CTA
+ * shares the gear's data-action so both routes reach onOpenSetup(). */
+function deconfidenceBannerHtml() {
+  return `<div class="deconf-banner">
+    <div class="deconf-head">Not checking your calendar</div>
+    <div class="deconf-body">No calendar is set to block, so these are all open shifts — not shifts you're free for. Some may overlap what you already have.</div>
+    <button type="button" class="deconf-cta" data-action="open-setup">Set up calendars →</button>
+  </div>`;
+}
+
 function filterRowHtml(filterTour) {
   const btn = (val, label) =>
     `<button type="button" class="filter-btn${filterTour === val ? " active" : ""}" data-action="filter" data-tour="${val}">${label}</button>`;
@@ -171,7 +201,7 @@ function checkboxHtml(x, checked) {
   return `<input type="checkbox" class="row-check" data-action="toggle-select" data-id="${escapeHtml(x.w2w_id)}" aria-label="Select ${escapeHtml(x.dateLabel)} ${escapeHtml(x.tour)} ${escapeHtml(x.pos)}"${checked ? " checked" : ""}>`;
 }
 
-function rowHtml(row, checked) {
+function rowHtml(row, checked, muted) {
   const tk = tourKey(row.tour);
   const pill = TOUR_PILL[tk];
   const tourPill = pillHtml(String(row.tour || "").toUpperCase(), pill.bg, pill.color, `pill-${tk}`);
@@ -179,6 +209,21 @@ function rowHtml(row, checked) {
   const line2 = (row.famLabels && row.famLabels.length)
     ? `<span class="fam-line">${escapeHtml(row.famLabels.join(" · "))}</span>`
     : `<span class="loc-line">${escapeHtml(row.locLine)}</span>`;
+  if (muted) {
+    // De-confidence variant: no rank number (a muted bullet), no tier color, a
+    // muted "?" where the score would be, and a "· not checked" tail. The point
+    // is that NOTHING in the row looks like a real ranking, because it isn't
+    // one — no calendar was consulted.
+    return `<div class="row row-muted" data-action="row-click" data-id="${escapeHtml(row.w2w_id)}" role="button" tabindex="0">
+    ${checkboxHtml(row, checked)}
+    <div class="row-rank row-rank-muted">•</div>
+    <div class="row-mid">
+      <div class="row-line1">${boldDayNumber(row.dateLabel)} ${tourPill} <span class="row-pos">${escapeHtml(row.pos)}</span>${newPill}</div>
+      <div class="row-line2">${line2} · <span class="not-checked">not checked</span></div>
+    </div>
+    <div class="row-score row-score-muted">?</div>
+  </div>`;
+  }
   const tierColor = TIER_COLOR[row.tier] || TIER_COLOR.t3;
   const rowClass = row.tier === "t3" ? "row row-dim" : "row";
   return `<div class="${rowClass}" data-action="row-click" data-id="${escapeHtml(row.w2w_id)}" role="button" tabindex="0">
@@ -192,11 +237,12 @@ function rowHtml(row, checked) {
   </div>`;
 }
 
-function rejectHtml(reject, checked) {
+function rejectHtml(reject, checked, muted) {
   const tk = tourKey(reject.tour);
   const pill = TOUR_PILL[tk];
   const tourPill = pillHtml(String(reject.tour || "").toUpperCase(), pill.bg, pill.color, `pill-${tk}`);
-  return `<div class="reject-row">
+  const rowClass = muted ? "reject-row reject-row-muted" : "reject-row";
+  return `<div class="${rowClass}">
     ${checkboxHtml(reject, checked)}
     <div class="reject-mid">
       <div class="reject-line1">${escapeHtml(reject.dateLabel)} ${tourPill} <span class="reject-pos">${escapeHtml(reject.pos)}</span> — <span class="reject-reason">${escapeHtml(reject.reason)}</span></div>
@@ -262,7 +308,7 @@ function collapsedTabHtml() {
 }
 
 /**
- * @param {{onScanAll?:Function, onRowClick?:Function, onConnectCalendar?:Function}} callbacks
+ * @param {{onScanAll?:Function, onRowClick?:Function, onConnectCalendar?:Function, onOpenSetup?:Function}} callbacks
  */
 export function initDrawer(callbacks) {
   const cb = callbacks || {};
@@ -382,8 +428,21 @@ export function initDrawer(callbacks) {
 
     // STATE 1: the normal list view, plus the compose bar when >=1 shift
     // is selected.
+    //
+    // The de-confidence ("muted") pass fires when the drawer is CONNECTED but
+    // no calendar is set to block. Precedence: an auth error wins — when
+    // calError === "auth_required" the status line already shows CONNECT
+    // GOOGLE, and "connect" comes before "set up", so the muted state stays
+    // off. Only connected-but-unconfigured shows it. When anyCalendarBlocks is
+    // true, EVERYTHING below renders exactly as it did before this state
+    // existed (muted stays false end to end).
+    const muted = !state.anyCalendarBlocks && state.calError !== "auth_required";
+
     let html = headerHtml();
-    html += `<div class="status-line">${escapeHtml(state.monthLabel)} · CAL ${calSegmentHtml(state)} · MYSCHED ${myschedHtml(state.myschedStatus)}</div>`;
+    // Gear, always present, at the end of the status line. It pulses amber
+    // (gear-attention) whenever nothing is set to block, calm otherwise.
+    const gearClass = state.anyCalendarBlocks ? "gear-btn" : "gear-btn gear-attention";
+    html += `<div class="status-line">${escapeHtml(state.monthLabel)} · CAL ${calSegmentHtml(state)} · MYSCHED ${myschedHtml(state.myschedStatus)}<button type="button" class="${gearClass}" data-action="open-setup" title="Calendar setup" aria-label="Calendar setup">⚙</button></div>`;
 
     const banner = state.banner;
     const bannerHasContent = banner && (
@@ -393,14 +452,18 @@ export function initDrawer(callbacks) {
     );
     if (bannerHasContent) html += bannerHtml(banner);
 
-    html += statsHtml(state.stats || { elig: 0, rej: 0, best: null, topCount: 0 });
+    if (muted) html += deconfidenceBannerHtml();
+
+    html += muted
+      ? mutedStatsHtml(state.rows ? state.rows.length : 0)
+      : statsHtml(state.stats || { elig: 0, rej: 0, best: null, topCount: 0 });
     html += filterRowHtml(filterTour);
     html += filterUnitRowHtml(filterUnit, unitOptions(state));
 
     const rows = applyUnitFilter(applyTourFilter(state.rows));
     html += `<div class="rows-scroll">${
       rows.length
-        ? rows.map((row) => rowHtml(row, selected.has(row.w2w_id))).join("")
+        ? rows.map((row) => rowHtml(row, selected.has(row.w2w_id), muted)).join("")
         : '<div class="empty-msg">No eligible shifts this window.</div>'
     }</div>`;
 
@@ -412,7 +475,7 @@ export function initDrawer(callbacks) {
       </div>
       ${rejectedExpanded ? `<div class="rejected-list">${
         rejects.length
-          ? rejects.map((reject) => rejectHtml(reject, selected.has(reject.w2w_id))).join("")
+          ? rejects.map((reject) => rejectHtml(reject, selected.has(reject.w2w_id), muted)).join("")
           : '<div class="empty-msg">No rejected shifts.</div>'
       }</div>` : ""}
     </div>`;
@@ -435,6 +498,8 @@ export function initDrawer(callbacks) {
       render();
     } else if (action === "connect-calendar") {
       cb.onConnectCalendar && cb.onConnectCalendar();
+    } else if (action === "open-setup") {
+      cb.onOpenSetup && cb.onOpenSetup();
     } else if (action === "filter") {
       filterTour = target.dataset.tour;
       render();

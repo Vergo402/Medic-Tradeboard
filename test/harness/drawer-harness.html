@@ -10,6 +10,7 @@
 <p>Offline fidelity harness for the compose-text drawer. No W2W, no network, no extension APIs beyond a getURL shim.</p>
 <button id="tick">simulate scan tick x5</button>
 <button id="swap">swap board (drop Jul 27)</button>
+<button id="blocks">toggle calendar-blocks (de-confidence state)</button>
 <h2>Expected message for Jul 23 + Jul 27</h2>
 <pre id="expected"></pre>
 
@@ -48,6 +49,11 @@
       reason: "no full open tour in gap" },
   ];
 
+  // Toggled by the "toggle calendar-blocks" button so both drawer states can be
+  // eyeballed offline: true = the normal ranked view, false = the de-confidence
+  // ("not checking your calendar") view with the amber gear.
+  let anyCalendarBlocks = true;
+
   function state(extra) {
     return Object.assign({
       monthLabel: "JUL 2026",
@@ -59,6 +65,7 @@
       rows,
       rejects,
       scanning: null,
+      anyCalendarBlocks,
     }, extra || {});
   }
 
@@ -66,6 +73,7 @@
     onScanAll: () => console.log("[harness] onScanAll"),
     onRowClick: (id) => console.log("[harness] onRowClick", id),
     onConnectCalendar: () => console.log("[harness] onConnectCalendar"),
+    onOpenSetup: () => console.log("[harness] onOpenSetup"),
   });
   controller.update(state());
   window.__ctl = controller;
@@ -87,5 +95,11 @@
   document.getElementById("swap").onclick = () => {
     controller.update(state({ rows: rows.filter((r) => r.w2w_id !== "id-jul27") }));
     console.log("[harness] board swapped — id-jul27 removed");
+  };
+
+  document.getElementById("blocks").onclick = () => {
+    anyCalendarBlocks = !anyCalendarBlocks;
+    controller.update(state());
+    console.log("[harness] anyCalendarBlocks =", anyCalendarBlocks);
   };
 </script>

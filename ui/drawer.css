@@ -647,3 +647,115 @@
   color: var(--dim);
   padding: 0 12px 12px;
 }
+
+/* ---------- 10. Calendar-setup gear + de-confidence state ---------- */
+
+/* Gear ported verbatim from the reverted per-calendar-role commit (49dee18);
+   only the amber-attention modifier below is new. */
+.gear-btn {
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.gear-btn:hover {
+  color: var(--ink);
+}
+
+/* Nothing is set to block: pull the eye to the gear so the fix is one click
+   away. A gentle opacity pulse, disabled for reduced-motion users. */
+.gear-attention {
+  color: var(--amber);
+  animation: gear-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes gear-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gear-attention { animation: none; }
+}
+
+.deconf-banner {
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  background: rgba(255, 93, 71, 0.1);
+  border: 1px solid var(--red);
+  border-left: 3px solid var(--red);
+  flex: 0 0 auto;
+}
+
+.deconf-head {
+  font-family: var(--font-head);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 12px;
+  color: var(--red);
+  margin-bottom: 4px;
+}
+
+.deconf-body {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+
+.deconf-cta {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--red);
+  color: #1a0705;
+  border: 1px solid var(--red);
+  border-radius: 2px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.deconf-cta:hover {
+  opacity: 0.9;
+}
+
+/* Muted stats: the OPEN tile stays legible (neutral top border), the three
+   dashed placeholders read as "not a real number". */
+.stat-tile.stat-open {
+  border-top-color: var(--dim);
+}
+
+.stat-tile.stat-muted {
+  border-top-color: var(--line);
+  opacity: 0.5;
+}
+
+/* Muted rows: bullet instead of a rank, "?" instead of a score, no tier
+   color — nothing that reads like a ranking. */
+.row-rank-muted {
+  color: var(--dim);
+}
+
+.row-score-muted {
+  color: var(--dim);
+}
+
+.row-line2 .not-checked {
+  color: var(--dim);
+  font-style: italic;
+}
+
+.reject-row-muted {
+  opacity: 0.6;
+}
+
+.reject-row-muted .reject-reason {
+  color: var(--dim);
+}

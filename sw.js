@@ -1149,6 +1149,23 @@ async function handleSetBlockTitles(msg) {
   return { ok: true };
 }
 
+/**
+ * Open the extension's own options page.
+ *
+ * This lives in the service worker because chrome.runtime.openOptionsPage() is
+ * ONLY callable from an extension context (worker/popup/options), never from a
+ * content script — the drawer's gear sends { type:"openOptions" } and the
+ * worker does the opening on its behalf.
+ */
+async function handleOpenOptions() {
+  try {
+    await chrome.runtime.openOptionsPage();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) ? e.message : String(e) };
+  }
+}
+
 const HANDLERS = {
   getCalendarData: handleGetCalendarData,
   listCalendars: handleListCalendars,
@@ -1156,6 +1173,7 @@ const HANDLERS = {
   setCalendarRole: handleSetCalendarRole,
   setBlockTitles: handleSetBlockTitles,
   setRuleFilter: handleSetRuleFilter,
+  openOptions: handleOpenOptions,
 };
 
 function onMessage(msg, _sender, sendResponse) {

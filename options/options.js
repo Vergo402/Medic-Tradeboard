@@ -15,9 +15,12 @@
  *   2. #noBlockBanner — signed in, list loaded, and no calendar blocks anything.
  *
  * A calendar counts as blocking only if its role is REJECT, or its role is RULE
- * AND we know it has at least one ticked title. An unknown/unloaded RULE
- * calendar is treated as NOT blocking on purpose: a false "nothing blocks"
- * warning is noise, while a missing one is the bug we are fixing.
+ * AND (it has at least one ticked title OR the advanced pattern hatch is armed).
+ * That last clause is why an unloaded RULE calendar can still count: a stored
+ * ruleUsePattern blocks via the regex regardless of what titles we have listed.
+ * A RULE calendar with nothing ticked and no pattern blocks nothing. This is
+ * the shared core/blocks.js definition (see calBlocks below), the same one the
+ * drawer uses, so the two surfaces cannot disagree.
  *
  * PRIVACY. Turning a calendar on is the only thing that reads it. We never show
  * event counts on the calendar list itself — that would require reading every
@@ -65,6 +68,12 @@
  *   → { type: "setRuleFilter", include, exclude }     (advanced escape hatch only)
  */
 
+// The per-calendar block predicate, shared with content/boot.js's
+// anyCalendarBlocks signal so the drawer's muted state and this page's "nothing
+// blocks" banner can never disagree. This is why options.html loads options.js
+// as type="module".
+import { calendarBlocks } from '../core/blocks.js';
+
 // `commitmentLabel` must match core/rowshape.js's DEFAULT_COMMITMENT_LABEL,
 // which is what content/boot.js falls back to. `ruleInclude` must match sw.js's
 // DEFAULTS.ruleInclude and must stay a real, non-empty, anchored pattern:
@@ -96,7 +105,10 @@ const state = {
   calendars: [],          // [{id, summary, primary, role}]
   loadError: null,        // string | null — set means the LOUD load banner shows
   titles: new Map(),      // calId -> {status, accessRole, items:[{title,count,minutes}], blocked:Set, error}
-  search: new Map()       // calId -> current search box text
+  search: new Map(),      // calId -> current search box text
+  ruleUsePattern: false   // the advanced regex hatch — the RAW ruleUsePattern key, the
+                          // same value content/boot.js feeds anyoneBlocks(), so the two
+                          // surfaces stay in lockstep. See loadCalendars().
 };
 
 function send(msg) {
@@ -187,19 +199,15 @@ function explainError(err) {
 // ---------------------------------------------------------------------------
 
 function calBlocks(cal) {
-  if (cal.role === 'REJECT') return true;
-  if (cal.role !== 'RULE') return false;
+  // Delegates to the shared core/blocks.js predicate so this banner and the
+  // drawer's muted state use ONE definition of "blocks". A RULE calendar counts
+  // when it has at least one ticked title OR the advanced pattern hatch is armed
+  // (state.ruleUsePattern) — the latter closes the gap the old inline check left
+  // open, where a pattern-armed RULE calendar returned false and the banner
+  // over-warned.
   const t = state.titles.get(cal.id);
-  // Unknown means "we cannot prove it blocks" — err toward showing the warning.
-  //
-  // A RULE calendar with nothing ticked genuinely blocks nothing, which is now
-  // what sw.js does too (calendarRule returns a match-nothing predicate). KNOWN
-  // GAP: a user who armed the advanced pattern hatch (stored ruleUsePattern)
-  // does have such a calendar blocking via the regex, and this returns false for
-  // it — the banner would over-warn. listCalendars reports ruleFilter.usePattern
-  // for exactly that case; wiring it in needs a UI decision about what the
-  // picker says, so it is deliberately left out rather than guessed at.
-  return Boolean(t && t.blocked && t.blocked.size > 0);
+  const blockTitles = t && t.blocked ? Array.from(t.blocked) : [];
+  return calendarBlocks(cal.role, blockTitles, state.ruleUsePattern);
 }
 
 function renderBanners() {
@@ -606,6 +614,17 @@ function render(opts) {
 // ---------------------------------------------------------------------------
 
 async function loadCalendars(interactive) {
+  // Read the RAW ruleUsePattern key — the exact value content/boot.js feeds
+  // anyoneBlocks — rather than resp.ruleFilter.usePattern (which sw.js resolves
+  // more broadly, e.g. from a stored ruleInclude). Feeding the same input keeps
+  // this banner and the drawer's muted state from ever disagreeing.
+  try {
+    const flags = await chrome.storage.local.get('ruleUsePattern');
+    state.ruleUsePattern = flags.ruleUsePattern === true;
+  } catch (_e) {
+    state.ruleUsePattern = false;
+  }
+
   const resp = await send({ type: 'listCalendars', interactive: Boolean(interactive) });
   if (!resp.ok) {
     state.loadError = resp.error || 'unknown_error';

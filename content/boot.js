@@ -60,6 +60,11 @@
       rejects: [],
       scanning: null,
       notice: notice || null,
+      // Whether ANY calendar is configured to block a shift. false here is the
+      // honest default for the early-exit guards (logged out / no page
+      // identity): no config has been read yet, so we do not claim to be
+      // checking anything.
+      anyCalendarBlocks: false,
     };
   }
 
@@ -86,13 +91,14 @@
     const host = location.origin;
 
     // --- Dynamic-import the core modules + the UI drawer -----------------
-    const [parseMod, nytime, scoreMod, diffMod, myschedMod, rowshape, uiMod] = await Promise.all([
+    const [parseMod, nytime, scoreMod, diffMod, myschedMod, rowshape, blocksMod, uiMod] = await Promise.all([
       import(chrome.runtime.getURL("core/parse.js")),
       import(chrome.runtime.getURL("core/nytime.js")),
       import(chrome.runtime.getURL("core/score.js")),
       import(chrome.runtime.getURL("core/diff.js")),
       import(chrome.runtime.getURL("core/mysched.js")),
       import(chrome.runtime.getURL("core/rowshape.js")),
+      import(chrome.runtime.getURL("core/blocks.js")),
       import(chrome.runtime.getURL("ui/drawer.js")),
     ]);
     const { parseMonth, mergeMonths, driftCheck } = parseMod;
@@ -104,6 +110,7 @@
       loc, posShort, tierClass, goneLabel, posterNote, tourOf,
       rejectChipLabel, DEFAULT_COMMITMENT_LABEL,
     } = rowshape;
+    const { anyoneBlocks } = blocksMod;
     const { initDrawer } = uiMod;
 
     // --- User-configured commitment label --------------------------------
@@ -216,7 +223,29 @@
     let calError = null;
     let lastVisible = null; // domscan's {records, year, month, monthName, source}
     let scanning = null;
+    // Does ANY calendar block a shift? Read from config (calRoles /
+    // calBlockTitles / ruleUsePattern), never inferred from an empty
+    // commitments array — empty is ambiguous (nothing configured vs configured
+    // but no events this window). Only the config read disambiguates.
+    let anyCalendarBlocks = false;
     let bannerOnLoad = await loadBannerFromLastDiff();
+
+    /**
+     * Re-read the three block-config keys and recompute anyCalendarBlocks. No
+     * network — just chrome.storage.local, the same store boot already reads in
+     * several places. Never throws; on a storage error it leaves the previous
+     * value in place rather than flapping the muted state.
+     */
+    async function refreshBlockingSignal() {
+      try {
+        const cfg = await chrome.storage.local.get(["calRoles", "calBlockTitles", "ruleUsePattern"]);
+        anyCalendarBlocks = anyoneBlocks(cfg.calRoles, cfg.calBlockTitles, cfg.ruleUsePattern);
+      } catch (e) {
+        console.error("[medic-tradeboard] reading block config failed:", e);
+      }
+    }
+
+    await refreshBlockingSignal();
 
     async function loadBannerFromLastDiff() {
       const { lastDiff } = await chrome.storage.local.get("lastDiff");
@@ -334,6 +363,7 @@
         rejects,
         scanning,
         notice: notice || null,
+        anyCalendarBlocks,
       };
     }
 
@@ -361,6 +391,13 @@
       },
       onConnectCalendar: () => {
         connectCalendar().catch((e) => console.error("[medic-tradeboard] connect calendar failed:", e));
+      },
+      onOpenSetup: () => {
+        // A content script can't open the options page itself; the worker owns
+        // chrome.runtime.openOptionsPage(). Fire-and-forget: a failure is
+        // logged, never thrown out of the click handler.
+        sendToSW({ type: "openOptions" })
+          .catch((e) => console.error("[medic-tradeboard] open options failed:", e));
       },
     });
 
@@ -394,6 +431,31 @@
         }));
       }
     }
+
+    // Returning from the options page must clear (or raise) the muted state
+    // without a manual reload. When any of the three block-config keys change,
+    // recompute anyCalendarBlocks and re-pull the calendar: the roles/titles
+    // decide how sw.js buckets events into commitments, so a role change needs
+    // a fresh, re-bucketed fetch — mode "refresh" bypasses the cache (the sw
+    // mutators drop it too). Mirrors connectCalendar's repaint contract so the
+    // new signal reaches the drawer even if that fetch fails. Guarded so a
+    // storage-event error is logged, never thrown out of the listener.
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (!("calRoles" in changes || "calBlockTitles" in changes || "ruleUsePattern" in changes)) return;
+      (async () => {
+        await refreshBlockingSignal();
+        const resp = await askCalendar("refresh");
+        applyCalResponse(resp);
+        if (resp && resp.ok && lastVisible) {
+          await rescoreVisibleAndPaint();
+        } else {
+          controller.update(buildState({
+            monthLabel: currentMonthLabel(), rows: lastRows, rejects: lastRejRows,
+          }));
+        }
+      })().catch((e) => console.error("[medic-tradeboard] block-config change refresh failed:", e));
+    });
 
     async function runFullSweep() {
       if (scanning && scanning.active) return; // never run two sweeps at once — server view state is shared
