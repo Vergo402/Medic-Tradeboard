@@ -23,6 +23,9 @@ trade_*.html
 mysched_*.html
 td_*.html
 
+# Build output — regenerate with ./tools/package.sh
+dist/
+
 # OS / editor
 .DS_Store
 *.swp
