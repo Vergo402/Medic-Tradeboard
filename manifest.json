@@ -10,7 +10,7 @@
     "https://www.googleapis.com/*"
   ],
   "oauth2": {
-    "client_id": "TODO_REPLACE_WITH_CHROME_WEB_STORE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "client_id": "704758498783-462u6and9ru92qr7r9jdbmb0gtgnmmmm.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/calendar.readonly"]
   },
   "background": { "service_worker": "sw.js", "type": "module" },
