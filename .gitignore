@@ -1,0 +1,30 @@
+# Extension signing key — deriving the extension ID. NEVER commit.
+key.pem
+
+# Credentials of any kind
+*.creds.json
+.w2w_creds.json
+*.pem
+!key.pub.txt
+
+# Live board captures. These contain real coworker names and shift postings.
+# Raw captures use these exact names, so blocking the pattern means an accidental
+# capture can never be committed even by `git add -A`.
+# Scrubbed fixtures are deliberately named differently (board-*.anon.html) so they
+# fall outside this block — if a fixture matches a pattern here, it is NOT scrubbed.
+*_capture.html
+tb_*.html
+drop_*.html
+trade_*.html
+mysched_*.html
+td_*.html
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Node
+node_modules/
+npm-debug.log*
