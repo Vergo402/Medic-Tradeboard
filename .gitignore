@@ -5,7 +5,11 @@ key.pem
 *.creds.json
 .w2w_creds.json
 *.pem
-!key.pub.txt
+
+# Do NOT commit a signing public key either. Embedding one in manifest.json pins
+# every install and every fork to one person's extension identity. The Chrome Web
+# Store assigns the published ID; for local dev, Chrome assigns your own.
+key.pub.txt
 
 # Live board captures. These contain real coworker names and shift postings.
 # Raw captures use these exact names, so blocking the pattern means an accidental

@@ -1,0 +1,290 @@
+<!DOCTYPE  html>
+<html lang="en">
+<head><script src="/js/newrelic-prod.js"></script><script>if (typeof newrelic == 'object') {newrelic.setCustomAttribute('sessionid', "00000000000000");newrelic.setCustomAttribute('sources', "empschedulefuture.htm");}</script>
+<script src="/js/windowsize.js?V=608" data-key="" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="00000000000000"></script>
+<title>My Schedule</title>
+<META http-equiv="Pragma" CONTENT="no-cache">
+<META http-equiv="expires" CONTENT="Fri, 1 Jan 1999 01:00:00 GMT">
+<base target="_top"></base>
+<link rel="StyleSheet" href="/css/base.css?V=608" type="text/css">
+<link rel="StyleSheet" href="/css/grph2.css?V=608" type="text/css">
+<link href="/css/format1.css?V=608" rel="stylesheet" type="text/css">
+<meta name="viewport" content="width=device-width, initial-scale=.8">
+<SCRIPT>
+function CC(myElement,dir)
+{if (dir.charAt(0)=='!')
+{windowOpen('empmytradeboardentry.htm','&Id='+dir.substring(1), 'tbmyentry')
+} else {
+windowOpen('empscheduleentry.htm','&ID='+dir, 'myshift')}
+}
+function CL(dir){CC(0,dir);}
+</SCRIPT>
+<style>
+.modwide td {
+font-size:14px !important;
+}
+</style>
+</head>
+<body>
+<link href="/css/custom-alert.css?V=608" rel="stylesheet">
+<script src="/js/custom-alert.js?V=608" data-native="false"></script>
+<script language="JavaScript" src="/js/pagenav.js?V=608" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="00000000000000" data-lyr=""></script>
+<script language="JavaScript" src="/js/support.js?V=608" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="00000000000000" data-help="false" data-isemp="true" data-helpctx="" data-append="file=empschedulefuture.htm&as=PA&us=A&coid=33893457&eid=632979401"></script>
+<SCRIPT type="text/javascript">
+function handleMenuKey(e,el) {
+if (e.keyCode == 13) {
+el.click();
+}
+}
+function MenuListChanged(el)
+{
+if (el.value=='home') {ReplWin('home','')}
+else if (el.value=='schedules') {ReplWin('empschedule','')}
+else if (el.value=='fullweek') {ReplWin('empfullschedule','&View=Week')}
+else if (el.value=='info') {ReplWin('empinfo.htm','')}
+else if (el.value=='prefs') {ReplWin('emppreferences.htm','')}
+else if (el.value=='timeoff') {ReplWin('emptimeoff.htm','')}
+else if (el.value=='trades') {ReplWin('emptradeboard','')}
+else if (el.value=='messaging') {ReplWin('empmessaging.htm','')}
+else if (el.value=='staff') {ReplWin('empemplist.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='bb') {ReplWin('empbb.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='help') {showW2WHelp()}
+else if (el.value=='signout') {ReplWin('signoff','')}
+}
+function signoutClick() {
+if (subMenuAction) {
+//console.log('signout click ignored!');
+subMenuAction = false;
+return true;
+}
+//ReplWin('signoff','');
+}
+</script>
+<div align="center">
+<select id="emptopnavdd" onChange="MenuListChanged(this)">
+<option value="home"  >Home</option>
+<option value="schedules" Selected>My Schedule</option>
+<option value="fullweek" >Everyone's Schedule</option>
+<option value="info" >My Info</option>
+<option value="prefs" >Preferences</option>
+<option value="timeoff" >Time Off</option>
+<option value="trades" >Trades</option>
+<option value="messaging" >Messaging</option>
+<option value="staff" >Staff</option>
+<option value="onnow" >On Now</option>
+<option value="bb" >Bulletin Board</option>
+<option value="help">Help</option>
+<option value="signout">SIGN OUT</option>
+</select>
+<script>
+var el = document.getElementById('emptopnavdd');
+var ie = detectIE();
+if ((ie)&&(ie<= 8)) el.style.display = 'none';
+</script>
+<style>
+</style>
+<div id="emptopnav" role="navigation" aria-labelledby="emptopnav">
+<table border="0" cellpadding="0" cellspacing="0" width="100%" class="bg17" id="emptop">
+<tr><td tabindex="0" class=" plr lOnOff" onclick="ReplWin('home','')" onkeypress="handleMenuKey(event,this)" title="Home">Home</td>
+<td tabindex="0" class="onmenu plr lOnOff" onclick="ReplWin('empschedule','')" onkeypress="handleMenuKey(event,this)" title="View the Schedule">Schedule</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empinfo.htm','')" onkeypress="handleMenuKey(event,this)" title="Info - your username/password, emails and contact information and export to Google Calendar">Info</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emppreferences.htm','')" onkeypress="handleMenuKey(event,this)" title="Your work time preferences">Prefs</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptimeoff.htm','')" onkeypress="handleMenuKey(event,this)" title="Time off">Time Off</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptradeboard','')" onkeypress="handleMenuKey(event,this)" title="Trades">Trades</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empmessaging.htm','')" onkeypress="handleMenuKey(event,this)" title="Messaging">Messaging</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empemplist.htm','')" onkeypress="handleMenuKey(event,this)" title="Staff List">Staff</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empwhosonnow.htm','')" onkeypress="handleMenuKey(event,this)" title="Who's on now">On Now</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empbb.htm','')" onkeypress="handleMenuKey(event,this)" title="Bulletin Board">Bulletins</td>
+<td tabindex="0" class="plr lOnOff" onclick="showW2WHelp()" onkeypress="handleMenuKey(event,this)" title="View help pages and videos">Help</td>
+<style>
+.menu ul {
+position: absolute;
+min-width: 150px;
+display: none;
+top:27px;
+}
+.menu_ul {
+display: inline;
+margin-top: 5px;
+margin-left: -2px;
+padding: 0;
+border: 1px solid black;
+outline-color: red;
+}
+.menu_li {
+height: 45px;
+xline-height: 35px;
+text-align: left;
+text-decoration: none;
+font-weight: normal;
+}
+.menu:hover {background: #ffffff;}
+.menu:hover ul {display: block;}
+.menu ul li {
+background: #ffffff;
+display: block;
+}
+.menu ul li a {
+display:block !important;
+color: black;
+text-decoration: none;
+}
+.menu ul li:hover {
+background: rgb(45, 71, 127);
+}
+.menu ul li:hover a {
+color: #ffffff;
+}
+.fa-circle {margin-top:7px;}
+.fa-bolt {margin-top:0px;}
+.fa { padding: inherit;}
+</style>
+<script src="/js/menu_support.js?V=608"></script>
+<script>
+function setLastMenuItem(el) {/* do nothing in this case (also implemented in top.htm) */ }
+
+</script>
+<td tabindex="0" class="plr menu" id="signout" style="display: none;" onclick="return signoutClick();" onkeypress="handleMenuKey(event,this)"><!--  Sign Out --><span class='fa-stack fa-lg'><i class='fa fa-circle fa-stack-2x ' style='color:#000000'></i><i class='fa fa-bolt fa-stack-1x fa-inverse'></i></span></td>
+<!--  no multiuser support -->
+<td tabindex="0" class="plr menu lOnOff" id="SingleUserMenu" style="display: none;"
+onclick="ReplWin('signoff','')" onkeypress="handleMenuKey(event,this)" title="Sign Out">Sign Out</td>
+<script>
+var menu = 'SingleUserMenu';
+document.getElementById(menu).style.display = '';
+</script>
+</tr>
+</table>
+</div>
+</div>
+<table width="100%" style="min-height:125px;">
+<tr><td class="hidemobile" width="20%" align="center" valign="middle">
+<img width="150" src="/logo/EXAMPLELOGO0.PNG?v=3" alt="Logo" style="border:0px" aria-hidden="true">
+</td>
+<td id="emptopcenter" align="center">
+<h3>Example County Paramedics EMS, Inc.</h3><b class="title">Avery Alder</b><br>
+<span class="hidemobile"><br><b class="title" role="heading" aria-level="1">My Schedule</b></span>
+</td>
+<td class="hidemobile topright" align="center" width="20%">
+<a href="/cgi-bin/w2wCC.dll/empmessaging.htm?SID=00000000000000&Show=New"><img src="/images/icon___fa-envelope.png" height="20px" alt="New message icon" aria-label="New message icon click to go to new messages" style="padding:5px;"><br></a>
+<br>Jul 19, 2026<br>22:45
+</td></tr>
+</table>
+<script type="text/javascript">
+function SMenuListChanged(el)
+{
+if (el.value=='myweek') {ReplWin('empschedule','&MyView=Week')}
+else if (el.value=='mymonth') {ReplWin('empschedule','&MyView=Month')}
+else if (el.value=='myupcoming') {ReplWin('empschedule','&MyView=Future')}
+else if (el.value=='fullday') {ReplWin('empfullschedule','&View=Day')}
+else if (el.value=='fullweek') {ReplWin('empfullschedule','&View=Week')}
+else if (el.value=='fullmonth') {ReplWin('empfullschedule','&View=Month')}
+else if (el.value=='fullchart') {ReplWin('empfullschedule','&View=Category')}
+else if (el.value=='fullinout') {ReplWin('empfullschedule','&View=InOut')}
+else if (el.value=='myshifts') {ReplWin('empaddshift.htm','')}
+else if (el.value=='offered') {ReplWin('emptrades.htm','')}
+else if (el.value=='tbweek') {ReplWin('emptradeboard','')}
+else if (el.value=='tbmonth') {ReplWin('empmonthtradeboard','')}
+else if (el.value=='print') {window.open('/cgi-bin/w2wCC.dll/empschedulefutureprint.htm?SID=00000000000000', 'Poppage',
+'scrollbars,menubars,statusbars,resizable,width=400,height=400');}
+}
+</script>
+<!--  start dropdown sub menu for mobile -->
+<div style="text-align:center;">
+<select id="empsubnav" onChange="SMenuListChanged(this)">
+<option value="myweek" >My Week</option>
+<option value="mymonth" >My Month</option>
+<option value="myupcoming" Selected>My Upcoming Shifts</option>
+<option value="fullday" >Everyone's Day</option>
+<option value="fullweek" >Everyone's Week</option>
+<option value="fullmonth" >Everyone's Month</option>
+<option value="fullchart" >Everyone's Chart</option>
+<option value="fullinout" >Everyone's In-Out</option>
+</select>
+</div>
+<!--  end -->
+<div id="emptopnav" role="navigation" aria-labelledby="nav2">
+<table cellpadding="0" cellspacing="0" width="100%" style="background:#2D477F;">
+<tr><td style="border:2px white solid">
+<table cellpadding="3" cellspacing="0" width="100%" id="AutoNumber2" height="34">
+<tr align="center"><td colspan="5"  style="color:white;"><b>MY SCHEDULE</b></td></tr>
+<tr><td tabindex="0" class=" plr lOnOff"  onclick="ReplWin('empschedule','&MyView=Week')" onkeypress="handleMenuKey(event,this)" title="View Your Weekly Schedule" >Week</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empschedule','&MyView=Month')" onkeypress="handleMenuKey(event,this)" title="View Your Monthly Schedule">Month</td>
+<td tabindex="0" class="onmenu plr lOnOff" onclick="ReplWin('empschedule','&MyView=Future')" onkeypress="handleMenuKey(event,this)" title="View Your Upcoming Shifts">Upcoming</td></tr>
+</table>
+</td>
+<td  style="border:2px white solid">
+<table border="0" cellpadding="3" cellspacing="0" width="100%" height="34">
+<tr><td colspan="5" height="16" align="center" style="color:white;"><b>EVERYONE'S SCHEDULE</b></td></tr>
+<tr>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Day')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Daily View">Day</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Week')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Weekly View">Week</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Month')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Monthly View">Month</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Category')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Chart View">Chart</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=InOut')" onkeypress="handleMenuKey(event,this)" title="Full Schedule In-Out View">In-Out</td>
+</tr>
+</table>
+</td>
+<td style="border:2px white solid">
+<table border="0" cellpadding="3" cellspacing="0" width="100%" height="34">
+<tr><td align="center" colspan="5" style="color:white;"><b>TRADEBOARD</b></td></tr>
+<tr>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empaddshift.htm','');" onkeypress="handleMenuKey(event,this)" title="Choose scheduled shifts to trade">My Shifts</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptrades.htm','')" onkeypress="handleMenuKey(event,this)">Offered</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptradeboard','')" onkeypress="handleMenuKey(event,this)" title="View the Tradeboard Weekly View">Week</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empmonthtradeboard','')" onkeypress="handleMenuKey(event,this)" title="View the Tradeboard Monthly View">Month</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptradesnew.htm','')" onkeypress="handleMenuKey(event,this)">Recent</td>
+</tr>
+</table>
+</td>
+<td tabindex="0" style="border:2px white solid" class="plr lOnOff" width="10%" onclick="window.open('/cgi-bin/w2wCC.dll/empschedulefutureprint.htm?SID=00000000000000', 'PopPrint', 'scrollbars,menubar=1,statusbars,resizable,width=700,height=400');" onkeypress="handleMenuKey(event,this)"
+title="Bring up a printer friendly version of your schedule">PRINT</td>
+</tr>
+</table>
+</div>
+<div align="center">
+<table class="modwideclear" style="margin-top:0;">
+<tr><td class="bWGTright"><a href="#" onclick="return windowOpen('empshiftchanges.htm','','shchange')"><i class="fa fa-long-arrow-right"></i>&nbsp;Recent Shift Change Notices</a></td></tr>
+</table>
+<div id="maincontent" role="main">
+<table class="modwide" style="margin-top:3px;" aria-label="Upcoming Shifts">
+<tr><td class="WGT"><b class="titleBox" role="heading" tabindex="0">My Upcoming Shifts</b></td></tr>
+<tr><td class="bWGT acborder">
+<table cellpadding="5" cellspacing="0" width="100%" style="background:white;" >
+<thead>
+<tr style="font-weight: bolder;text-align:left;" class="small underline">
+<th scope="col">Date/Time</th>
+<th scope="col">Position</th>
+<th scope="col">Desc</th>
+</tr>
+</thead>
+<tbody>
+<tr><td COLSPAN="3"><br><i>You are not currently scheduled for any shifts.</i></td></tr>
+</tbody>
+</table>
+</td></tr>
+</table>
+<table class="modwide">
+<tr><td class="WGT"><b class="titleBox" role="heading">Information</b></td></tr>
+<tr><td class="bWGT">
+- To put a shift on tradeboard,
+or find a possible replacement
+click on the shift.
+<br><br>- Shifts missing?&nbsp; If your list stops at a certain date you can post later shifts to the tradeboard by going to your <a href="empschedulemonth.htm?SID=00000000000000"><u>My Schedule Month</u></a> page and clicking the shift.
+<br><br>- If you see colored shift text and need to know the meaning please <a tabindex="0" class="linkfocus" href="empwritemgr.htm?SID=00000000000000"><u>contact your manager</u></a>
+<br>
+</td></tr>
+</table>
+<br><br><br>
+<div align="center">
+<table border="0" cellpadding="0" style="border-collapse: collapse" width="100%" bgcolor="#FFFFFF">
+<tr><td><p align="center">If you have questions about your schedule, please <a tabindex="0" class="linkfocus" href="empwritemgr.htm?SID=00000000000000"><u>contact your manager</u></a>.</p>
+</td></tr>
+</table>
+</div>
+</div>
+</div>
+</body>
+</html>

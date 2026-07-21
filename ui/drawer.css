@@ -1,0 +1,649 @@
+/*
+ * Medic Shift Scanner -- drawer stylesheet, loaded into the shadow root
+ * created by ui/drawer.js (host.attachShadow) via a <link> pointed at
+ * chrome.runtime.getURL('ui/drawer.css'). Everything here is scoped by the
+ * shadow boundary: it cannot leak onto the W2W page and W2W's ancient CSS
+ * cannot leak in.
+ *
+ * Design tokens (bg/panel/panel2/line/amber/red/green/blue/ink/dim) match the
+ * color palette used consistently across the project, plus the FAM purple
+ * (#b48cff).
+ *
+ * No external network references anywhere in this file (MV3 CSP: no Google
+ * Fonts CDN, no CDN of any kind) -- font stacks below are local-fallback
+ * only, and the @font-face block that would load packaged woff2 files is
+ * commented out until assets/fonts/*.woff2 actually exist.
+ */
+
+:host {
+  --bg: #0e1116;
+  --panel: #161b23;
+  --panel2: #1c2330;
+  --line: #2a3547;
+  --amber: #ffb428;
+  --red: #ff5d47;
+  --green: #3fd68f;
+  --blue: #5aa9ff;
+  --fam: #b48cff;
+  --ink: #e8edf4;
+  --dim: #8b98ab;
+  --font-head: "Barlow Condensed", "Arial Narrow", "Avenir Next Condensed", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  box-shadow: -2px 0 10px rgba(0, 0, 0, 0.4);
+}
+
+/*
+ * Ready to enable once assets/fonts/*.woff2 land (both files are
+ * already declared under web_accessible_resources in manifest.json as
+ * "assets/fonts/*"). Paths are relative to this stylesheet's own URL
+ * (ui/drawer.css), which the browser resolves correctly without
+ * needing chrome.runtime.getURL() from inside CSS (impossible -- CSS can't
+ * call JS). Until these files exist, the font-family stacks above fall
+ * back to system fonts.
+ *
+ * @font-face {
+ *   font-family: "Barlow Condensed";
+ *   src: url("../assets/fonts/barlow-condensed-500.woff2") format("woff2");
+ *   font-weight: 500;
+ *   font-display: swap;
+ * }
+ * @font-face {
+ *   font-family: "Barlow Condensed";
+ *   src: url("../assets/fonts/barlow-condensed-700.woff2") format("woff2");
+ *   font-weight: 700;
+ *   font-display: swap;
+ * }
+ * @font-face {
+ *   font-family: "IBM Plex Mono";
+ *   src: url("../assets/fonts/ibm-plex-mono-400.woff2") format("woff2");
+ *   font-weight: 400;
+ *   font-display: swap;
+ * }
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+.medic-drawer-root {
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------- 1. Header ---------- */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+
+.header-title {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.header-title .accent {
+  color: var(--amber);
+}
+
+.chevron {
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+.chevron:hover {
+  color: var(--ink);
+}
+
+/* Collapsed edge tab */
+
+.edge-tab {
+  width: 100%;
+  height: 100%;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.edge-tab-label {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--amber);
+  text-transform: uppercase;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+/* ---------- notice (replaces everything below the header) ---------- */
+
+.notice {
+  margin: 10px 12px;
+  padding: 10px 12px;
+  background: rgba(255, 180, 40, 0.12);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* ---------- 2. Status line ---------- */
+
+.status-line {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 11px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.cal-age.cal-green { color: var(--green); }
+.cal-age.cal-amber { color: var(--amber); }
+.cal-age.cal-red { color: var(--red); }
+
+.mysched-ok { color: var(--green); }
+.mysched-partial { color: var(--amber); }
+.mysched-none { color: var(--dim); }
+
+.chip {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.chip-connect {
+  background: rgba(255, 180, 40, 0.15);
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.chip-connect:hover {
+  background: var(--amber);
+  color: #1a1204;
+}
+
+/* ---------- 3. Since-last-visit banner ---------- */
+
+.since-banner {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-left: 3px solid var(--green);
+  flex: 0 0 auto;
+}
+
+.since-label {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  color: var(--dim);
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.since-segs {
+  font-size: 11px;
+}
+
+.banner-new { color: var(--green); }
+.banner-gone { color: var(--red); }
+.banner-changed { color: var(--amber); }
+
+/* ---------- 4. Stats strip ---------- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 10px 12px;
+  flex: 0 0 auto;
+}
+
+.stat-tile {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 2px solid var(--line);
+  padding: 6px 6px;
+  text-align: center;
+}
+
+.stat-tile b {
+  display: block;
+  font-family: var(--font-head);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.stat-tile span {
+  display: block;
+  color: var(--dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 2px;
+}
+
+.stat-elig { border-top-color: var(--green); }
+.stat-rej { border-top-color: var(--red); }
+.stat-best { border-top-color: var(--amber); }
+.stat-top { border-top-color: var(--blue); }
+
+/* ---------- 5. Filter row ---------- */
+
+.filter-row {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 10px;
+  flex: 0 0 auto;
+}
+
+.filter-btn {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 4px 0;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.filter-btn:hover {
+  border-color: var(--blue);
+  color: var(--ink);
+}
+
+.filter-btn.active {
+  background: var(--blue);
+  color: #06121f;
+  border-color: var(--blue);
+  font-weight: 600;
+}
+
+/* ---------- 6. Ranked rows ---------- */
+
+.rows-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.row:first-child {
+  border-top: none;
+}
+
+.row:hover {
+  background: var(--panel);
+}
+
+.row-dim {
+  opacity: 0.6;
+}
+
+.row-rank {
+  flex: 0 0 auto;
+  color: var(--amber);
+  font-weight: 700;
+  font-size: 11px;
+  padding-top: 1px;
+}
+
+.row-mid {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.row-line1 {
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.row-pos {
+  color: var(--ink);
+}
+
+.row-line2 {
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+.fam-line {
+  color: var(--fam);
+}
+
+.row-score {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.pill {
+  display: inline-block;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+}
+
+.empty-msg {
+  text-align: center;
+  color: var(--dim);
+  font-style: italic;
+  font-size: 11px;
+  padding: 24px 12px;
+}
+
+/* ---------- 7. Rejected section ---------- */
+
+.rejected-section {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+}
+
+.rejected-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11.5px;
+  color: var(--dim);
+  font-weight: 600;
+}
+
+.rejected-header:hover {
+  color: var(--ink);
+}
+
+.rejected-chevron {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.rejected-list {
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.reject-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.reject-mid {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.reject-pos {
+  color: var(--ink);
+}
+
+.reject-reason {
+  color: var(--red);
+}
+
+.reject-line2 {
+  color: var(--dim);
+  font-size: 10.5px;
+  margin-top: 2px;
+}
+
+/* ---------- 8. Footer ---------- */
+
+.footer {
+  flex: 0 0 auto;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.scan-btn {
+  width: 100%;
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: transparent;
+  color: var(--amber);
+  border: 1px solid var(--amber);
+  padding: 8px 0;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.scan-btn:hover:not(:disabled) {
+  background: var(--amber);
+  color: #1a1204;
+}
+
+.scan-btn:disabled {
+  color: var(--dim);
+  border-color: var(--line);
+  cursor: default;
+}
+
+.footer-note {
+  text-align: center;
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+/* ---------- 9. Compose-text (row checkboxes, compose bar, preview) ---------- */
+
+.row-check {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0;
+  accent-color: var(--amber);
+  cursor: pointer;
+}
+
+.row-check:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.compose-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--amber);
+  background: var(--panel);
+}
+
+.compose-count {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.compose-clear {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.compose-clear:hover {
+  border-color: var(--blue);
+  color: var(--ink);
+}
+
+.compose-btn {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  background: var(--amber);
+  color: #1a1204;
+  border: 1px solid var(--amber);
+  border-radius: 2px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.compose-btn:hover {
+  opacity: 0.9;
+}
+
+.compose-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.preview-topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.compose-back {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.compose-back:hover {
+  border-color: var(--blue);
+  color: var(--ink);
+}
+
+.preview-title {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+.compose-text {
+  margin: 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  white-space: pre-wrap;
+  user-select: text;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--ink);
+}
+
+.compose-copy {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 0 12px 4px;
+  padding: 8px 0;
+  text-align: center;
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  background: var(--amber);
+  color: #1a1204;
+  border: 1px solid var(--amber);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.compose-copy:hover {
+  opacity: 0.9;
+}
+
+.copy-flash {
+  text-align: center;
+  padding: 2px 12px 6px;
+}
+
+.copy-ok {
+  color: var(--green);
+}
+
+.copy-err {
+  color: var(--red);
+}
+
+.compose-caption {
+  text-align: center;
+  color: var(--dim);
+  padding: 0 12px 12px;
+}

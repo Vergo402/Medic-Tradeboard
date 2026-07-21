@@ -1,0 +1,624 @@
+<!DOCTYPE  html>
+<html lang="en">
+<head><script src="/js/newrelic-prod.js"></script><script>if (typeof newrelic == 'object') {newrelic.setCustomAttribute('sessionid', "0000000000000");newrelic.setCustomAttribute('sources', "emptradeboardmonth.htm");}</script>
+<script src="/js/windowsize.js?V=608" data-key="" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="0000000000000"></script>
+<title>Tradeboard - Monthly</title>
+<base target="_top"></base>
+<link rel="StyleSheet" type="text/css" href="/css/base3.css?V=608">
+<link rel="stylesheet" type="text/css" href="/css/w2wmaincolors.css?V=608">
+<link href="/css/format1.css?V=608" rel="stylesheet" type="text/css">
+<meta name="viewport" content="width=device-width, initial-scale=.8">
+<style TYPE="text/css">
+.bWGT td {
+border:1px gray solid !important;
+}
+td.dnam {
+font-size: 12px;
+font-weight:bold;
+text-align:center;
+}
+td.dnum {
+font-size: 16px;
+font-weight:bold;
+text-align:center;
+background-color:#F0F1F7;
+height:20px;
+}
+div.skh {
+color:#000080;
+text-align:center;
+background-color:#CECEFF;
+font-weight:bold;
+}
+td.maintab {
+color:#000080;
+font-size: 10px;
+}
+.cD {
+color:black !important;
+}
+.dnam {
+text-align:center;
+padding:5px;
+}
+.module a {
+font-size:12px;
+}
+td.dnum {
+cursor: default;
+}
+.shiftUnassigned {
+background-color: #ffff64;
+}
+.shiftMine {
+background-color: #D7F4D2;
+}
+.weekpubback, .weekunpubback {
+border-top:0;
+}
+</style>
+<SCRIPT>
+function CCL(myElement,dir)
+{
+if (dir.charAt(0)=='#')
+{ windowOpen('emptradeboardentry.htm','&Id='+dir.substring(1), 'tbentry') }
+else if (dir.charAt(0)=='!')
+{
+windowOpen('empmytradeboardentry.htm','&Id='+dir.substring(1), 'tbmyentry')
+}
+else if (dir.charAt(0)=='*')
+{
+windowOpen('empopenshiftentry.htm','&TransactionId='+dir.substring(1), 'emposh')
+}
+else if (dir.charAt(0)=='$')
+{
+windowOpen('empscheduleentry.htm','&Id='+dir.substring(1), 'myshift')
+}
+else
+{ windowOpen('empallshiftentry.htm','&Id='+dir, 'eallshift') }
+}
+function CC(dir)
+{
+CCL(0,dir);
+return false;
+}
+function ListChanged(el)
+{
+top.window.location.replace("/cgi-bin/w2wCC.dll/empmonthtradeboard?SID=0000000000000&SkillFilter="+el.value)
+}
+function MTBChanged(el)
+{
+top.window.location.replace("/cgi-bin/w2wCC.dll/empmonthtradeboard?SID=0000000000000&MTBView="+el.value)
+}
+function EmpTeamListChanged(el)
+{
+top.window.location.replace("/cgi-bin/w2wCC.dll/empmonthtradeboard?SID=0000000000000&EmpTeamFilter="+el.value)
+}
+</SCRIPT>
+</head>
+<body>
+<link href="/css/custom-alert.css?V=608" rel="stylesheet">
+<script src="/js/custom-alert.js?V=608" data-native="false"></script>
+<script language="JavaScript" src="/js/pagenav.js?V=608" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="0000000000000" data-lyr=""></script>
+<script language="JavaScript" src="/js/support.js?V=608" data-w2w="/cgi-bin/w2wCC.dll/" data-sid="0000000000000" data-help="false" data-isemp="true" data-helpctx="" data-append="file=emptradeboardmonth.htm&as=PA&us=A&coid=33893457&eid=632979401"></script>
+<SCRIPT type="text/javascript">
+function handleMenuKey(e,el) {
+if (e.keyCode == 13) {
+el.click();
+}
+}
+function MenuListChanged(el)
+{
+if (el.value=='home') {ReplWin('home','')}
+else if (el.value=='schedules') {ReplWin('empschedule','')}
+else if (el.value=='fullweek') {ReplWin('empfullschedule','&View=Week')}
+else if (el.value=='info') {ReplWin('empinfo.htm','')}
+else if (el.value=='prefs') {ReplWin('emppreferences.htm','')}
+else if (el.value=='timeoff') {ReplWin('emptimeoff.htm','')}
+else if (el.value=='trades') {ReplWin('emptradeboard','')}
+else if (el.value=='messaging') {ReplWin('empmessaging.htm','')}
+else if (el.value=='staff') {ReplWin('empemplist.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='bb') {ReplWin('empbb.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='onnow') {ReplWin('empwhosonnow.htm','')}
+else if (el.value=='help') {showW2WHelp()}
+else if (el.value=='signout') {ReplWin('signoff','')}
+}
+function signoutClick() {
+if (subMenuAction) {
+//console.log('signout click ignored!');
+subMenuAction = false;
+return true;
+}
+//ReplWin('signoff','');
+}
+</script>
+<div align="center">
+<select id="emptopnavdd" onChange="MenuListChanged(this)">
+<option value="home"  >Home</option>
+<option value="schedules" >My Schedule</option>
+<option value="fullweek" >Everyone's Schedule</option>
+<option value="info" >My Info</option>
+<option value="prefs" >Preferences</option>
+<option value="timeoff" >Time Off</option>
+<option value="trades" Selected>Trades</option>
+<option value="messaging" >Messaging</option>
+<option value="staff" >Staff</option>
+<option value="onnow" >On Now</option>
+<option value="bb" >Bulletin Board</option>
+<option value="help">Help</option>
+<option value="signout">SIGN OUT</option>
+</select>
+<script>
+var el = document.getElementById('emptopnavdd');
+var ie = detectIE();
+if ((ie)&&(ie<= 8)) el.style.display = 'none';
+</script>
+<style>
+</style>
+<div id="emptopnav" role="navigation" aria-labelledby="emptopnav">
+<table border="0" cellpadding="0" cellspacing="0" width="100%" class="bg17" id="emptop">
+<tr><td tabindex="0" class=" plr lOnOff" onclick="ReplWin('home','')" onkeypress="handleMenuKey(event,this)" title="Home">Home</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empschedule','')" onkeypress="handleMenuKey(event,this)" title="View the Schedule">Schedule</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empinfo.htm','')" onkeypress="handleMenuKey(event,this)" title="Info - your username/password, emails and contact information and export to Google Calendar">Info</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emppreferences.htm','')" onkeypress="handleMenuKey(event,this)" title="Your work time preferences">Prefs</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptimeoff.htm','')" onkeypress="handleMenuKey(event,this)" title="Time off">Time Off</td>
+<td tabindex="0" class="onmenu plr lOnOff" onclick="ReplWin('emptradeboard','')" onkeypress="handleMenuKey(event,this)" title="Trades">Trades</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empmessaging.htm','')" onkeypress="handleMenuKey(event,this)" title="Messaging">Messaging</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empemplist.htm','')" onkeypress="handleMenuKey(event,this)" title="Staff List">Staff</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empwhosonnow.htm','')" onkeypress="handleMenuKey(event,this)" title="Who's on now">On Now</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empbb.htm','')" onkeypress="handleMenuKey(event,this)" title="Bulletin Board">Bulletins</td>
+<td tabindex="0" class="plr lOnOff" onclick="showW2WHelp()" onkeypress="handleMenuKey(event,this)" title="View help pages and videos">Help</td>
+<style>
+.menu ul {
+position: absolute;
+min-width: 150px;
+display: none;
+top:27px;
+}
+.menu_ul {
+display: inline;
+margin-top: 5px;
+margin-left: -2px;
+padding: 0;
+border: 1px solid black;
+outline-color: red;
+}
+.menu_li {
+height: 45px;
+xline-height: 35px;
+text-align: left;
+text-decoration: none;
+font-weight: normal;
+}
+.menu:hover {background: #ffffff;}
+.menu:hover ul {display: block;}
+.menu ul li {
+background: #ffffff;
+display: block;
+}
+.menu ul li a {
+display:block !important;
+color: black;
+text-decoration: none;
+}
+.menu ul li:hover {
+background: rgb(45, 71, 127);
+}
+.menu ul li:hover a {
+color: #ffffff;
+}
+.fa-circle {margin-top:7px;}
+.fa-bolt {margin-top:0px;}
+.fa { padding: inherit;}
+</style>
+<script src="/js/menu_support.js?V=608"></script>
+<script>
+function setLastMenuItem(el) {/* do nothing in this case (also implemented in top.htm) */ }
+
+</script>
+<td tabindex="0" class="plr menu" id="signout" style="display: none;" onclick="return signoutClick();" onkeypress="handleMenuKey(event,this)"><!--  Sign Out --><span class='fa-stack fa-lg'><i class='fa fa-circle fa-stack-2x ' style='color:#000000'></i><i class='fa fa-bolt fa-stack-1x fa-inverse'></i></span></td>
+<!--  no multiuser support -->
+<td tabindex="0" class="plr menu lOnOff" id="SingleUserMenu" style="display: none;"
+onclick="ReplWin('signoff','')" onkeypress="handleMenuKey(event,this)" title="Sign Out">Sign Out</td>
+<script>
+var menu = 'SingleUserMenu';
+document.getElementById(menu).style.display = '';
+</script>
+</tr>
+</table>
+</div>
+</div>
+<table width="100%" style="min-height:125px;">
+<tr><td class="hidemobile" width="20%" align="center" valign="middle">
+<img width="150" src="/logo/EXAMPLELOGO0.PNG?v=3" alt="Logo" style="border:0px" aria-hidden="true">
+</td>
+<td id="emptopcenter" align="center">
+<h3>Example County Paramedics EMS, Inc.</h3><b class="title">Avery Alder</b><br>
+<span class="hidemobile"><br><b class="title" role="heading" aria-level="1">Tradeboard - Monthly</b></span>
+</td>
+<td class="hidemobile topright" align="center" width="20%">
+<a href="/cgi-bin/w2wCC.dll/empmessaging.htm?SID=0000000000000&Show=New"><img src="/images/icon___fa-envelope.png" height="20px" alt="New message icon" aria-label="New message icon click to go to new messages" style="padding:5px;"><br></a>
+<br>Jul 19, 2026<br>21:19
+</td></tr>
+</table>
+<script type="text/javascript">
+function SMenuListChanged(el)
+{
+if (el.value=='myweek') {ReplWin('empschedule','&MyView=Week')}
+else if (el.value=='mymonth') {ReplWin('empschedule','&MyView=Month')}
+else if (el.value=='myupcoming') {ReplWin('empschedule','&MyView=Future')}
+else if (el.value=='fullday') {ReplWin('empfullschedule','&View=Day')}
+else if (el.value=='fullweek') {ReplWin('empfullschedule','&View=Week')}
+else if (el.value=='fullmonth') {ReplWin('empfullschedule','&View=Month')}
+else if (el.value=='fullchart') {ReplWin('empfullschedule','&View=Category')}
+else if (el.value=='fullinout') {ReplWin('empfullschedule','&View=InOut')}
+else if (el.value=='myshifts') {ReplWin('empaddshift.htm','')}
+else if (el.value=='offered') {ReplWin('emptrades.htm','')}
+else if (el.value=='tbweek') {ReplWin('emptradeboard','')}
+else if (el.value=='tbmonth') {ReplWin('empmonthtradeboard','')}
+else if (el.value=='print') {window.open('/cgi-bin/w2wCC.dll/?SID=0000000000000', 'Poppage',
+'scrollbars,menubars,statusbars,resizable,width=400,height=400');}
+}
+</script>
+<!--  start dropdown sub menu for mobile -->
+<div style="text-align:center;">
+<select id="empsubnav" onChange="SMenuListChanged(this)">
+<option value="myshifts" >My Shifts to Trade</option>
+<option value="offered" >Shifts Offered</option>
+<option value="tbweek" >Tradeboard Week</option>
+<option value="tbmonth" Selected>Tradeboard Month</option>
+</select>
+</div>
+<!--  end -->
+<div id="emptopnav" role="navigation" aria-labelledby="nav2">
+<table cellpadding="0" cellspacing="0" width="100%" style="background:#2D477F;">
+<tr><td style="border:2px white solid">
+<table cellpadding="3" cellspacing="0" width="100%" id="AutoNumber2" height="34">
+<tr align="center"><td colspan="5"  style="color:white;"><b>MY SCHEDULE</b></td></tr>
+<tr><td tabindex="0" class=" plr lOnOff"  onclick="ReplWin('empschedule','&MyView=Week')" onkeypress="handleMenuKey(event,this)" title="View Your Weekly Schedule" >Week</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empschedule','&MyView=Month')" onkeypress="handleMenuKey(event,this)" title="View Your Monthly Schedule">Month</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empschedule','&MyView=Future')" onkeypress="handleMenuKey(event,this)" title="View Your Upcoming Shifts">Upcoming</td></tr>
+</table>
+</td>
+<td  style="border:2px white solid">
+<table border="0" cellpadding="3" cellspacing="0" width="100%" height="34">
+<tr><td colspan="5" height="16" align="center" style="color:white;"><b>EVERYONE'S SCHEDULE</b></td></tr>
+<tr>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Day')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Daily View">Day</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Week')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Weekly View">Week</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Month')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Monthly View">Month</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=Category')" onkeypress="handleMenuKey(event,this)" title="Full Schedule Chart View">Chart</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empfullschedule','&View=InOut')" onkeypress="handleMenuKey(event,this)" title="Full Schedule In-Out View">In-Out</td>
+</tr>
+</table>
+</td>
+<td style="border:2px white solid">
+<table border="0" cellpadding="3" cellspacing="0" width="100%" height="34">
+<tr><td align="center" colspan="5" style="color:white;"><b>TRADEBOARD</b></td></tr>
+<tr>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('empaddshift.htm','');" onkeypress="handleMenuKey(event,this)" title="Choose scheduled shifts to trade">My Shifts</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptrades.htm','')" onkeypress="handleMenuKey(event,this)">Offered</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptradeboard','')" onkeypress="handleMenuKey(event,this)" title="View the Tradeboard Weekly View">Week</td>
+<td tabindex="0" class="onmenu plr lOnOff" onclick="ReplWin('empmonthtradeboard','')" onkeypress="handleMenuKey(event,this)" title="View the Tradeboard Monthly View">Month</td>
+<td tabindex="0" class=" plr lOnOff" onclick="ReplWin('emptradesnew.htm','')" onkeypress="handleMenuKey(event,this)">Recent</td>
+</tr>
+</table>
+</td>
+<td width="10%" style="border:2px white solid">&nbsp;</td>
+</tr>
+</table>
+</div>
+<script src="/js/pop-pos.js?V=608"></script>
+<link href="/cal/calendar-win2k-1.css?V=608" rel="stylesheet" type="text/css">
+<script type="text/javascript" src="/cal/calendar.js?V=608"></script>
+<script type="text/javascript" src="/cal/lang/calendar-en.js?V=608"></script>
+<script type="text/javascript" src="/cal/calendar-setup.js?V=608"></script>
+<script class='LayeredJS'>
+function jmp(dt){
+ReplWin('empmonthtradeboard','&Date='+dt);
+}
+function jmpLayer(dt,parent){
+parent=parent||false;
+ReplWinLayer('empmonthtradeboard','&Date='+dt,null,null,null,null,parent);
+}
+var jumpHandler = jump;
+var navHandler = null;
+var date_layer=true;
+function openDatePage(isSND){
+if((typeof date_layer !== 'undefined')&&(date_layer)) {
+var onSelect = function(calendar, date){
+if(calendar.dateClicked){
+// get the value and do something
+calendar.callCloseHandler();
+var y = calendar.date.getFullYear();
+var m = calendar.date.getMonth()+1;     // integer, 0..11 + 1
+var d = calendar.date.getDate();      // integer, 1..31
+// window.top.location=window.top.location+"&Date="+m + "/" + d + "/" + y;
+jump(m + "/" + d + "/" + y);
+}
+};
+var onClose = function(calendar){
+calendar.hide(); // hide calendar
+};
+var navDatecal = new Calendar(1, null, onSelect, onClose); //create
+var dateEl =document.getElementById("mgrDayCalSelect"+isSND);
+navDatecal.weekNumbers = false;
+navDatecal.setDateFormat("%m/%d/%Y");
+navDatecal.create(null);
+// navDatecal.parseDate(dateEl.value);
+navDatecal.element.style.zIndex = 10000;
+var pos = getRelativePositionEx(dateEl,navDatecal.element,'bottom');
+navDatecal.showAt(pos.left,pos.top);
+} else {
+window.open('/cgi-bin/w2wCC.dll/datepick.htm?SID=0000000000000', 'PopDate','scrollbars,menubars,statusbars,resizable,top=300,left=400,width=220,height=220');
+}
+}
+var CurrentWeek = new Date('2026-07-19T00:00:00Z'); // Use "Z" to insure consistent behavior
+CurrentWeek.setMinutes(CurrentWeek.getMinutes() + CurrentWeek.getTimezoneOffset()); // Then normalize
+var addMonthsClassic = true;
+//Testing:
+//Switch to "Monthly"
+//Using calendar to go to Jan 31, 2029.
+//Then "next" to Feb. Then switch to "Weekly"
+Date.prototype.daysInThisMonth = function() {
+function leapYear(year) {return ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);}
+monthDays = [31,28,31,30,31,30,31,31,30,31,30,31];
+var m = this.getMonth();
+return (m==1&&leapYear(this.getFullYear()))?monthDays[m]+1:monthDays[m];
+}
+Date.prototype.addMonths = function(offsetMonths) {
+var dat = new Date(this.valueOf());
+if (offsetMonths == 0) return dat;
+if (addMonthsClassic) {
+var delta = offsetMonths/Math.abs(offsetMonths); //delta = -1 or 1
+var origMonth;
+for (var i=1;i<=Math.abs(offsetMonths);i++) {
+origMonth = dat.getMonth();
+dat.setDate(dat.getDate() + (28*delta));
+if (dat.getMonth() == origMonth) {
+dat.setDate(dat.getDate() + (7*delta));
+}
+}
+} else {
+//Try to set the target date to the same day of the offset month.
+//However, if the resulting target month has fewer days than current day of month,
+//  then set the target day of month to the last day of of the target month.
+var origDate = dat.getDate();
+dat.setDate(1);
+dat.setMonth(dat.getMonth()+offsetMonths);
+dat.setDate(Math.min(origDate,dat.daysInThisMonth()));
+}
+return dat;
+}
+function updateNavDate() {
+var monthNames = ["January", "February", "March", "April", "May", "June","July", "August", "September", "October", "November", "December"];
+var el = document.getElementById('nmThisMonth');
+el.innerHTML = monthNames[CurrentWeek.getMonth()]+' '+CurrentWeek.getFullYear();
+var dt;
+for (var i=1;i<=4;i++) {
+el = document.getElementById('nm_-'+i);
+dt = CurrentWeek.addMonths(i*-1);
+el.innerHTML = monthNames[dt.getMonth()];
+}
+for (var i=1;i<=4;i++) {
+el = document.getElementById('nm_+'+i);
+dt = CurrentWeek.addMonths(i);
+el.innerHTML = monthNames[dt.getMonth()];
+}
+}
+function prevNavDate() {
+CurrentWeek = navHandler(CurrentWeek.addMonths(-1));
+updateNavDate();
+}
+function nextNavDate() {
+CurrentWeek = navHandler(CurrentWeek.addMonths(1));
+updateNavDate();
+}
+function gotoToday() {
+CurrentWeek = navHandler(new Date());
+updateNavDate();
+}
+function gotoNavDate(dt) {
+var dtAr = dt.split('/');
+CurrentWeek = navHandler(new Date(dtAr[2],parseInt(dtAr[0])-1,dtAr[1]));
+updateNavDate();
+}
+function gotoNavDateOffset(el,offset) {
+CurrentWeek = navHandler(CurrentWeek.addMonths(offset));
+updateNavDate();
+}
+function dynNavMonth(fnNavHandler) { //NavMonth.htm behaves exactly the same as before until/unless dynNavMonth() is called
+//Replace existing click-handlers with new
+navHandler = fnNavHandler;
+jumpHandler = gotoNavDate;
+document.getElementById('nmPrevMonth').setAttribute('onclick','prevNavDate()');
+document.getElementById('nmNextMonth').setAttribute('onclick','nextNavDate()');
+for (var i=1;i<=4;i++) {
+document.getElementById('nm_-'+i).setAttribute('onclick','gotoNavDateOffset(this,-'+i+')');
+}
+for (var i=1;i<=4;i++) {
+document.getElementById('nm_+'+i).setAttribute('onclick','gotoNavDateOffset(this,'+i+')');
+}
+}
+</script>
+<STYLE>
+tr.navrow td {
+background-color: #E3E6F0;
+font-size: 11px;
+color:#E3E6F0;
+border:2px solid #E3E6F0;
+text-align:center;
+text-decoration:none;
+text-align:center;
+height:30px;
+}
+.initial td {
+background-color: #E3E6F0;
+font-size: 11px;
+color:red;
+border:1px solid #E3E6F0;
+text-decoration:none;
+}
+.normal td {
+background-color: #E3E6F0;
+font-size: 11px;
+color:#E3E6F0;
+border:2px solid #E3E6F0;
+text-align:center;
+text-decoration:none;
+text-align:center;
+height:30px;
+}
+.highlight td {
+background-color: #FFFFFF;
+font-size: 11px;
+color:#000000;
+border:2px solid #E3E6F0;
+text-align:center;
+cursor:pointer;
+height:30px;
+}
+.highlight td a {
+text-decoration:none;
+}
+#calbtn {
+background-color: #E3E6F0;
+color:black;
+font-weight:bold;
+width:30%;
+text-decoration:none;
+}
+</style>
+<div align="center" class="lineback1 wgtclr" >
+<table width="100%" cellspacing="0" cellpadding="3" style="border:1px #E3E6F0 solid;" height="32px">
+<tr class="navrow" onMouseOver="this.className='highlight'" onMouseOut="this.className='normal'">
+<td id="nm_-4" tabindex="0" onclick="jump('03/10/2026')" width="8%" class="hidemobile" title="&nbsp;&nbsp;March&nbsp;&nbsp;">&nbsp;&nbsp;March&nbsp;&nbsp;</td>
+<td id="nm_-3" tabindex="0" onclick="jump('04/10/2026')" width="8%" class="hidemobile" title="&nbsp;&nbsp;April&nbsp;&nbsp;">&nbsp;&nbsp;April&nbsp;&nbsp;</td>
+<td id="nm_-2" tabindex="0" onclick="jump('05/10/2026')" width="8%" title="&nbsp;&nbsp;&nbsp;May&nbsp;&nbsp;&nbsp;">&nbsp;&nbsp;&nbsp;May&nbsp;&nbsp;&nbsp;</td>
+<td id="nm_-1" tabindex="0" onclick="jump('06/10/2026')" width="8%" title="&nbsp;&nbsp;June&nbsp;&nbsp;">&nbsp;&nbsp;June&nbsp;&nbsp;</td>
+<td id="calbtn" class="hover" style="width:50%;text-align:center;vertical-align:middle;">
+<nobr>
+<a id="nmPrevMonth" href="#" onclick="ReplaceWindow('empmonthtradeboard','&Month=Prev');return false;" title="Click to navigate back one month" style="padding:0 3px 0 6px;">
+<img src="/images/icon___fa-caret-left.png" height="24px" alt="left arrow"></a>
+<div style="display: inline-block; font-size: 16px;font-weight:bold;text-decoration:none;" tabindex="0" onclick="openDatePage('');return false"><span id="nmThisMonth">July  2026</span>
+<a href="#" onclick="openDatePage('');return false" title="Click to select new date" style="padding:0 5px 5px;" id="mgrDayCalSelect">
+<img src="/images/icon__fa-calendar.png" height="20px" alt="click to open date picker"></a>
+</div>
+<a id="nmNextMonth" href="#" onclick="ReplaceWindow('empmonthtradeboard','&Month=Next');return false;" title="Click to navigate forward one month" style="padding:0 3px;"><img src="/images/icon___fa-caret-right.png" height="24px" alt="click to navigate forward a week" ></a></nobr>
+</td>
+<td id="nm_+1" tabindex="0" onclick="jump('08/10/2026')" width="8%" title="&nbsp;August&nbsp;">&nbsp;August&nbsp;</td>
+<td id="nm_+2" tabindex="0" onclick="jump('09/10/2026')" width="8%" title="September">September</td>
+<td id="nm_+3" tabindex="0" onclick="jump('10/10/2026')" width="8%" title="October" class="hidemobile">October</td>
+<td id="nm_+4" tabindex="0" onclick="jump('11/10/2026')" width="8%" title="November" class="hidemobile">November</td>
+</tr>
+</table>
+</div>
+<div align="center">
+<table class="modwideclear" style="margin:0">
+<tr><td width="80%">&nbsp;</td><td  style="padding:5px;" valign="middle" align="right">
+<select size="1" name="EmpListSkill" onChange="ListChanged(this);" aria-label="Positions filter">
+<option value="-1"  Selected>All Positions</option>
+<option value="-2" >My Positions</option>
+<option value="" >----------</option>
+<option value="-332445296" >35 Medics</option>
+<option value="" >----------</option>
+<option value="332432673" >35 Medic 1</option>
+<option value="332432674" >35 Medic 2</option>
+<option value="332432675" >35 Medic 3</option>
+<option value="332432676" >35 Medic 4</option>
+<option value="651293994" >Sick</option>
+<option value="793610972" >PT PTO</option>
+</select>
+</td>
+</tr>
+</table>
+<div id="maincontent" role="main">
+<table class="modwide" tabindex="0" aria-label="Tradeboard for July  2026">
+<tr><td class="WGT"><b class="titleBox" role="heading" role="heading">July  2026 Tradeboard</b>
+&nbsp;</td>
+<td align="right" style="padding-right:20px;">
+<select size="1" name="MTBView" onChange="MTBChanged(this);" aria-label="Show only - trades or drops filter">
+<option value="All" Selected>Show All</option>
+<option value="Trade" >Show Trades Only</option>
+<option value="Drop" >Show Drops Only</option>
+<option value="TD" >Show Trade or Drop</option>
+<option value="Open" >Show Open Shifts</option>
+</select></td></tr>
+<tr><td class="bwgtcolors" colspan="2">
+<table border="1" cellpadding="0" cellspacing="0" width="100%" bgcolor="#FFFFFF" bordercolor="#000000" style="border-collapse: collapse"><tr>
+<td width="14%" class="dnam">Sunday</td>
+<td width="14%" class="dnam">Monday</td>
+<td width="14%" class="dnam">Tuesday</td>
+<td width="14%" class="dnam">Wednesday</td>
+<td width="14%" class="dnam">Thursday</td>
+<td width="14%" class="dnam">Friday</td>
+<td width="14%" class="dnam">Saturday</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%">&nbsp;</td>
+<td width="14%">&nbsp;</td>
+<td width="14%">&nbsp;</td>
+<td width="14%" class="dnum">1</td>
+<td width="14%" class="dnum">2</td>
+<td width="14%" class="dnum">3</td>
+<td width="14%" class="dnum">4</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%">&nbsp;</td>
+<td width="14%">&nbsp;</td>
+<td width="14%">&nbsp;</td>
+<td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td></tr><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%" class="dnum">5</td>
+<td width="14%" class="dnum">6</td>
+<td width="14%" class="dnum">7</td>
+<td width="14%" class="dnum">8</td>
+<td width="14%" class="dnum">9</td>
+<td width="14%" class="dnum">10</td>
+<td width="14%" class="dnum">11</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td></tr><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%" class="dnum">12</td>
+<td width="14%" class="dnum">13</td>
+<td width="14%" class="dnum">14</td>
+<td width="14%" class="dnum">15</td>
+<td width="14%" class="dnum">16</td>
+<td width="14%" class="dnum">17</td>
+<td width="14%" class="dnum">18</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td></tr><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%" class="dnum">19</td>
+<td width="14%" class="dnum">20</td>
+<td width="14%" class="dnum">21</td>
+<td width="14%" class="dnum">22</td>
+<td width="14%" class="dnum">23</td>
+<td width="14%" class="dnum">24</td>
+<td width="14%" class="dnum">25</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td></tr><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td width="14%" class="dnum">26</td>
+<td width="14%" class="dnum">27</td>
+<td width="14%" class="dnum">28</td>
+<td width="14%" class="dnum">29</td>
+<td width="14%" class="dnum">30</td>
+<td width="14%" class="dnum">31</td>
+<td width="14%">&nbsp;</td>
+</tr></table><table border="1" cellpadding="0" cellspacing="0" width="100%" bordercolor="#000000" bgcolor="#FFFFFF" style="border-collapse: collapse"><tr>
+<td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td class="weekunpubback">&nbsp;</td><td width="14%">&nbsp;</td>
+</tr></table>&nbsp;
+</td></tr>
+</table>
+<table class="modwide">
+<tr><td class="WGT"><b class="titleBox" role="heading">Information</b></td></tr>
+<tr><td class="bWGT">- Click shift to view details.<br>
+</td></tr>
+</table>
+<br><br><br>
+<div align="center">
+<table border="0" cellpadding="0" style="border-collapse: collapse" width="100%" bgcolor="#FFFFFF">
+<tr><td><p align="center">If you have questions about your schedule, please <a tabindex="0" class="linkfocus" href="empwritemgr.htm?SID=0000000000000"><u>contact your manager</u></a>.</p>
+</td></tr>
+</table>
+</div>
+</div></div>
+</body>
+</html>

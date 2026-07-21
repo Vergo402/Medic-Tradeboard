@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Medic Tradeboard",
+  "version": "0.1.0",
+  "description": "Read-only overlay for a WhenToWork tradeboard that scores each open shift against your own Google Calendar.",
+  "minimum_chrome_version": "116",
+  "permissions": ["identity", "storage"],
+  "host_permissions": [
+    "https://*.whentowork.com/*",
+    "https://www.googleapis.com/*"
+  ],
+  "oauth2": {
+    "client_id": "TODO_REPLACE_WITH_CHROME_WEB_STORE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/calendar.readonly"]
+  },
+  "background": { "service_worker": "sw.js", "type": "module" },
+  "content_scripts": [
+    {
+      "matches": ["https://*.whentowork.com/cgi-bin/*"],
+      "js": ["content/board.js", "content/domscan.js", "content/badges.js", "content/boot.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["core/*.js", "ui/*", "assets/fonts/*", "assets/icons/*"],
+      "matches": ["https://*.whentowork.com/*"]
+    }
+  ],
+  "options_ui": { "page": "options/options.html", "open_in_tab": true },
+  "action": { "default_title": "Medic Tradeboard" },
+  "icons": { "16": "assets/icons/16.png", "48": "assets/icons/48.png", "128": "assets/icons/128.png" }
+}

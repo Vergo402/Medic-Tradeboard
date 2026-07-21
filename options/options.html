@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Medic Tradeboard Options</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 20px;
+      max-width: 600px;
+      line-height: 1.6;
+    }
+    .option {
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 500;
+    }
+    input {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-family: inherit;
+      box-sizing: border-box;
+    }
+    .note {
+      padding: 8px 0;
+      color: #555;
+      font-size: 14px;
+      margin-bottom: 16px;
+    }
+    button {
+      padding: 8px 16px;
+      background-color: #0066cc;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover {
+      background-color: #0052a3;
+    }
+    #status {
+      margin-top: 12px;
+      font-size: 14px;
+      color: #080;
+    }
+    #status.error {
+      color: #c00;
+    }
+    .hint {
+      font-weight: 400;
+      color: #555;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Medic Tradeboard Options</h1>
+
+  <p class="note">
+    These settings control which of your Google Calendar events count as a
+    hard commitment (rejects an overlapping shift) versus a soft flag
+    (annotates it only). Connect your calendar from the tradeboard drawer
+    first, then tune the patterns below.
+  </p>
+
+  <div class="option">
+    <label for="ruleInclude">Commitment include pattern (regex):</label>
+    <input type="text" id="ruleInclude" value="^Work\b" placeholder="e.g. ^On[- ]?Duty\b">
+    <div class="hint">
+      Applies to calendars set to the RULE role. Must not be blank — a blank
+      pattern would match every event and block every shift, so leaving it empty
+      resets it to the default.
+    </div>
+  </div>
+
+  <div class="option">
+    <label for="ruleExclude">Commitment exclude substrings, comma-separated:</label>
+    <input type="text" id="ruleExclude" value="meeting">
+  </div>
+
+  <div class="option">
+    <label for="commitmentLabel">Commitment label (shown on rejected shifts):</label>
+    <input type="text" id="commitmentLabel" value="Commitment" placeholder="e.g. Fire Dept">
+    <div class="hint">
+      The word for &ldquo;I am already committed&rdquo; — your department, second
+      job, whatever. Appears as the reject chip, e.g. &ldquo;✕ Fire Dept&rdquo;.
+    </div>
+  </div>
+
+  <button id="save">Save</button>
+  <div id="status"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

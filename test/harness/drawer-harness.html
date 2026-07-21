@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Medic drawer harness — compose text</title>
+<style>
+  body { background: #202830; color: #cfd8e3; font: 13px/1.6 ui-monospace, Menlo, monospace; margin: 0; padding: 16px; }
+  button { font: inherit; margin-right: 8px; padding: 6px 10px; }
+  pre { background: #11161d; padding: 10px; white-space: pre-wrap; }
+</style>
+<h1>Drawer harness</h1>
+<p>Offline fidelity harness for the compose-text drawer. No W2W, no network, no extension APIs beyond a getURL shim.</p>
+<button id="tick">simulate scan tick x5</button>
+<button id="swap">swap board (drop Jul 27)</button>
+<h2>Expected message for Jul 23 + Jul 27</h2>
+<pre id="expected"></pre>
+
+<script>
+  // Shim: drawer.js calls chrome.runtime.getURL('ui/drawer.css').
+  window.chrome = { runtime: { getURL: (p) => new URL("/" + p, location.href).href } };
+</script>
+<script type="module">
+  import { initDrawer } from "/ui/drawer.js";
+  import { composeMessage } from "/core/compose.js";
+
+  const rows = [
+    { rank: 1, w2w_id: "id-jul23", date: "2026-07-23", dateLabel: "Thu Jul 23", tour: "Day",
+      start: "07:00", end: "19:00", pos: "Medic 9", locLine: "Northgate", famLabels: [],
+      isNew: false, score: 52, tier: "t1" },
+    { rank: 2, w2w_id: "id-jul25", date: "2026-07-25", dateLabel: "Sat Jul 25", tour: "Night",
+      start: "19:00", end: "07:00", pos: "Medic 1", locLine: "Lakeview", famLabels: [],
+      isNew: false, score: 31, tier: "t2" },
+    { rank: 3, w2w_id: "id-jul27", date: "2026-07-27", dateLabel: "Mon Jul 27", tour: "Night",
+      start: "23:00", end: "06:00", pos: "Medic 9", locLine: "Northgate · A. Testerson posted",
+      famLabels: [], isNew: false, score: 27, tier: "t2" },
+    { rank: 4, w2w_id: "id-jul28", date: "2026-07-28", dateLabel: "Tue Jul 28", tour: "Day",
+      start: "07:30", end: "13:30", pos: "Medic 1", locLine: "Northgate (0730 partial — Day under new rule)",
+      famLabels: [], isNew: true, score: 26, tier: "t2" },
+    { rank: 5, w2w_id: "id-jul29", date: "2026-07-29", dateLabel: "Wed Jul 29", tour: "Night",
+      start: "00:00", end: "06:00", pos: "Medic 9", locLine: "Lakeview (midnight start)",
+      famLabels: [], isNew: false, score: 24, tier: "t3" },
+  ];
+
+  const rejects = [
+    { w2w_id: "id-jul24", date: "2026-07-24", start: "07:00", end: "19:00",
+      dateLabel: "Fri Jul 24", tour: "Day", pos: "Medic 1", locLine: "Lakeview",
+      reason: "overlaps commitment" },
+    { w2w_id: "id-jul30", date: "2026-07-30", start: "19:00", end: "07:00",
+      dateLabel: "Thu Jul 30", tour: "Night", pos: "Medic 9", locLine: "Northgate",
+      reason: "no full open tour in gap" },
+  ];
+
+  function state(extra) {
+    return Object.assign({
+      monthLabel: "JUL 2026",
+      calAgeMs: 2 * 60 * 1000,
+      calError: null,
+      myschedStatus: "ok",
+      banner: null,
+      stats: { elig: rows.length, rej: rejects.length, best: 52, topCount: 1 },
+      rows,
+      rejects,
+      scanning: null,
+    }, extra || {});
+  }
+
+  const controller = initDrawer({
+    onScanAll: () => console.log("[harness] onScanAll"),
+    onRowClick: (id) => console.log("[harness] onRowClick", id),
+    onConnectCalendar: () => console.log("[harness] onConnectCalendar"),
+  });
+  controller.update(state());
+  window.__ctl = controller;
+  window.__state = state;
+
+  document.getElementById("expected").textContent = composeMessage([
+    { date: "2026-07-23", start: "07:00", end: "19:00" },
+    { date: "2026-07-27", start: "23:00", end: "06:00" },
+  ]);
+
+  document.getElementById("tick").onclick = () => {
+    for (let i = 1; i <= 5; i++) {
+      controller.update(state({ scanning: { active: true, done: i, total: 4 } }));
+    }
+    controller.update(state());
+    console.log("[harness] 5 scan ticks + final repaint done");
+  };
+
+  document.getElementById("swap").onclick = () => {
+    controller.update(state({ rows: rows.filter((r) => r.w2w_id !== "id-jul27") }));
+    console.log("[harness] board swapped — id-jul27 removed");
+  };
+</script>
