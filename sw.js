@@ -4,9 +4,16 @@
  * Purpose: on request from the content script, produce two triplet lists for
  * the scoring engine in NY-local "YYYY-MM-DD HH:MM" string form:
  *   - commitments: hard conflicts — every event of a REJECT calendar, plus the
- *     events of a RULE calendar whose title passes the user's rule regex.
+ *     events of a RULE calendar whose title matches the user's block list.
  *   - soft: annotations — every event of a FLAG calendar, plus the events of a
- *     RULE calendar whose title FAILS that regex.
+ *     RULE calendar whose title does NOT match.
+ *
+ * A RULE calendar's block list is the set of real event titles the user ticked
+ * in the picker (`calBlockTitles`), matched by stem, anchored at the start of
+ * the title. THAT IS THE WHOLE BLOCKING SET: a RULE calendar with nothing
+ * ticked blocks NOTHING. The older ruleInclude/ruleExclude regex applies only
+ * to a user who explicitly opted into the advanced pattern hatch (the stored
+ * `ruleUsePattern` flag) — never as a fallback inferred from an empty tick list.
  *
  * Calendar identity is per-user config, never code. Every Google calendar the
  * signed-in account can see carries one of four roles — OFF | FLAG | REJECT |
@@ -25,8 +32,9 @@
  *     DEBUG flag (default false) gates the only verbose logging, and even then
  *     we log counts/warnings/mode — never event summaries.
  *   - OFF calendars are never fetched: the refresh loop skips them before any
- *     events request, so their contents never reach this extension. Every
- *     calendar except the signed-in account's own primary starts OFF.
+ *     events request, so their contents never reach this extension. EVERY
+ *     calendar starts OFF — including the signed-in account's own primary.
+ *     Nothing is read until the user explicitly turns it on.
  *
  * ALL chrome.* references live inside function/listener bodies (the sole
  * top-level touch is the typeof-guarded addListener at the bottom) so a bare
@@ -34,7 +42,7 @@
  * — succeeds without a chrome global.
  */
 
-import { toEpoch, civilFromEpoch, addDays } from "./core/nytime.js";
+import { toEpoch, civilFromEpoch, addDays, parseCivil } from "./core/nytime.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,6 +68,24 @@ const LABEL_SEP = " · ";
 
 const ROLES = ["OFF", "FLAG", "REJECT", "RULE"];
 const ROLES_KEY = "calRoles";
+
+// Per-calendar list of the event titles the user ticked as "I am unavailable":
+// { [calendarId]: string[] }. This is the ONLY way a RULE calendar decides a
+// hard reject unless the pattern hatch below is explicitly armed. Empty list ⇒
+// that calendar blocks nothing.
+const BLOCK_TITLES_KEY = "calBlockTitles";
+
+// The user's explicit opt-in to the legacy regex ("advanced pattern") hatch.
+// Written ONLY by handleSetRuleFilter, i.e. only when the user opened the
+// advanced disclosure on the options page and saved a real pattern.
+//
+// This flag exists because the alternative — inferring "use the regex" from an
+// EMPTY ticked list — is the bug it replaces: it made a RULE calendar with
+// nothing ticked hard-reject every event matching the default "^Work\b", which
+// is the exact opposite of what the options page tells the user that state
+// means, and it made "I want nothing to block" unrepresentable (un-ticking
+// everything stores [] and would re-arm the regex).
+const PATTERN_OPT_IN_KEY = "ruleUsePattern";
 
 const CACHE_KEY = "calCache";
 
@@ -135,32 +161,176 @@ export function ruleMatches(summary, includeRe, excludes) {
   return true;
 }
 
+// The separators that end a title's leading segment. Three dash variants
+// (hyphen, em dash, en dash) each surrounded by spaces, plus colon-space.
+//
+// These carry ASCII spaces ONLY, which is safe exclusively because every title
+// is run through normalizeTitleWhitespace() first — see the note there.
+const STEM_SEPARATORS = [" - ", " — ", " – ", ": "];
+
+// Zero-width characters: deleted outright. They are invisible, so a title
+// carrying one must behave as the identical-looking title without it.
+const ZERO_WIDTH_RE = /[\u200B\u200C\u200D\u2060\uFEFF]/g;
+
+// Every other space-like character, folded to a plain ASCII space: tab, the
+// newline family, NO-BREAK SPACE (U+00A0), OGHAM SPACE MARK, the U+2000–200A
+// run (which includes FIGURE SPACE U+2007), NARROW NO-BREAK SPACE (U+202F),
+// MEDIUM MATHEMATICAL SPACE (U+205F) and IDEOGRAPHIC SPACE (U+3000).
+const SPACE_LIKE_RE = /[\t\n\v\f\r\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * Fold a title's exotic whitespace to plain ASCII spaces.
+ *
+ * WHY THIS EXISTS. iCal and Outlook feed exports routinely emit a NO-BREAK
+ * SPACE around the dash in a title, so what the user reads as "ACME - Desk" is
+ * really "ACME\u00A0-\u00A0Desk". Matched literally, that title never stems:
+ * titleStem hands back the whole string, so the ticked title stops matching its
+ * own siblings ("ACME - Night Tour") and the shift is offered as free while the
+ * user is on a tour. The failure is asymmetric — it depends on which of the two
+ * titles carried the odd character — and completely invisible.
+ *
+ * Applied to BOTH sides of every comparison: the stored ticked titles and the
+ * incoming event titles. Normalizing only one side would just move the seam.
+ *
+ * DOES NOT TRIM. titleStem depends on a leading separator staying at index 0 so
+ * that " - Desk" still reads as an empty stem rather than a real one.
+ *
+ * @param {unknown} s
+ * @returns {string} "" for any non-string
+ */
+export function normalizeTitleWhitespace(s) {
+  if (typeof s !== "string") return "";
+  return s.replace(ZERO_WIDTH_RE, "").replace(SPACE_LIKE_RE, " ").replace(/ {2,}/g, " ");
+}
+
+/**
+ * The leading segment of an event title, before the first separator.
+ *
+ * "First" means EARLIEST BY POSITION across all four separators, not the first
+ * separator that happens to appear in STEM_SEPARATORS — "Standby: Ladder - 2"
+ * must stem to "Standby", not to "Standby: Ladder".
+ *
+ * A title with no separator is its own stem, trimmed. That is what makes a
+ * one-off title like "Tech rescue Training" tickable as itself.
+ *
+ *   "ACME - Desk"                -> "ACME"
+ *   "ACME - Water Rescue Drill"  -> "ACME"
+ *   "Medic 1 Shift"              -> "Medic 1 Shift"
+ *
+ * Whitespace is normalized FIRST, so a feed that writes the separator with a
+ * NO-BREAK SPACE stems exactly like the same title written with plain spaces.
+ * Without that, the separator search silently misses and the whole title comes
+ * back as its own stem — see normalizeTitleWhitespace.
+ *
+ * @param {unknown} title
+ * @returns {string} the stem, trimmed ("" for non-string/blank input)
+ */
+export function titleStem(title) {
+  if (typeof title !== "string") return "";
+  // Normalized but NOT trimmed: a title that OPENS with a separator (" - Desk")
+  // has an empty leading segment, and trimming first would hide the separator
+  // and hand back "- Desk" as if it were a real stem.
+  const str = normalizeTitleWhitespace(title);
+  let cut = -1;
+  for (const sep of STEM_SEPARATORS) {
+    const i = str.indexOf(sep);
+    if (i > -1 && (cut === -1 || i < cut)) cut = i;
+  }
+  return (cut === -1 ? str : str.slice(0, cut)).trim();
+}
+
+// A "word" character for the stem-boundary test: any Unicode letter, digit,
+// combining mark, or underscore. NOT /\w/ — see titlesToMatcher.
+const WORD_CHAR_RE = /[\p{L}\p{N}\p{M}_]/u;
+
+/**
+ * Build the predicate behind "these titles mean I am unavailable".
+ *
+ * The user ticks real titles off their own calendar; each is reduced to its
+ * stem, and an event matches if its title STARTS WITH one of those stems,
+ * case-insensitively, at a word boundary.
+ *
+ * ANCHORING IS THE WHOLE POINT. A substring rule would be a silent disaster: a
+ * calendar can hold an all-day memorial like "Jordan Rivers - ACME Memorial
+ * 1944", which CONTAINS "ACME" but is not a commitment. Under a substring rule
+ * that event hard-rejects every shift touching that day and the user never
+ * learns why. It must not match — it does not START with the stem.
+ *
+ * The word-boundary check stops "ACME" from swallowing "ACMEX"; a stem followed
+ * by a separator, space, or end-of-string still matches, which is the case that
+ * actually occurs ("ACME" ticked, "ACME - Night Tour" must match).
+ *
+ * Matching is done with string comparison, never a compiled RegExp: the stems
+ * are raw user calendar data and may contain regex metacharacters ("C++ Class",
+ * "Q3 (tentative)"), which would either throw or match the wrong thing.
+ *
+ * Two ways the input can be degenerate, both handled the same way — DISCARD:
+ * non-string or blank entries, and entries whose stem is empty. An empty stem
+ * would make startsWith("") true for every event, i.e. hard-reject everything.
+ * An EMPTY ticked list therefore yields a matcher that matches NOTHING. Never
+ * everything: this codebase has already shipped that bug once (see
+ * resolveIncludeRegex) and it hid every shift the user could have taken.
+ *
+ * The boundary test is UNICODE-AWARE (\p{L}\p{N}\p{M}_), not /\w/. /\w/ is
+ * ASCII-only, so for a Cyrillic, Greek or CJK title every following letter reads
+ * as a non-word character and the boundary protection silently evaporates —
+ * anchored matching quietly degrades into bare prefix matching, and a ticked
+ * stem starts swallowing longer unrelated words in exactly the alphabets where
+ * nobody is watching for it.
+ *
+ * @param {unknown} titles  array of ticked event titles (any shape — user data)
+ * @returns {(eventTitle:string)=>boolean}
+ */
+export function titlesToMatcher(titles) {
+  const stems = [];
+  for (const t of Array.isArray(titles) ? titles : []) {
+    const stem = titleStem(t);
+    if (stem === "") continue; // blank / non-string / separator-led — discard
+    const low = stem.toLowerCase();
+    if (!stems.includes(low)) stems.push(low);
+  }
+  if (stems.length === 0) return () => false; // match NOTHING, never everything
+  return function matches(eventTitle) {
+    if (typeof eventTitle !== "string") return false;
+    // Normalized on this side too: the stems above already went through
+    // titleStem, so comparing a raw incoming title against them would make the
+    // match depend on which of the two carried the odd whitespace.
+    const low = normalizeTitleWhitespace(eventTitle).trim().toLowerCase();
+    for (const stem of stems) {
+      if (!low.startsWith(stem)) continue;
+      const next = low.charAt(stem.length);
+      // End of string, or a non-word char — "ACME" must not match "ACMEX".
+      if (next === "" || !WORD_CHAR_RE.test(next)) return true;
+    }
+    return false;
+  };
+}
+
 /**
  * The role a calendar takes when the user has never picked one for it.
  *
- * The cascade is deliberately minimal, because for a freshly-installed user we
- * know nothing about which calendars represent real commitments:
+ * EVERY calendar defaults to OFF — the primary included. There is no cascade
+ * and no exception:
  *
- *   - NO default may produce a hard REJECT. A wrong reject silently hides a
- *     shift the user was actually free to take, and we would be guessing. Hard
- *     rejects are opt-in, always.
- *   - The signed-in account's own primary calendar defaults to FLAG. It is the
- *     one calendar we can be sure belongs to the user, so annotating shifts
- *     with it gives immediate value on first run while blocking nothing.
- *   - Everything else defaults to OFF, so no other calendar — shared, family,
- *     subscribed holidays, a coworker's — is even fetched until the user opts
- *     in. Least data leaves Google by default.
+ *   - A default may never produce a hard REJECT. A wrong reject silently hides
+ *     a shift the user was actually free to take, and we would be guessing.
+ *   - A default may never produce a FLAG either, not even on the primary. The
+ *     primary calendar is the MOST sensitive one the account holds — a family
+ *     member's surgery, a therapy appointment, a lawyer's name in an event
+ *     title. Reading it because we assumed consent is not ours to assume, and
+ *     annotating with it means those titles get rendered onto a work page.
+ *   - OFF means the refresh loop never issues an events request for it at all,
+ *     so its contents never leave Google.
  *
- * RULE is never a default: its protection only exists once the user has written
- * a regex describing their own title convention, so defaulting to it would buy
- * no safety over FLAG while implying a rule that isn't really configured.
+ * Accepted cost: a freshly-installed user gets no scoring value until they open
+ * the picker and turn a calendar on. That is the correct trade — the extension
+ * has nothing to say about a user's availability until the user tells it which
+ * calendars represent real commitments.
  *
- * @param {{id:string, summary?:string, primary?:boolean}} item
- * @returns {string} one of ROLES
+ * @param {{id:string, summary?:string, primary?:boolean}} _item
+ * @returns {string} always "OFF"
  */
-export function defaultRole(item) {
-  if (!item) return "OFF";
-  if (item.primary === true) return "FLAG";
+export function defaultRole(_item) {
   return "OFF";
 }
 
@@ -169,28 +339,67 @@ export function defaultRole(item) {
  * stored map is sparse and may have been hand-edited, so an entry that isn't a
  * known role falls back to defaultRole.
  *
+ * DISPLAY NAME: `summaryOverride` is the name the USER gave the calendar in
+ * Google Calendar; `summary` is the name its owner gave it. When both exist the
+ * override wins everywhere — display, label prefix, and sort key — or the user
+ * would be shown a calendar they renamed under a name they do not recognise.
+ *
+ * ACCESS ROLE is carried through untouched. A "freeBusyReader" calendar returns
+ * events with NO summary at all, so a title picker over it can only ever render
+ * blank rows; the UI needs this field to say so instead of looking broken.
+ *
  * Primary gets an empty prefix because Google returns the account email as its
  * summary — unusable as a label, and an address we should not be rendering.
  *
- * @param {object[]} items  calendarList items (id, summary, primary)
+ * DELETED calendars are dropped: they are not things the user still has.
+ *
+ * HIDDEN calendars are NOT. "Hide from list" in Google Calendar is a display
+ * preference — the user is still subscribed, and the calendar still holds the
+ * tours that must knock a shift out. Dropping it here (combined with Google
+ * omitting it entirely unless the request passes showHidden=true) meant a stored
+ * REJECT role stopped being consulted the moment the user tidied their sidebar:
+ * the calendar silently stopped blocking AND disappeared from the options page,
+ * so the failure was both invisible and un-fixable.
+ *
+ * A hidden calendar is therefore kept whenever the user has given it a real
+ * blocking-capable role (FLAG/REJECT/RULE), and flagged `hiddenInGoogle` so the
+ * options page can label it rather than looking like it invented a calendar the
+ * user cannot find. A hidden calendar with no stored role — or an explicit OFF —
+ * is still dropped: it is nothing the user has spoken about, it is not blocking
+ * anything, and accounts accumulate dozens of them.
+ *
+ * @param {object[]} items  calendarList items
  * @param {object} storedRoles  the calRoles map (may be undefined/sparse)
- * @returns {Array<{id:string, summary:string, primary:boolean, role:string, prefix:string}>}
- *          primary first, then case-insensitive alpha by summary
+ * @returns {Array<{id:string, summary:string, primary:boolean, role:string,
+ *                  prefix:string, accessRole:string, selected:boolean,
+ *                  hiddenInGoogle:boolean}>}
+ *          primary first, then case-insensitive alpha by display name
  */
 export function resolveRoles(items, storedRoles) {
   const roles = storedRoles || {};
-  const out = (items || []).map((it) => {
-    const summary = it.summary || "";
-    const primary = it.primary === true;
-    const stored = roles[it.id];
-    return {
-      id: it.id,
-      summary,
-      primary,
-      role: ROLES.includes(stored) ? stored : defaultRole(it),
-      prefix: primary ? "" : summary,
-    };
-  });
+  const out = (items || [])
+    .filter((it) => {
+      if (!it || it.deleted === true) return false;
+      if (it.hidden !== true) return true;
+      const stored = roles[it.id];
+      return ROLES.includes(stored) && stored !== "OFF";
+    })
+    .map((it) => {
+      const override = typeof it.summaryOverride === "string" ? it.summaryOverride.trim() : "";
+      const summary = override || it.summary || "";
+      const primary = it.primary === true;
+      const stored = roles[it.id];
+      return {
+        id: it.id,
+        summary,
+        primary,
+        role: ROLES.includes(stored) ? stored : defaultRole(it),
+        prefix: primary ? "" : summary,
+        accessRole: typeof it.accessRole === "string" ? it.accessRole : "",
+        selected: it.selected === true,
+        hiddenInGoogle: it.hidden === true,
+      };
+    });
   out.sort((a, b) => {
     if (a.primary !== b.primary) return a.primary ? -1 : 1;
     const as = a.summary.toLowerCase();
@@ -232,6 +441,127 @@ export function bucketEvents(events, role, rule, prefix) {
     else soft.push(row);
   }
   return { commitments, soft };
+}
+
+/**
+ * Roll a calendar's events up into the DISTINCT titles the picker offers.
+ *
+ * Titles are grouped verbatim (trimmed) rather than by stem: the user is
+ * picking their own real event titles, and collapsing "ACME - Desk" into "ACME"
+ * before they have chosen would hide from them what they are actually ticking.
+ * Stemming happens later, in titlesToMatcher, on what they picked.
+ *
+ * typicalMinutes is the MEDIAN duration of that title's occurrences (even
+ * counts take the lower of the two middle values). Median, not mean, because a
+ * single mis-entered all-day copy of a 12-hour tour would drag a mean far
+ * enough to misdescribe the title in the picker.
+ *
+ * Cancelled, untriplet-able, and blank-titled events are dropped — a blank row
+ * is not something a user can meaningfully tick.
+ *
+ * Sorted most-frequent first, ties broken case-insensitively by title so the
+ * order is stable between calls.
+ *
+ * @param {object[]} events
+ * @returns {Array<{title:string, count:number, typicalMinutes:number}>}
+ */
+export function summarizeTitles(events) {
+  const byTitle = new Map();
+  for (const ev of events || []) {
+    if (!ev || ev.status === "cancelled") continue;
+    const title = typeof ev.summary === "string" ? ev.summary.trim() : "";
+    if (title === "") continue;
+    const trip = buildTriplet(ev);
+    if (!trip) continue;
+    let mins = 0;
+    try {
+      mins = Math.round((toEpoch(parseCivil(trip[1])) - toEpoch(parseCivil(trip[0]))) / 60);
+    } catch (_e) {
+      mins = 0; // unparseable bound — count the event, claim no duration for it
+    }
+    if (!Number.isFinite(mins) || mins < 0) mins = 0;
+    const bucket = byTitle.get(title) || [];
+    bucket.push(mins);
+    byTitle.set(title, bucket);
+  }
+  const out = [];
+  for (const [title, durations] of byTitle) {
+    durations.sort((a, b) => a - b);
+    const mid = Math.floor((durations.length - 1) / 2); // lower median on ties
+    out.push({ title, count: durations.length, typicalMinutes: durations[mid] });
+  }
+  out.sort((a, b) => {
+    if (a.count !== b.count) return b.count - a.count;
+    const at = a.title.toLowerCase();
+    const bt = b.title.toLowerCase();
+    return at < bt ? -1 : at > bt ? 1 : 0;
+  });
+  return out;
+}
+
+/**
+ * The commitment predicate for ONE calendar.
+ *
+ * A RULE calendar's blocking set is its ticked titles, FULL STOP. Nothing ticked
+ * means nothing blocks — the matcher matches nothing, and every event on that
+ * calendar becomes a soft note.
+ *
+ * EMPTINESS IS NOT A REQUEST FOR THE REGEX. Routing an empty ticked list to the
+ * legacy pattern is the defect this signature exists to kill: resolveIncludeRegex
+ * turns an absent pattern into the anchored default "^Work\b", so a RULE calendar
+ * the user had ticked nothing on silently hard-rejected every event titled
+ * "Work…". That contradicted the options page in three places (it renders
+ * "Nothing ticked yet — this calendar blocks nothing"), and it made "I want
+ * nothing to block" unrepresentable: un-ticking everything stores [], which
+ * re-armed the regex.
+ *
+ * The pattern hatch therefore requires an EXPLICIT stored opt-in
+ * (`ruleUsePattern`, resolved by resolvePatternOptIn) — never an inference from
+ * an empty list. Ticked titles still win over the pattern when both are present:
+ * the picker is what a configured user actually sees and edits.
+ *
+ * @param {unknown} tickedTitles  calBlockTitles[calId]
+ * @param {(title:string)=>boolean} regexRule  the legacy global rule predicate
+ * @param {boolean} usePattern  the user's explicit pattern-hatch opt-in
+ * @returns {{rule:(title:string)=>boolean, mode:"titles"|"regex"|"none"}}
+ */
+export function calendarRule(tickedTitles, regexRule, usePattern) {
+  const list = Array.isArray(tickedTitles) ? tickedTitles : [];
+  const usable = list.filter((t) => titleStem(t) !== "");
+  if (usable.length > 0) return { rule: titlesToMatcher(usable), mode: "titles" };
+  if (usePattern === true && typeof regexRule === "function") {
+    return { rule: regexRule, mode: "regex" };
+  }
+  return { rule: () => false, mode: "none" };
+}
+
+/**
+ * Has the user explicitly opted into the advanced pattern hatch?
+ *
+ * Two things count, and emptiness is not one of them:
+ *
+ *   - `ruleUsePattern === true`: written by handleSetRuleFilter, i.e. the user
+ *     opened the advanced disclosure and saved a valid pattern. This is the
+ *     signal going forward.
+ *   - a stored non-blank `ruleInclude`: the same affirmative act, performed
+ *     before the flag existed. A pattern can only ever reach storage through
+ *     handleSetRuleFilter, which refuses blank and invalid input, so its presence
+ *     IS a past opt-in. Honouring it is what stops an upgrade from silently
+ *     disarming a working configuration — the same failure mode as a hidden
+ *     calendar losing its REJECT role.
+ *
+ * MUST be given the RAW stored object. Reading storage with a defaults object
+ * (chrome.storage.local.get(DEFAULTS)) backfills ruleInclude with the default
+ * pattern for users who never saved one, which would read as an opt-in for
+ * everybody.
+ *
+ * @param {unknown} store  raw chrome.storage.local contents
+ * @returns {boolean}
+ */
+export function resolvePatternOptIn(store) {
+  const s = store && typeof store === "object" ? store : {};
+  if (s[PATTERN_OPT_IN_KEY] === true) return true;
+  return typeof s.ruleInclude === "string" && s.ruleInclude.trim() !== "";
 }
 
 // ---------------------------------------------------------------------------
@@ -287,10 +617,22 @@ export function parseExcludes(src) {
     .filter((x) => x.length > 0);
 }
 
+// Read RAW — never with a defaults object. get(DEFAULTS) backfills ruleInclude
+// with the default pattern for a user who never saved one, and resolvePatternOptIn
+// would then read that as an opt-in for every user on earth.
 async function loadConfig() {
-  const cfg = await chrome.storage.local.get(DEFAULTS);
+  const cfg = await chrome.storage.local.get(["ruleInclude", "ruleExclude", PATTERN_OPT_IN_KEY]);
+  const usePattern = resolvePatternOptIn(cfg);
   const { includeRe, warnings } = resolveIncludeRegex(cfg.ruleInclude);
-  return { includeRe, excludes: parseExcludes(cfg.ruleExclude), warnings };
+  return {
+    includeRe,
+    excludes: parseExcludes(cfg.ruleExclude),
+    usePattern,
+    // A broken/absent pattern only matters to someone actually using the hatch.
+    // Warning everyone else about a regex that is never consulted is noise, and
+    // noise is how a real warning gets ignored.
+    warnings: usePattern ? warnings : [],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,9 +744,27 @@ function taggedError(code, message) {
 async function listCalendars(holder) {
   const items = [];
   let pageToken = "";
-  const fields = "items(id,summary,primary),nextPageToken";
+  // accessRole: freeBusyReader calendars return titleless events — the picker
+  //   must be told, not left rendering blank rows.
+  // summaryOverride: the user's own rename of the calendar; preferred over
+  //   summary so they recognise it.
+  // selected: mirrors the checkbox in Google Calendar — an ordering signal.
+  // deleted/hidden: deleted calendars are dropped; hidden ones are KEPT when the
+  //   user has given them a blocking role (see resolveRoles).
+  const fields =
+    "items(id,summary,summaryOverride,primary,accessRole,selected,deleted,hidden),nextPageToken";
   do {
-    let url = `${CAL_BASE}/users/me/calendarList?maxResults=250&fields=${encodeURIComponent(fields)}`;
+    // showHidden=true is REQUIRED, not an optimization. Without it Google omits
+    // every calendar the user has "Hide from list"-ed — which is a display
+    // preference, not an unsubscribe. A fire-department calendar set to REJECT
+    // and then hidden would vanish from this response, its stored role would
+    // never be consulted, and it would stop blocking without a word. It also
+    // disappeared from the options list, so the user could neither see the
+    // problem nor undo it. showDeleted stays OFF: a deleted calendar really is
+    // gone, and resolveRoles drops any that slip through anyway.
+    let url =
+      `${CAL_BASE}/users/me/calendarList?maxResults=250&showHidden=true` +
+      `&fields=${encodeURIComponent(fields)}`;
     if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
     const data = await authedFetch(url, holder);
     if (Array.isArray(data.items)) items.push(...data.items);
@@ -445,6 +805,36 @@ export function nyMidnightRfc3339(dateStr, plusDays) {
   return new Date(epochSec * 1000).toISOString();
 }
 
+// How far either side of today the title picker samples when the caller has no
+// window of its own. Wide enough that a monthly or quarterly commitment shows
+// up at all — a title the user never sees is a title they cannot tick.
+const TITLE_SAMPLE_BACK_DAYS = 30;
+const TITLE_SAMPLE_FWD_DAYS = 60;
+
+/**
+ * The NY date range a title sample covers. Honours an explicit window when the
+ * caller has one; otherwise spans TITLE_SAMPLE_BACK/FWD days around today.
+ *
+ * Sampling only ever decides WHICH TITLES ARE OFFERED, never whether a shift is
+ * blocked, so a default that is wider than the scored window is harmless.
+ *
+ * @param {unknown} start  "YYYY-MM-DD" or absent
+ * @param {unknown} end    "YYYY-MM-DD" or absent
+ * @param {number} [nowMs] injectable clock for tests
+ * @returns {{start:string, end:string}}
+ */
+export function titleSampleWindow(start, end, nowMs) {
+  const ok = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (ok(start) && ok(end) && start <= end) return { start, end };
+  const today = civilFromEpoch((nowMs === undefined ? Date.now() : nowMs) / 1000);
+  const base = { y: today.y, mo: today.mo, d: today.d, h: 0, mi: 0 };
+  const iso = (c) => `${c.y}-${pad2(c.mo)}-${pad2(c.d)}`;
+  return {
+    start: iso(addDays(base, -TITLE_SAMPLE_BACK_DAYS)),
+    end: iso(addDays(base, TITLE_SAMPLE_FWD_DAYS)),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Refresh: token → calendarList → per-calendar events → triplet lists → cache
 // ---------------------------------------------------------------------------
@@ -466,24 +856,28 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
     return errorResponse(e);
   }
 
-  const stored = (await chrome.storage.local.get(ROLES_KEY))[ROLES_KEY];
-  const cals = resolveRoles(calItems, stored);
+  const store = await chrome.storage.local.get([ROLES_KEY, BLOCK_TITLES_KEY]);
+  const cals = resolveRoles(calItems, store[ROLES_KEY]);
+  const blockTitles = store[BLOCK_TITLES_KEY] || {};
 
   const timeMin = nyMidnightRfc3339(windowStart, 0);
   const timeMax = nyMidnightRfc3339(windowEnd, 1); // +1 day: exclusive upper bound
 
   const commitments = [];
   const soft = [];
-  const rule = (title) => ruleMatches(title, cfg.includeRe, cfg.excludes);
+  const regexRule = (title) => ruleMatches(title, cfg.includeRe, cfg.excludes);
 
   try {
     for (const cal of cals) {
       if (cal.role === "OFF") continue; // never fetched — no request is made at all
       const evs = await listEvents(holder, cal.id, timeMin, timeMax);
+      // Ticked titles are per-calendar and are the whole blocking set. The
+      // legacy regex is consulted ONLY for a user who explicitly armed it.
+      const { rule, mode } = calendarRule(blockTitles[cal.id], regexRule, cfg.usePattern);
       const b = bucketEvents(evs, cal.role, rule, cal.prefix);
       commitments.push(...b.commitments);
       soft.push(...b.soft);
-      dlog("calendar events", cal.role, evs.length);
+      dlog("calendar events", cal.role, mode, evs.length);
     }
   } catch (e) {
     return errorResponse(e);
@@ -567,12 +961,27 @@ async function handleListCalendars(msg) {
     return errorResponse(e);
   }
 
-  const store = await chrome.storage.local.get([ROLES_KEY, "ruleInclude", "ruleExclude"]);
+  const store = await chrome.storage.local.get([
+    ROLES_KEY,
+    BLOCK_TITLES_KEY,
+    PATTERN_OPT_IN_KEY,
+    "ruleInclude",
+    "ruleExclude",
+  ]);
+  const blockTitles = store[BLOCK_TITLES_KEY] || {};
   const calendars = resolveRoles(calItems, store[ROLES_KEY]).map((c) => ({
     id: c.id,
     summary: c.summary,
     primary: c.primary,
     role: c.role,
+    // accessRole lets the panel warn instead of rendering a titleless picker;
+    // blockTitles lets it show what is already ticked without a second round trip.
+    accessRole: c.accessRole,
+    selected: c.selected,
+    // Hidden in Google Calendar but still configured here — the panel must say
+    // so, or it looks like it conjured up a calendar the user cannot find.
+    hiddenInGoogle: c.hiddenInGoogle,
+    blockTitles: Array.isArray(blockTitles[c.id]) ? blockTitles[c.id] : [],
   }));
 
   return {
@@ -581,6 +990,9 @@ async function handleListCalendars(msg) {
     ruleFilter: {
       include: typeof store.ruleInclude === "string" ? store.ruleInclude : DEFAULTS.ruleInclude,
       exclude: typeof store.ruleExclude === "string" ? store.ruleExclude : DEFAULTS.ruleExclude,
+      // Whether the pattern is actually ARMED — without it the panel cannot tell
+      // an inert legacy pattern from one that is deciding hard rejects.
+      usePattern: resolvePatternOptIn(store),
     },
   };
 }
@@ -614,7 +1026,125 @@ async function handleSetRuleFilter(msg) {
   } catch (_err) {
     return { ok: false, error: "bad_regex" }; // reject without persisting
   }
-  await chrome.storage.local.set({ ruleInclude: include, ruleExclude: exclude });
+  // Saving a pattern IS the opt-in, and it is written in the same set() as the
+  // pattern itself: the flag is what arms the hatch, and a pattern stored
+  // without it would be inert config the user believes is blocking shifts.
+  await chrome.storage.local.set({
+    ruleInclude: include,
+    ruleExclude: exclude,
+    [PATTERN_OPT_IN_KEY]: true,
+  });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
+/**
+ * List ONE calendar's distinct event titles, so the user can tick the ones that
+ * mean "I am unavailable" instead of writing a regex.
+ *
+ * -> { type:"listCalendarTitles", calendarId[, windowStart, windowEnd] }
+ * <- { ok:true, titles:[{title,count,typicalMinutes}], accessRole, blockTitles }
+ * <- { ok:false, error }   error:"calendar_off" when the calendar is not
+ *                          switched on — this handler reads events, so it is
+ *                          gated on the same stored role everything else is.
+ *
+ * windowStart/windowEnd are the same NY date strings getCalendarData takes. A
+ * caller that has a scored window (the drawer) should pass it so the picker
+ * samples exactly what will be scored; the options page has no window of its
+ * own, so omitting them falls back to a sampling window around today. The
+ * fallback is only ever used to POPULATE A LIST OF TITLES — it never decides
+ * whether a shift is blocked, so a wider-than-scored sample costs nothing but
+ * an extra row in the picker.
+ *
+ * blockTitles echoes back what is currently ticked for this calendar, so the
+ * picker can render its checkboxes without a second round trip.
+ *
+ * A freeBusyReader calendar returns events with no summary at all, so there is
+ * nothing to pick. We return an EMPTY list plus the accessRole and let the UI
+ * explain that, rather than rendering rows of blanks that look like a bug.
+ */
+async function handleListCalendarTitles(msg) {
+  const calendarId = msg && msg.calendarId;
+  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  const win = titleSampleWindow(msg.windowStart, msg.windowEnd);
+
+  const tok = await getToken(false);
+  if (!tok.token) return { ok: false, ...classifyAuthError(tok.error) };
+  const holder = { token: tok.token, refreshed: false };
+
+  let calItems;
+  try {
+    calItems = await listCalendars(holder);
+  } catch (e) {
+    return errorResponse(e);
+  }
+  const stored = await chrome.storage.local.get([ROLES_KEY, BLOCK_TITLES_KEY]);
+  const cal = resolveRoles(calItems, stored[ROLES_KEY]).find((c) => c.id === calendarId);
+  if (!cal) return { ok: false, error: "unknown_calendar" };
+
+  // THE ROLE GATE. PRIVACY.md promises the extension reads only "the calendars
+  // you've configured it to read", and this worker has to enforce that itself
+  // rather than trusting whoever sent the message: it previously resolved roles
+  // against an EMPTY map and then fetched whatever calendarId it was handed, so
+  // one stray message would have read an OFF calendar's event titles.
+  //
+  // No deadlock for the legitimate caller: the options page awaits
+  // setCalendarRole (which persists FLAG) BEFORE it asks for titles, so by the
+  // time this runs the calendar the user just switched on is already non-OFF.
+  if (cal.role === "OFF") return { ok: false, error: "calendar_off" };
+
+  const blockTitles = Array.isArray((stored[BLOCK_TITLES_KEY] || {})[calendarId])
+    ? stored[BLOCK_TITLES_KEY][calendarId]
+    : [];
+
+  // A freeBusyReader grant returns events with no summary at all. Return the
+  // empty list and the accessRole so the UI can say why, instead of drawing
+  // rows of blanks that read as a broken picker.
+  if (cal.accessRole === "freeBusyReader") {
+    return { ok: true, titles: [], accessRole: cal.accessRole, blockTitles };
+  }
+
+  try {
+    const evs = await listEvents(
+      holder,
+      calendarId,
+      nyMidnightRfc3339(win.start, 0),
+      nyMidnightRfc3339(win.end, 1) // +1 day: exclusive upper bound
+    );
+    const titles = summarizeTitles(evs);
+    dlog("listCalendarTitles", evs.length, titles.length);
+    return { ok: true, titles, accessRole: cal.accessRole, blockTitles };
+  } catch (e) {
+    return errorResponse(e);
+  }
+}
+
+/**
+ * Persist the ticked titles for one calendar under `calBlockTitles`.
+ *
+ * An empty array is a legitimate value — it is how the user says "nothing on
+ * this calendar blocks a shift" — so it is stored, not rejected. calendarRule()
+ * reads it as "match nothing": never as "block everything", and no longer as
+ * "fall back to the legacy regex" either.
+ *
+ * Drops the cache for the same reason the other mutators do: a cache bucketed
+ * under the old titles would keep applying blocks the user just removed.
+ */
+async function handleSetBlockTitles(msg) {
+  const calendarId = msg && msg.calendarId;
+  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  if (!Array.isArray(msg.titles)) return { ok: false, error: "bad_titles" };
+
+  const titles = [];
+  for (const t of msg.titles) {
+    if (typeof t !== "string") continue;
+    const trimmed = t.trim();
+    if (trimmed !== "" && !titles.includes(trimmed)) titles.push(trimmed);
+  }
+
+  const map = (await chrome.storage.local.get(BLOCK_TITLES_KEY))[BLOCK_TITLES_KEY] || {};
+  map[calendarId] = titles;
+  await chrome.storage.local.set({ [BLOCK_TITLES_KEY]: map });
   await chrome.storage.local.remove(CACHE_KEY);
   return { ok: true };
 }
@@ -622,7 +1152,9 @@ async function handleSetRuleFilter(msg) {
 const HANDLERS = {
   getCalendarData: handleGetCalendarData,
   listCalendars: handleListCalendars,
+  listCalendarTitles: handleListCalendarTitles,
   setCalendarRole: handleSetCalendarRole,
+  setBlockTitles: handleSetBlockTitles,
   setRuleFilter: handleSetRuleFilter,
 };
 

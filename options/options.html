@@ -3,100 +3,265 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Medic Tradeboard Options</title>
+  <title>Choose your calendars</title>
   <style>
+    :root {
+      --ink: #16191d;
+      --ink-soft: #5b6472;
+      --line: #dfe3e8;
+      --bg-soft: #f6f7f9;
+      --accent: #0066cc;
+      --danger: #b3261e;
+      --danger-bg: #fdecea;
+      --danger-line: #f0b4ae;
+    }
+    * { box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      padding: 20px;
-      max-width: 600px;
-      line-height: 1.6;
+      color: var(--ink);
+      margin: 0 auto;
+      padding: 32px 20px 80px;
+      max-width: 720px;
+      line-height: 1.55;
+      font-size: 15px;
     }
-    .option {
-      margin-bottom: 16px;
+    h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+    .subtitle { color: var(--ink-soft); margin: 0 0 20px; }
+    h2 { font-size: 17px; margin: 0 0 4px; }
+
+    /* ---- loud states ------------------------------------------------- */
+    .banner {
+      border: 1px solid var(--danger-line);
+      background: var(--danger-bg);
+      border-left: 4px solid var(--danger);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin: 0 0 18px;
     }
-    label {
-      display: block;
-      margin-bottom: 6px;
-      font-weight: 500;
+    .banner h2 { color: var(--danger); }
+    .banner p { margin: 6px 0 0; font-size: 14px; color: #6b2b26; }
+    .banner-sub { font-weight: 600; font-size: 14px; }
+    .banner button {
+      margin-top: 10px;
+      background: var(--danger);
     }
-    input {
-      width: 100%;
-      padding: 8px;
-      border: 1px solid #ccc;
-      border-radius: 4px;
-      font-family: inherit;
-      box-sizing: border-box;
-    }
+    .banner button:hover { background: #8c1d17; }
+    [hidden] { display: none !important; }
+
+    /* ---- privacy note ------------------------------------------------ */
     .note {
-      padding: 8px 0;
-      color: #555;
-      font-size: 14px;
-      margin-bottom: 16px;
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 13.5px;
+      color: var(--ink-soft);
+      margin: 0 0 20px;
+    }
+
+    /* ---- calendar list ----------------------------------------------- */
+    .cal {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      background: #fff;
+    }
+    .cal.on { border-color: #c3d6ea; }
+    .cal-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+    }
+    .cal-name { font-weight: 600; flex: 1; word-break: break-word; }
+    .tag {
+      font-weight: 500;
+      font-size: 12px;
+      color: var(--ink-soft);
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 1px 8px;
+      margin-left: 6px;
+      white-space: nowrap;
+    }
+
+    /* toggle */
+    .switch { position: relative; width: 40px; height: 23px; flex: none; display: block; }
+    .switch input {
+      position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer;
+    }
+    .slider {
+      position: absolute; inset: 0; background: #c7ccd3; border-radius: 999px;
+      transition: background .12s ease; pointer-events: none;
+    }
+    .slider::after {
+      content: ""; position: absolute; top: 3px; left: 3px; width: 17px; height: 17px;
+      background: #fff; border-radius: 50%; transition: transform .12s ease;
+    }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::after { transform: translateX(17px); }
+    .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .cal-body { border-top: 1px solid var(--line); padding: 12px 14px; }
+
+    /* role pills */
+    .roles { display: flex; flex-wrap: wrap; gap: 8px; }
+    .role-pill {
+      border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px;
+      font-size: 13.5px; cursor: pointer; background: #fff; display: inline-flex;
+      align-items: center; gap: 6px;
+    }
+    .role-pill input { margin: 0; }
+    .role-pill.sel { border-color: var(--accent); background: #eaf3fc; color: #06437f; font-weight: 600; }
+
+    .cal-status { font-size: 13px; color: var(--ink-soft); margin-top: 8px; }
+    .cal-status.error { color: var(--danger); font-weight: 600; }
+
+    /* ---- picker ------------------------------------------------------ */
+    .picker { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 12px; }
+    .picker h3 { font-size: 14.5px; margin: 0 0 2px; }
+    .picker .hint { font-size: 13px; color: var(--ink-soft); margin: 0 0 10px; }
+    .group-label {
+      font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--ink-soft); font-weight: 700; margin: 14px 0 6px;
+    }
+    .title-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 6px 8px; border-radius: 5px; font-size: 14px;
+    }
+    .title-row:hover { background: var(--bg-soft); }
+    .title-row input { margin: 0; flex: none; }
+    .title-row .t { flex: 1; word-break: break-word; }
+    .title-row .meta { color: var(--ink-soft); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .empty-group { font-size: 13px; color: var(--ink-soft); padding: 4px 8px; }
+    .totals {
+      margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+      font-size: 13.5px; color: var(--ink-soft);
+    }
+    .totals strong { color: var(--ink); }
+    .freebusy {
+      background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px;
+      padding: 10px 12px; font-size: 13.5px;
+    }
+    .freebusy .acts { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* ---- inputs / buttons -------------------------------------------- */
+    input[type="text"], input[type="search"] {
+      width: 100%; padding: 8px 10px; border: 1px solid #ccd2d9; border-radius: 5px;
+      font-family: inherit; font-size: 14px;
     }
     button {
-      padding: 8px 16px;
-      background-color: #0066cc;
-      color: white;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 14px;
+      padding: 7px 14px; background: var(--accent); color: #fff; border: none;
+      border-radius: 5px; cursor: pointer; font-size: 13.5px; font-family: inherit;
     }
-    button:hover {
-      background-color: #0052a3;
+    button:hover { background: #0052a3; }
+    button.ghost { background: #fff; color: var(--ink); border: 1px solid var(--line); }
+    button.ghost:hover { background: var(--bg-soft); }
+
+    /* ---- label + chip preview ---------------------------------------- */
+    .section { margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .field-hint { font-size: 13px; color: var(--ink-soft); margin: 6px 0 0; }
+    label.field { display: block; font-weight: 600; margin-bottom: 6px; }
+    .preview {
+      margin-top: 12px; background: var(--bg-soft); border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px;
     }
-    #status {
-      margin-top: 12px;
-      font-size: 14px;
-      color: #080;
+    .preview-cap {
+      font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--ink-soft); font-weight: 700; margin-bottom: 8px;
     }
-    #status.error {
-      color: #c00;
+    .shift-line { display: flex; align-items: center; gap: 10px; font-size: 14px; flex-wrap: wrap; }
+    .shift-line .when { font-variant-numeric: tabular-nums; }
+    .shift-line .who { color: var(--ink-soft); }
+    .chip {
+      background: #23262b; color: #fff; border-radius: 4px; padding: 2px 8px;
+      font-size: 12.5px; font-weight: 600; white-space: nowrap;
     }
-    .hint {
-      font-weight: 400;
-      color: #555;
-      font-size: 13px;
-      margin-top: 4px;
-    }
+    details.advanced { margin-top: 24px; font-size: 14px; }
+    details.advanced summary { cursor: pointer; color: var(--ink-soft); font-size: 13.5px; }
+    details.advanced .inner { padding: 12px 0 0; }
+    details.advanced .row { margin-bottom: 10px; }
+    #status { margin-top: 12px; font-size: 13.5px; color: #0a7d33; min-height: 20px; }
+    #status.error { color: var(--danger); }
   </style>
 </head>
 <body>
-  <h1>Medic Tradeboard Options</h1>
+  <h1>Choose your calendars</h1>
+  <p class="subtitle">Nothing is read until you turn it on.</p>
 
-  <p class="note">
-    These settings control which of your Google Calendar events count as a
-    hard commitment (rejects an overlapping shift) versus a soft flag
-    (annotates it only). Connect your calendar from the tradeboard drawer
-    first, then tune the patterns below.
+  <!-- Loud state 1: we could not even list the calendars (auth / network). This
+       must never be mistaken for "you have no blocking calendars". -->
+  <div class="banner" id="loadBanner" hidden>
+    <h2 id="loadBannerTitle">Can&rsquo;t read your calendar list</h2>
+    <div class="banner-sub" id="loadBannerSub"></div>
+    <p id="loadBannerBody"></p>
+    <button id="loadRetry" type="button">Connect Google Calendar</button>
+  </div>
+
+  <!-- Loud state 2: signed in, but nothing on this page blocks anything.
+       The heading must be true in BOTH states this covers: no calendar switched
+       on at all, AND several switched on but every one of them "Notes only".
+       "No calendars selected" was false in the second case. -->
+  <div class="banner" id="noBlockBanner" hidden>
+    <h2>No calendar is blocking shifts</h2>
+    <div class="banner-sub">Nothing is blocking shifts right now</div>
+    <p>
+      Every open shift will show as available &mdash; including ones that overlap
+      something already on your calendar. Turn a calendar on and set it to
+      &ldquo;All of it blocks&rdquo; or &ldquo;Only some events&rdquo; so real
+      commitments knock a shift out.
+    </p>
+  </div>
+
+  <p class="note" id="privacyNote">
+    These are the calendar names on your account. Their contents are not read
+    unless you switch one on.
   </p>
 
-  <div class="option">
-    <label for="ruleInclude">Commitment include pattern (regex):</label>
-    <input type="text" id="ruleInclude" value="^Work\b" placeholder="e.g. ^On[- ]?Duty\b">
-    <div class="hint">
-      Applies to calendars set to the RULE role. Must not be blank — a blank
-      pattern would match every event and block every shift, so leaving it empty
-      resets it to the default.
-    </div>
-  </div>
+  <div id="calList"></div>
 
-  <div class="option">
-    <label for="ruleExclude">Commitment exclude substrings, comma-separated:</label>
-    <input type="text" id="ruleExclude" value="meeting">
-  </div>
-
-  <div class="option">
-    <label for="commitmentLabel">Commitment label (shown on rejected shifts):</label>
+  <div class="section">
+    <label class="field" for="commitmentLabel">Commitment label (shown on rejected shifts)</label>
     <input type="text" id="commitmentLabel" value="Commitment" placeholder="e.g. Fire Dept">
-    <div class="hint">
-      The word for &ldquo;I am already committed&rdquo; — your department, second
-      job, whatever. Appears as the reject chip, e.g. &ldquo;✕ Fire Dept&rdquo;.
-    </div>
-  </div>
+    <p class="field-hint">
+      The word for &ldquo;I am already committed&rdquo; &mdash; your department,
+      second job, whatever.
+    </p>
 
-  <button id="save">Save</button>
-  <div id="status"></div>
+    <div class="preview">
+      <div class="preview-cap">Preview</div>
+      <div class="shift-line">
+        <span class="when">Sat 15 &middot; 07:00&ndash;19:00</span>
+        <span class="who">Medic &middot; Unit 2</span>
+        <span class="chip" id="chipPreview">&#10005; Commitment</span>
+      </div>
+    </div>
+
+    <div id="status" role="status" aria-live="polite"></div>
+
+    <details class="advanced" id="advanced">
+      <summary>Use a pattern instead (advanced)</summary>
+      <div class="inner">
+        <p class="field-hint" style="margin-top:0">
+          Legacy escape hatch. The event picker above writes these for you &mdash;
+          only touch this if you know what a regular expression is. A blank
+          include pattern would match every event and block every shift, so a
+          blank value is refused.
+        </p>
+        <div class="row">
+          <label class="field" for="ruleInclude">Commitment include pattern (regex)</label>
+          <input type="text" id="ruleInclude" placeholder="e.g. ^On[- ]?Duty\b">
+        </div>
+        <div class="row">
+          <label class="field" for="ruleExclude">Commitment exclude substrings, comma-separated</label>
+          <input type="text" id="ruleExclude" placeholder="e.g. meeting, training">
+        </div>
+        <button id="savePattern" class="ghost" type="button">Save pattern</button>
+        <div id="patternStatus" role="status" aria-live="polite" style="font-size:13.5px;margin-top:8px"></div>
+      </div>
+    </details>
+  </div>
 
   <script src="options.js"></script>
 </body>

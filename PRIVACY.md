@@ -17,10 +17,28 @@ extension requests the `https://www.googleapis.com/auth/calendar.readonly`
 OAuth scope and nothing else. With that scope it fetches, directly from your
 browser to Google's servers:
 
-- Your calendar list — each calendar's ID, display name, and whether it's your
-  primary calendar.
-- Events on the calendars you've configured it to read — each event's title,
-  start time, end time, and cancellation status.
+- Your calendar list — for each calendar: its ID, its name, the name you
+  renamed it to if you did, whether it is your primary calendar, your access
+  level to it, whether it is currently checked in Google Calendar, and whether
+  it is hidden or deleted. This is the list you choose from, so the extension
+  has to read the names of calendars you never switch on. It does not read
+  their contents.
+
+  Access level is read because a calendar shared with you as free/busy only
+  returns events with no titles at all — the extension needs to know that in
+  order to tell you, rather than showing you an empty list.
+
+  The calendar list is requested including calendars you have hidden from your
+  Google Calendar sidebar. Hiding a calendar there is a display preference, not
+  an unsubscribe: if the extension could not see it, a calendar you had switched
+  on here would quietly stop counting, and it would vanish from the settings page
+  so you could not switch it back off either. A hidden calendar is still only
+  read if you switched it on, and it is labelled as hidden on the settings page.
+  Deleted calendars are read only so they can be discarded.
+
+- Events, only on the calendars you switch on — each event's title, start time,
+  end time, and cancellation status. Switching a calendar on is what causes it
+  to be read; switching it off means it is never opened.
 
 It does not request event descriptions, locations, attendees, attachments,
 reminders, or any calendar outside the ones you've pointed it at. The
