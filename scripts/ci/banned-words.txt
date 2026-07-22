@@ -1,0 +1,56 @@
+# banned-words.txt — egregious LLM-"slop" tells for scripts/ci/slopcheck.js
+#
+# Conservative by design: every entry is a marketing-blog / stock-essay tell that
+# would never show up in this repo's own prose (terse comments, a dry README, a
+# privacy policy). Ordinary technical vocabulary ("robust", "leverage", "crucial",
+# "underscore", "foster", ...) is deliberately NOT listed — those are legitimate
+# and would produce false positives. One term or phrase per line. Blank lines and
+# lines starting with # are ignored. Matching is whole-word / whole-phrase,
+# case-insensitive (see slopcheck.js).
+
+# --- marketing / hype filler ---
+cutting-edge
+game changer
+game-changer
+unlock the power of
+harness the power of
+seamlessly integrate
+paradigm shift
+revolutionize
+revolutionary
+elevate your
+unleash the power
+unparalleled
+trailblazing
+groundbreaking
+state-of-the-art solution
+next-level
+top-notch
+one-stop shop
+peace of mind
+supercharge your
+empower you to
+unwavering commitment
+
+# --- stock LLM essay filler ---
+delve into
+tapestry
+testament to
+stands as a testament
+cannot be overstated
+rich tapestry
+myriad of
+plethora of
+navigate the complexities of
+in the ever-evolving landscape
+in today's fast-paced world
+whether you're a beginner or
+look no further
+needless to say
+it is important to note that
+embark on a journey
+
+# --- AI self-reference tells ---
+as an ai language model
+i hope this helps
+let's dive in

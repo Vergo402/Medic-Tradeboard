@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Instant pre-commit gate: the staged-manifest key guard (your existing tool),
+# then the fast gate (eslint + slop + committed-manifest + capture guards). The
+# node suite runs on pre-push and in CI.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -e
+bash tools/check-no-key.sh
+bash scripts/ci/gate.sh --fast

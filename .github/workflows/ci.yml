@@ -1,0 +1,25 @@
+name: CI
+
+# Single gate — lint, slop, key/capture guards, and the node test suite. Fast and
+# offline; runs on every PR and push to main. (Public repo → free Actions.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # node:test is stable since 20; eslint runs via npx
+      - name: Run the gate
+        run: bash scripts/ci/gate.sh

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Pre-push gate — the full gauntlet: eslint, slop, manifest + capture guards, and
+# the 365 node tests. Blocks a push if anything fails, mirroring CI.
+set -e
+exec bash scripts/ci/gate.sh
