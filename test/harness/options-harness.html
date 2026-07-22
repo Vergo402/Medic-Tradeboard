@@ -12,11 +12,14 @@
   // ---- synthetic canned data (no real calendars/names) --------------------
   const CALS = [
     { id: 'primary', summary: 'me@example.com', primary: true, role: 'RULE',
-      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: ['ACME - Desk'] },
+      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: ['ACME - Desk'],
+      bufferBefore: 0, bufferAfter: 12 },
     { id: 'crew', summary: 'Crew Schedule', primary: false, role: 'REJECT',
-      accessRole: 'reader', selected: true, hiddenInGoogle: false, blockTitles: [] },
+      accessRole: 'reader', selected: true, hiddenInGoogle: false, blockTitles: [],
+      bufferBefore: 8, bufferAfter: 8 },
     { id: 'fam', summary: 'Family calendar', primary: false, role: 'OFF',
-      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: [] },
+      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: [],
+      bufferBefore: 0, bufferAfter: 0 },
   ];
   const TITLES = {
     primary: {
@@ -32,6 +35,7 @@
       noteTitles: ['Kid book and drink'],
       titleLabels: { 'ACME - Water Rescue Drill': 'Drill', 'Kid book and drink': 'Kid' },
       calLabel: 'Fam',
+      eventBuffers: { 'ACME - Desk': { before: 0, after: 24 } },
     },
   };
   const storage = { commitmentLabel: 'Fire Dept', ruleInclude: '', ruleExclude: '', ruleUsePattern: false };
@@ -45,6 +49,7 @@
         if (msg.type === 'listCalendars') r = { ok: true, calendars: CALS, ruleFilter: { include: '', exclude: '', usePattern: false } };
         else if (msg.type === 'listCalendarTitles') r = TITLES[msg.calendarId] || { ok: true, accessRole: 'owner', titles: [], blockTitles: [], noteTitles: [], titleLabels: {}, calLabel: '' };
         else if (msg.type === 'setEventRules') { console.log('[harness] setEventRules', JSON.stringify(msg)); r = { ok: true }; }
+        else if (msg.type === 'setCalendarBuffer') { console.log('[harness] setCalendarBuffer', JSON.stringify(msg)); r = { ok: true }; }
         else if (msg.type === 'setCalendarRole') { console.log('[harness] setCalendarRole', msg.calendarId, msg.role); r = { ok: true }; }
         else if (msg.type === 'setRuleFilter') r = { ok: true };
         setTimeout(() => cb(r), 0);

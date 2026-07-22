@@ -299,7 +299,18 @@ function normalizeTitleItems(raw) {
 }
 
 function emptyThreeWay() {
-  return { blockSet: new Set(), noteSet: new Set(), labels: new Map(), calLabel: '' };
+  return {
+    blockSet: new Set(), noteSet: new Set(), labels: new Map(), calLabel: '',
+    eventBuffers: new Map() // title -> { before, after }, overrides only (zero entries dropped)
+  };
+}
+
+// Coerce any raw input (string from a number field, blank, etc.) to a
+// non-negative, finite, <=2-decimal hours value. Never returns NaN.
+function toHours(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n * 100) / 100;
 }
 
 // Seed the authoritative Block/Note/label/calLabel state from the handler's FULL
@@ -319,11 +330,24 @@ function seedThreeWay(resp) {
   // A title can only be one thing; if storage ever holds it in both, Block wins
   // (it is the safety-critical, forward-looking rule) — mirror bucketEvents.
   for (const b of blockSet) noteSet.delete(b);
+
+  const eventBuffers = new Map();
+  const rawBuffers = resp.eventBuffers;
+  if (rawBuffers && typeof rawBuffers === 'object' && !Array.isArray(rawBuffers)) {
+    for (const [title, v] of Object.entries(rawBuffers)) {
+      if (typeof title !== 'string' || !v || typeof v !== 'object') continue;
+      const before = toHours(v.before);
+      const after = toHours(v.after);
+      if (before > 0 || after > 0) eventBuffers.set(title, { before, after });
+    }
+  }
+
   return {
     blockSet,
     noteSet,
     labels,
-    calLabel: typeof resp.calLabel === 'string' ? resp.calLabel : ''
+    calLabel: typeof resp.calLabel === 'string' ? resp.calLabel : '',
+    eventBuffers
   };
 }
 
@@ -407,13 +431,24 @@ async function sendEventRules(calId) {
       const v = (typeof lab === 'string' ? lab : '').trim();
       if (v) labels[title] = v;
     }
+    // Per-event overrides only apply to Block rows and only when actually set
+    // (non-zero) — a title with no override inherits the calendar default via
+    // the FIXED CONTRACT's ?? fallback, so a zero/absent entry must not be sent.
+    const eventBuffers = {};
+    for (const [title, buf] of t.eventBuffers) {
+      if (!t.blockSet.has(title)) continue;
+      const before = toHours(buf && buf.before);
+      const after = toHours(buf && buf.after);
+      if (before > 0 || after > 0) eventBuffers[title] = { before, after };
+    }
     const resp = await send({
       type: 'setEventRules',
       calendarId: calId,
       block: Array.from(t.blockSet),
       note: Array.from(t.noteSet),
       labels,
-      calLabel: (typeof t.calLabel === 'string' ? t.calLabel : '').trim()
+      calLabel: (typeof t.calLabel === 'string' ? t.calLabel : '').trim(),
+      eventBuffers
     });
     t.saveError = resp.ok ? null : resp.error;
   } catch (e) {
@@ -423,6 +458,125 @@ async function sendEventRules(calId) {
   // visual changed, and a re-render would steal focus from a "show as" field the
   // user is still typing in (the debounced save can fire mid-edit).
   if (t.saveError || hadError) render();
+}
+
+// ---------------------------------------------------------------------------
+// Rest buffer — calendar-level default (setCalendarBuffer)
+// ---------------------------------------------------------------------------
+//
+// Same one-in-flight-per-calendar, snapshot-at-send pattern as the event-rules
+// save above, kept as its own chain/timer pair so a buffer save and an
+// event-rules save for the same calendar never block on each other.
+const bufferSaveChains = new Map();
+const bufferSaveTimers = new Map();
+
+function persistCalendarBuffer(calId) {
+  const timer = bufferSaveTimers.get(calId);
+  if (timer) { clearTimeout(timer); bufferSaveTimers.delete(calId); }
+  const previous = bufferSaveChains.get(calId) || Promise.resolve();
+  const next = previous.then(() => sendCalendarBuffer(calId));
+  bufferSaveChains.set(calId, next);
+  return next;
+}
+
+function persistCalendarBufferDebounced(calId, ms = 400) {
+  const existing = bufferSaveTimers.get(calId);
+  if (existing) clearTimeout(existing);
+  bufferSaveTimers.set(calId, setTimeout(() => {
+    bufferSaveTimers.delete(calId);
+    persistCalendarBuffer(calId);
+  }, ms));
+}
+
+async function sendCalendarBuffer(calId) {
+  const cal = state.calendars.find((c) => c.id === calId);
+  if (!cal) return;
+  const hadError = Boolean(cal.bufferSaveError);
+  try {
+    // Snapshotted here, at send time — whatever is on screen right now.
+    const resp = await send({
+      type: 'setCalendarBuffer',
+      calendarId: calId,
+      before: toHours(cal.bufferBefore),
+      after: toHours(cal.bufferAfter)
+    });
+    cal.bufferSaveError = resp.ok ? null : resp.error;
+  } catch (e) {
+    cal.bufferSaveError = e && e.message ? e.message : String(e);
+  }
+  if (cal.bufferSaveError || hadError) render();
+}
+
+function buildBufferField(cal, key, label) {
+  const wrap = el('label', 'buffer-field');
+  wrap.appendChild(document.createTextNode(label + ' '));
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = '0';
+  input.step = '0.5';
+  input.inputMode = 'decimal';
+  input.value = String(key === 'before' ? cal.bufferBefore : cal.bufferAfter);
+  input.addEventListener('input', () => {
+    const v = toHours(input.value);
+    if (key === 'before') cal.bufferBefore = v; else cal.bufferAfter = v;
+    persistCalendarBufferDebounced(cal.id);
+  });
+  wrap.appendChild(input);
+  wrap.appendChild(document.createTextNode(' h'));
+  return wrap;
+}
+
+// Calendar-level "Rest buffer" block — shown on any calendar that can block:
+// a REJECT card's body, and the header of a RULE calendar's picker.
+function buildBufferBlock(cal) {
+  const box = el('div', 'buffer-block');
+  box.appendChild(el('div', 'buffer-title', 'Rest buffer'));
+  const row = el('div', 'buffer-row');
+  row.appendChild(buildBufferField(cal, 'before', 'Before'));
+  row.appendChild(buildBufferField(cal, 'after', 'After'));
+  box.appendChild(row);
+  box.appendChild(el('p', 'buffer-hint',
+    'Shifts within this window of a blocking event are rejected. 0 = block only direct overlaps.'));
+  if (cal.bufferSaveError) {
+    box.appendChild(el('div', 'cal-status error', 'Not saved (' + cal.bufferSaveError + ').'));
+  }
+  return box;
+}
+
+// Per-event override, shown only on a Block row. Both fields at 0 means
+// "inherit the calendar default" — nothing is sent for this title in that case.
+function buildEventBufferRow(cal, t, item) {
+  const cur = t.eventBuffers.get(item.title) || { before: 0, after: 0 };
+  const wrap = el('div', 'event-buffer');
+  wrap.appendChild(el('span', 'arrow', '↳'));
+  wrap.appendChild(document.createTextNode(' Before'));
+
+  const beforeInput = document.createElement('input');
+  beforeInput.type = 'number';
+  beforeInput.min = '0';
+  beforeInput.step = '0.5';
+  beforeInput.value = String(cur.before || 0);
+  beforeInput.dataset.title = item.title;
+  beforeInput.addEventListener('input', () => {
+    setEventBuffer(cal.id, item.title, 'before', beforeInput.value);
+  });
+  wrap.appendChild(beforeInput);
+
+  wrap.appendChild(document.createTextNode(' / After'));
+
+  const afterInput = document.createElement('input');
+  afterInput.type = 'number';
+  afterInput.min = '0';
+  afterInput.step = '0.5';
+  afterInput.value = String(cur.after || 0);
+  afterInput.dataset.title = item.title;
+  afterInput.addEventListener('input', () => {
+    setEventBuffer(cal.id, item.title, 'after', afterInput.value);
+  });
+  wrap.appendChild(afterInput);
+
+  wrap.appendChild(document.createTextNode(' h (override)'));
+  return wrap;
 }
 
 // Move a title to exactly one of the three states, preserving any typed label.
@@ -437,6 +591,23 @@ function setTitleMode(calId, title, mode) {
   // The row's "show as" field appears/disappears and the totals move, so a
   // re-render is needed; keep the clicked segment focused for keyboard users.
   render({ focus: { calId, kind: 'seg', title, mode } });
+}
+
+// Set one side (before/after) of a title's per-event buffer override. A title
+// that lands back at {0,0} is removed from the map entirely — that IS "no
+// override, inherit the calendar default", not "an override of zero".
+function setEventBuffer(calId, title, key, raw) {
+  const t = state.titles.get(calId);
+  if (!t) return;
+  const v = toHours(raw);
+  const cur = t.eventBuffers.get(title) || { before: 0, after: 0 };
+  cur[key] = v;
+  if (cur.before === 0 && cur.after === 0) t.eventBuffers.delete(title);
+  else t.eventBuffers.set(title, cur);
+  // Debounced, no render(): same reasoning as the "show as" field — the row's
+  // shape does not change as the number is typed, and a re-render would drop
+  // focus/caret out of the input.
+  persistEventRulesDebounced(calId);
 }
 
 function modeOf(t, title) {
@@ -510,6 +681,9 @@ function buildTitleRow(cal, t, item) {
     showas.appendChild(input);
     row.appendChild(showas);
   }
+
+  if (mode === 'block') row.appendChild(buildEventBufferRow(cal, t, item));
+
   return row;
 }
 
@@ -519,6 +693,11 @@ function buildPicker(cal) {
   wrap.appendChild(el('p', 'hint',
     'Mark an event Block to knock out an overlapping shift, or Note to leave a '
     + 'reminder. Everything you leave on Ignore is dropped.'));
+
+  // Rest buffer default lives at the top of the picker, above search/loading
+  // states — a RULE calendar can block via this default even while its titles
+  // are still loading or failed to load.
+  wrap.appendChild(buildBufferBlock(cal));
 
   const t = state.titles.get(cal.id);
 
@@ -700,6 +879,9 @@ function buildCalendar(cal) {
     if (cal.roleError) body.appendChild(el('div', 'cal-status error', cal.roleError));
 
     const t = state.titles.get(cal.id);
+    if (cal.role === 'REJECT') {
+      body.appendChild(buildBufferBlock(cal));
+    }
     if (cal.role === 'RULE') {
       body.appendChild(buildPicker(cal));
     } else if (t && t.status === 'error') {
@@ -783,7 +965,10 @@ async function loadCalendars(interactive) {
     primary: c.primary === true,
     role: c.role || 'OFF',
     hiddenInGoogle: c.hiddenInGoogle === true,
-    roleError: null
+    roleError: null,
+    bufferBefore: toHours(c.bufferBefore),
+    bufferAfter: toHours(c.bufferAfter),
+    bufferSaveError: null
   }));
   render();
 

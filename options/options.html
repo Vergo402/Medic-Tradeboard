@@ -164,6 +164,29 @@
     .showas .arrow { flex: none; }
     .showas input { flex: 1; min-width: 120px; max-width: 240px; padding: 5px 8px; font-size: 13px; }
 
+    /* rest buffer — calendar-level default (REJECT card body, RULE picker header) */
+    .buffer-block { margin: 12px 0; padding-top: 12px; border-top: 1px dashed var(--line); }
+    .buffer-block .buffer-title {
+      font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--ink-soft); font-weight: 700; margin-bottom: 6px;
+    }
+    .buffer-row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .buffer-field { display: flex; align-items: center; gap: 6px; font-size: 13.5px; color: var(--ink-soft); }
+    .buffer-field input[type="number"] {
+      width: 64px; padding: 5px 6px; border: 1px solid #ccd2d9; border-radius: 5px;
+      font-family: inherit; font-size: 13.5px;
+    }
+    .buffer-hint { font-size: 12.5px; color: var(--ink-soft); margin: 6px 0 0; }
+
+    /* per-event buffer override, on a Block row only */
+    .event-buffer {
+      display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+      margin: 6px 0 0 4px; font-size: 12.5px; color: var(--ink-soft);
+    }
+    .event-buffer input[type="number"] {
+      width: 50px; padding: 4px 6px; font-size: 12.5px; border: 1px solid #ccd2d9; border-radius: 5px;
+    }
+
     .empty-group { font-size: 13px; color: var(--ink-soft); padding: 4px 8px; }
     .totals {
       margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);

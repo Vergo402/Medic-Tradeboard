@@ -322,10 +322,10 @@
     }
 
     /** reject.reason is passed through raw. evaluate() emits fixed, neutral
-     * wording ("overlaps a commitment (...)", "no full open tour ... gap)")
-     * that never embeds a calendar event's own title, so it is safe to render
-     * verbatim. The user's commitment label reaches the UI through chipLabel
-     * only — see rejectChipLabel(). */
+     * wording ("overlaps a commitment (...)", "only Xh after a commitment
+     * (needs N)") that never embeds a calendar event's own title, so it is safe
+     * to render verbatim. The user's commitment label reaches the UI through
+     * chipLabel only — see rejectChipLabel(). */
     function buildReject(rec) {
       return {
         w2w_id: rec.w2w_id,

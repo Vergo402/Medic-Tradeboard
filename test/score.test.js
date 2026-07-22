@@ -17,17 +17,23 @@ function triplet(sStr, eStr, label) {
 
 // --- table-driven evaluate() cases ------------------------------------------
 //
-// Each case's gap/score was hand-derived from THE RULE in score.js and
-// cross-checked against the TOUR_STARTS grid: [(7,19),(19,7),(8,18),(18,8)].
-// Commitment labels here are arbitrary test strings -- evaluate() never reads
-// them for its verdict, reason, or chip: rejects are classified by the
-// structured `rejectKind`, and the user's own commitment label is applied
-// later, in the display layer.
+// Each case's gap/score/reason was hand-derived from THE explicit rest-buffer
+// RULE in score.js's header comment: a commitment carries restBefore/restAfter
+// hours (5-element triplet: [start, end, label, restBefore, restAfter]) and a
+// shift is rejected only when a gap is STRICTLY LESS than the relevant
+// commitment's own buffer (gap == buffer passes). This REPLACES the old
+// "a full grid tour must fit the gap" rule entirely -- there is no tour grid
+// any more, only explicit numeric buffers. Commitment labels here are
+// arbitrary test strings -- evaluate() never reads them for its verdict,
+// reason, or chip: rejects are classified by the structured `rejectKind`, and
+// the user's own commitment label is applied later, in the display layer.
 
 const CASES = [
   {
     id: "a_overlap_reject",
-    // Shift entirely inside a commitment block -> straight overlap reject.
+    // Shift entirely inside a commitment block -> straight overlap reject,
+    // BEFORE any buffer check runs (this precedence is unchanged by the
+    // buffer-hours rewrite and must stay first).
     schedule: [["2026-07-13 08:00", "2026-07-13 18:00", "Day Tour"]],
     rec: { date: "2026-07-13", start: "10:00", end: "14:00" },
     verdict: "reject",
@@ -40,72 +46,72 @@ const CASES = [
   },
   {
     id: "b_boundary_touch_pass",
-    // Commitment ends D 18:00; shift starts D+1 08:00 -> 14h gap, exactly
-    // filled by the 18:00-08:00 tour (boundary-touch on both ends counts per
-    // the rule).
-    schedule: [["2026-07-14 08:00", "2026-07-14 18:00", "Day Tour"]],
-    rec: { date: "2026-07-15", start: "08:00", end: "20:00" },
+    // BEHAVIOR CHANGE (hours model): restAfter=8, gap = 8.0h exactly (commitment
+    // ends Tue 07/14 18:00; shift starts 07/15 02:00). gap == buffer PASSES
+    // (strict `<` is what fails), per THE RULE's explicit "gap == buffer
+    // passes" contract -- this is the boundary case the old tour-grid table
+    // used to cover with a fitting 18:00-08:00 tour.
+    schedule: [["2026-07-14 08:00", "2026-07-14 18:00", "Day Tour", 0, 8]],
+    rec: { date: "2026-07-15", start: "02:00", end: "10:00" },
     verdict: "pass",
     reason: "clears buffer rule",
     rejectKind: null,
     rejectGapHours: null,
-    score: 14.0,
-    before: "commitment ends Tue 07/14 18:00 (14.0h before)",
+    score: 8.0,
+    before: "commitment ends Tue 07/14 18:00 (8.0h before)",
     after: null,
   },
   {
-    id: "c_no_complete_tour_reject",
-    // Commitment ends D 12:00, shift starts D+1 06:00 -> 18h gap. No grid tour
-    // (07-19/19-07/08-18/18-08) starts at/after 12:00 D and ends at/before
-    // 06:00 D+1: the earliest candidate start on D is 18:00, which needs
-    // >=10h and lands past 06:00 D+1 in every case. Reject, but the score
-    // still reports the numeric gap (buffer-failure rejects keep their score).
-    schedule: [["2026-07-16 06:00", "2026-07-16 12:00", "Day Tour"]],
-    rec: { date: "2026-07-17", start: "06:00", end: "18:00" },
+    id: "c_restAfter_reject",
+    // BEHAVIOR CHANGE (hours model): restAfter=12, actual gap = 8.0h -> fails
+    // (8 < 12). Single-sided, single-commitment, so rejectGapHours == score
+    // here (the score-vs-rejectGapHours split is exercised elsewhere).
+    schedule: [["2026-07-16 06:00", "2026-07-16 12:00", "Day Tour", 0, 12]],
+    rec: { date: "2026-07-16", start: "20:00", end: "23:00" },
     verdict: "reject",
-    reason: "no full open tour after the previous commitment (18.0h gap)",
+    reason: "only 8.0h after a commitment (needs 12)",
     rejectKind: "buffer",
-    rejectGapHours: 18.0,
-    score: 18.0,
-    before: "commitment ends Thu 07/16 12:00 (18.0h before)",
+    rejectGapHours: 8.0,
+    score: 8.0,
+    before: "commitment ends Thu 07/16 12:00 (8.0h before)",
     after: null,
   },
   {
     id: "c2_both_sides_fail",
-    // Same failing 18.0h gap before as c_no_complete_tour_reject, plus a 9.0h
-    // gap after (D+1 18:00 -> D+2 03:00) that fits no grid tour either. Both
-    // clauses are emitted, joined with "; ", and rejectGapHours is the
-    // SMALLEST of the two failing gaps.
+    // BEHAVIOR CHANGE (hours model): prev restAfter=12 fails an 8.0h gap;
+    // next restBefore=15 fails a 10.0h gap. Both clauses are emitted, prev
+    // clause first, joined with "; ", and rejectGapHours is the SMALLEST of
+    // the two failing gaps (8.0).
     schedule: [
-      ["2026-07-16 06:00", "2026-07-16 12:00", "Day Tour"],
-      ["2026-07-18 03:00", "2026-07-18 09:00", "Early Tour"],
+      ["2026-07-16 06:00", "2026-07-16 12:00", "Day Tour", 0, 12],
+      ["2026-07-17 09:00", "2026-07-17 15:00", "Early Tour", 15, 0],
     ],
-    rec: { date: "2026-07-17", start: "06:00", end: "18:00" },
+    rec: { date: "2026-07-16", start: "20:00", end: "23:00" },
     verdict: "reject",
     reason:
-      "no full open tour after the previous commitment (18.0h gap); "
-      + "no full open tour before the next commitment (9.0h gap)",
+      "only 8.0h after a commitment (needs 12); "
+      + "only 10.0h before a commitment (needs 15)",
     rejectKind: "buffer",
-    rejectGapHours: 9.0,
-    score: 9.0,
-    before: "commitment ends Thu 07/16 12:00 (18.0h before)",
-    after: "commitment starts Sat 07/18 03:00 (9.0h after)",
+    rejectGapHours: 8.0,
+    score: 8.0,
+    before: "commitment ends Thu 07/16 12:00 (8.0h before)",
+    after: "commitment starts Fri 07/17 09:00 (10.0h after)",
   },
   {
     id: "d_failing_gap_is_not_the_score",
-    // Two-sided and ASYMMETRIC: the 14.0h gap before the shift is filled by
-    // the 18:00-08:00 tour (passes), while the 21.0h gap after it fits no
-    // grid tour (fails). score is min over ALL gaps = 14.0; the reject was
-    // caused by the 21.0h side, so rejectGapHours must be 21.0. Pinning the
-    // two apart is the point of this row -- a chip built from `score` would
-    // wrongly read "BUFFER 14h".
+    // BEHAVIOR CHANGE (hours model), same shape as before: the 14.0h gap
+    // before passes its restAfter=12 (14 !< 12), while the 21.0h gap after
+    // FAILS its restBefore=24 (21 < 24). score is min over ALL (nearest) gaps
+    // = 14.0; the reject was caused by the 21.0h side, so rejectGapHours must
+    // be 21.0. Pinning the two apart is the point of this row -- a chip built
+    // from `score` would wrongly read "BUFFER 14h".
     schedule: [
-      ["2026-07-14 08:00", "2026-07-14 18:00", "Day Tour"],
-      ["2026-07-16 17:00", "2026-07-16 23:00", "Evening Tour"],
+      ["2026-07-14 08:00", "2026-07-14 18:00", "Day Tour", 0, 12],
+      ["2026-07-16 17:00", "2026-07-16 23:00", "Evening Tour", 24, 0],
     ],
     rec: { date: "2026-07-15", start: "08:00", end: "20:00" },
     verdict: "reject",
-    reason: "no full open tour before the next commitment (21.0h gap)",
+    reason: "only 21.0h before a commitment (needs 24)",
     rejectKind: "buffer",
     rejectGapHours: 21.0,
     score: 14.0,
@@ -114,10 +120,14 @@ const CASES = [
   },
   {
     id: "e_dst_fall_back",
-    // THE TRIPWIRE. Commitment ends Sat 2026-10-31 18:00 (EDT); medic night
-    // shift starts Sun 2026-11-01 19:00 (EST) -- the gap spans the fall-back.
-    // Wall-clock says 25h, but Nov 1 2026 has 25 wall hours, so real rest is
-    // 26.0h. Gaps are measured in TRUE elapsed hours.
+    // PRESERVED VERBATIM (MUST NOT WEAKEN). THE TRIPWIRE. Commitment ends Sat
+    // 2026-10-31 18:00 (EDT); medic night shift starts Sun 2026-11-01 19:00
+    // (EST) -- the gap spans the fall-back. Wall-clock says 25h, but Nov 1
+    // 2026 has 25 wall hours, so real rest is 26.0h. Gaps are measured in TRUE
+    // elapsed hours -- unaffected by the buffer-hours rewrite: this 3-element
+    // (old-cache-shaped) triplet defaults restAfter to 0, so it passes
+    // trivially, but the DST elapsed-hours math driving `score`/`before` is
+    // exactly what must survive the rewrite.
     schedule: [["2026-10-31 08:00", "2026-10-31 18:00", "Day Tour"]],
     rec: { date: "2026-11-01", start: "19:00", end: "07:00" },
     verdict: "pass",
@@ -130,6 +140,8 @@ const CASES = [
   },
   {
     id: "g_no_neighbor_pass",
+    // PRESERVED VERBATIM (MUST NOT WEAKEN). No commitments at all -> the 999
+    // sentinel score.
     schedule: [],
     rec: { date: "2026-07-20", start: "07:00", end: "19:00" },
     verdict: "pass",
@@ -142,14 +154,13 @@ const CASES = [
   },
   {
     id: "h_min_of_two",
-    // Before: commitment ends Tue 07/21 08:00 -> shift starts Wed 07/22 07:00
-    //   = 23h gap; the 08-18 tour starting exactly at 08:00 fits.
-    // After: shift ends Wed 07/22 19:00 -> next commitment starts Thu 07/23
-    //   20:00 = 25h gap; the 19-07 tour starting exactly at 19:00 fits.
+    // BEHAVIOR CHANGE (hours model): before restAfter=20 passes a 23.0h gap
+    // (23 !< 20); after restBefore=20 passes a 25.0h gap (25 !< 20). Both
+    // pass for a REAL numeric reason (not a vacuous 0/0 default), and score =
     // min(23.0, 25.0) = 23.0.
     schedule: [
-      ["2026-07-20 18:00", "2026-07-21 08:00", "Night Tour"],
-      ["2026-07-23 20:00", "2026-07-24 08:00", "Night Tour 2"],
+      ["2026-07-20 18:00", "2026-07-21 08:00", "Night Tour", 0, 20],
+      ["2026-07-23 20:00", "2026-07-24 08:00", "Night Tour 2", 20, 0],
     ],
     rec: { date: "2026-07-22", start: "07:00", end: "19:00" },
     verdict: "pass",
@@ -176,6 +187,123 @@ for (const c of CASES) {
     assert.equal(result.after, c.after);
   });
 }
+
+// --- NEW: per-commitment rest-buffer model ----------------------------------
+//
+// These pin the CONTRACT directly: restBefore/restAfter default to 0 (a
+// blocking calendar with no configured buffer rejects only direct overlaps),
+// gap == buffer passes (strict `<` fails), and buffer failures are evaluated
+// per-commitment (not nearest-only), so a farther commitment's larger buffer
+// can bind when a nearer commitment's smaller buffer passes.
+
+test("evaluate: 0/0 buffer imposes no buffer at all -- only overlap rejects, no matter how close", () => {
+  // Commitment ends exactly when the shift starts (touching, not overlapping):
+  // gap == 0. With restBefore=restAfter=0, 0 < 0 is false, so this passes no
+  // matter how tight the touch is -- only a true overlap could reject it.
+  const commitments = loadCommitments([["2026-07-13 08:00", "2026-07-13 10:00", "Tour", 0, 0]]);
+  const rec = { date: "2026-07-13", start: "10:00", end: "12:00" };
+  const result = evaluate(rec, commitments);
+  assert.equal(result.verdict, "pass");
+  assert.equal(result.rejectKind, null);
+  assert.equal(result.score, 0.0);
+});
+
+// restAfter: a prev commitment ending 8h before the shift, varied restAfter.
+for (const [restAfter, verdict] of [[12, "reject"], [8, "pass"], [0, "pass"]]) {
+  test(`evaluate: restAfter=${restAfter} against an 8.0h gap -> ${verdict}`, () => {
+    const commitments = loadCommitments([
+      ["2026-07-16 06:00", "2026-07-16 12:00", "Tour", 0, restAfter],
+    ]);
+    const rec = { date: "2026-07-16", start: "20:00", end: "23:00" };
+    const result = evaluate(rec, commitments);
+    assert.equal(result.verdict, verdict);
+    if (verdict === "reject") {
+      assert.equal(result.rejectKind, "buffer");
+      assert.equal(result.rejectGapHours, 8.0);
+      assert.equal(result.reason, `only 8.0h after a commitment (needs ${restAfter})`);
+    } else {
+      assert.equal(result.rejectKind, null);
+      assert.equal(result.score, 8.0);
+    }
+  });
+}
+
+// restBefore mirrors restAfter on the next side: a next commitment starting
+// 8h after the shift ends, varied restBefore.
+for (const [restBefore, verdict] of [[12, "reject"], [8, "pass"], [0, "pass"]]) {
+  test(`evaluate: restBefore=${restBefore} against an 8.0h gap -> ${verdict}`, () => {
+    const commitments = loadCommitments([
+      ["2026-07-17 09:00", "2026-07-17 15:00", "Tour", restBefore, 0],
+    ]);
+    const rec = { date: "2026-07-16", start: "20:00", end: "01:00" };
+    const result = evaluate(rec, commitments);
+    assert.equal(result.verdict, verdict);
+    if (verdict === "reject") {
+      assert.equal(result.rejectKind, "buffer");
+      assert.equal(result.rejectGapHours, 8.0);
+      assert.equal(result.reason, `only 8.0h before a commitment (needs ${restBefore})`);
+    } else {
+      assert.equal(result.rejectKind, null);
+      assert.equal(result.score, 8.0);
+    }
+  });
+}
+
+// THE MONOTONICITY CASE: per-commitment buffers are non-monotonic, so
+// evaluate() must check EVERY prev/next against its OWN buffer, not just the
+// nearest. Here the nearest prev (2h before, restAfter=1) passes, but a
+// FARTHER prev (20h before, restAfter=24) fails -- a nearest-only
+// implementation would wrongly pass this shift.
+test("evaluate: a farther commitment's larger buffer can fail when the nearest one passes", () => {
+  const commitments = loadCommitments([
+    ["2026-07-21 08:00", "2026-07-21 16:00", "Farther Tour", 0, 24], // ends 20h before shift start
+    ["2026-07-22 08:00", "2026-07-22 10:00", "Nearest Tour", 0, 1], // ends 2h before shift start
+  ]);
+  const rec = { date: "2026-07-22", start: "12:00", end: "20:00" };
+  const result = evaluate(rec, commitments);
+
+  assert.equal(result.verdict, "reject");
+  assert.equal(result.rejectKind, "buffer");
+  // score reflects the NEAREST gap (2.0h, which itself passed its own buffer);
+  // rejectGapHours reflects the FAILING gap (20.0h, from the farther commitment).
+  assert.equal(result.score, 2.0);
+  assert.equal(result.rejectGapHours, 20.0);
+  assert.equal(result.reason, "only 20.0h after a commitment (needs 24)");
+  assert.equal(result.before, "commitment ends Wed 07/22 10:00 (2.0h before)");
+  assert.equal(result.after, null);
+});
+
+// --- loadCommitments(): buffer merge + old-cache defaulting -----------------
+
+test("loadCommitments(): touching commitments merge buffers by taking the MAX on each side", () => {
+  const schedule = [
+    ["2026-07-10 18:00", "2026-07-11 08:00", "Night Tour", 0, 4],
+    ["2026-07-11 08:00", "2026-07-12 08:00", "24h Tour", 0, 12],
+  ];
+  const commitments = loadCommitments(schedule);
+  assert.equal(commitments.length, 1);
+  assert.equal(commitments[0].restAfter, 12);
+  assert.equal(commitments[0].restBefore, 0);
+});
+
+test("loadCommitments(): a 3-element (old-cache-shaped) triplet defaults restBefore/restAfter to 0", () => {
+  const commitments = loadCommitments([["2026-07-13 08:00", "2026-07-13 18:00", "Old Tour"]]);
+  assert.equal(commitments.length, 1);
+  assert.equal(commitments[0].restBefore, 0);
+  assert.equal(commitments[0].restAfter, 0);
+});
+
+test("loadCommitments(): a non-numeric/negative/NaN/Infinity buffer field collapses to 0", () => {
+  const schedule = [
+    ["2026-07-13 08:00", "2026-07-13 18:00", "A", -5, NaN],
+    ["2026-07-20 08:00", "2026-07-20 18:00", "B", Infinity, "12"],
+  ];
+  const commitments = loadCommitments(schedule);
+  assert.equal(commitments[0].restBefore, 0);
+  assert.equal(commitments[0].restAfter, 0);
+  assert.equal(commitments[1].restBefore, 0);
+  assert.equal(commitments[1].restAfter, 0);
+});
 
 // No reject reason, on any path, may name a specific employer or calendar --
 // the reason is neutral prose and the label lives only in the display layer.

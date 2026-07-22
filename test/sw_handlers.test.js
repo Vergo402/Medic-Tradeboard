@@ -94,7 +94,7 @@ globalThis.fetch = async (url) => {
 };
 
 // Import AFTER the globals exist — sw.js registers its listener at module load.
-await import("../sw.js");
+const sw = await import("../sw.js");
 assert.equal(listeners.length, 1, "sw.js should register exactly one message listener");
 const onMessage = listeners[0];
 
@@ -522,4 +522,182 @@ test("getCalendarData: OFF calendars are never fetched", async () => {
   assert.equal(resp.ok, true);
   assert.equal(eventsFetchedFor("cal-off").length, 0);
   assert.equal(eventsFetchedFor("cal-on").length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Per-calendar / per-event rest-buffer CONTRACT
+//
+//   restBefore = calEventBuffers[C]?.[T]?.before ?? calBufferBefore[C] ?? 0
+//   restAfter  = calEventBuffers[C]?.[T]?.after  ?? calBufferAfter[C]  ?? 0
+// ---------------------------------------------------------------------------
+
+test("setCalendarBuffer: writes both calBufferBefore/After for the calendar and drops the cache", async () => {
+  reset();
+  STORE.calCache = {
+    fetchedAt: 1, commitments: [], soft: [], windowStart: "2026-08-01", windowEnd: "2026-08-31",
+  };
+  const resp = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: 6, after: 12.5 });
+  assert.equal(resp.ok, true);
+  assert.equal(STORE.calBufferBefore["cal-1"], 6);
+  assert.equal(STORE.calBufferAfter["cal-1"], 12.5);
+  assert.equal(STORE.calCache, undefined, "a stale cache must not survive a buffer change");
+});
+
+test("setCalendarBuffer: NaN/negative/Infinity are all refused as bad_buffer, nothing written", async () => {
+  reset();
+  for (const bad of [NaN, -1, Infinity, -Infinity]) {
+    const resp = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: bad, after: 0 });
+    assert.deepEqual(resp, { ok: false, error: "bad_buffer" }, `before=${bad}`);
+    const resp2 = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: 0, after: bad });
+    assert.deepEqual(resp2, { ok: false, error: "bad_buffer" }, `after=${bad}`);
+  }
+  assert.equal(STORE.calBufferBefore, undefined);
+  assert.equal(STORE.calBufferAfter, undefined);
+});
+
+test("setCalendarBuffer: missing calendarId is refused as bad_calendar_id", async () => {
+  reset();
+  const resp = await send({ type: "setCalendarBuffer", before: 1, after: 1 });
+  assert.deepEqual(resp, { ok: false, error: "bad_calendar_id" });
+});
+
+test("setEventRules: persists eventBuffers alongside block/note/labels/calLabel", async () => {
+  reset();
+  const resp = await send({
+    type: "setEventRules",
+    calendarId: "cal-1",
+    block: ["Crew - Desk"],
+    note: [],
+    labels: {},
+    calLabel: "",
+    eventBuffers: { "Crew - Desk": { before: 4, after: 10 } },
+  });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockTitles["cal-1"], ["Crew - Desk"]);
+  assert.deepEqual(STORE.calEventBuffers["cal-1"], { "Crew - Desk": { before: 4, after: 10 } });
+});
+
+test("setEventRules: omitting eventBuffers leaves the calendar's stored overrides untouched", async () => {
+  reset();
+  STORE.calEventBuffers = { "cal-1": { "Crew - Desk": { before: 4, after: 10 } } };
+  const resp = await send({
+    type: "setEventRules", calendarId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
+  });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calEventBuffers["cal-1"], { "Crew - Desk": { before: 4, after: 10 } });
+});
+
+test("listCalendars: each calendar gets bufferBefore/bufferAfter, default 0 when unconfigured", async () => {
+  reset();
+  CAL_ITEMS = [
+    { id: "cal-a", summary: "Crew Schedule" },
+    { id: "cal-b", summary: "Household" },
+  ];
+  STORE.calBufferBefore = { "cal-a": 6 };
+  STORE.calBufferAfter = { "cal-a": 12 };
+
+  const resp = await send({ type: "listCalendars", interactive: false });
+  assert.equal(resp.ok, true);
+  const a = resp.calendars.find((c) => c.id === "cal-a");
+  const b = resp.calendars.find((c) => c.id === "cal-b");
+  assert.equal(a.bufferBefore, 6);
+  assert.equal(a.bufferAfter, 12);
+  assert.equal(b.bufferBefore, 0);
+  assert.equal(b.bufferAfter, 0);
+});
+
+test("listCalendarTitles: echoes eventBuffers for the calendar (default {})", async () => {
+  reset();
+  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  STORE.calRoles = { "cal-on": "RULE" };
+  STORE.calBlockTitles = { "cal-on": ["Crew - Desk"] };
+  STORE.calEventBuffers = { "cal-on": { "Crew - Desk": { before: 4, after: 10 } } };
+  EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.eventBuffers, { "Crew - Desk": { before: 4, after: 10 } });
+});
+
+test("listCalendarTitles: a calendar with no stored eventBuffers echoes {}", async () => {
+  reset();
+  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  STORE.calRoles = { "cal-on": "RULE" };
+  EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.eventBuffers, {});
+});
+
+// ---------------------------------------------------------------------------
+// bucketEvents(): the commitment triplet's 5th/4th elements ARE the effective
+// buffer for that event — a per-event override beats the calendar's default.
+// ---------------------------------------------------------------------------
+
+test("bucketEvents: a commitment triplet is 5 elements carrying the effective restBefore/restAfter", () => {
+  const events = [timed("Crew - Desk", "10")];
+  const rule = (title) => title === "Crew - Desk";
+  const { commitments } = sw.bucketEvents(
+    events,
+    "RULE",
+    rule,
+    "",
+    [],
+    {},
+    { before: 6, after: 12, eventBuffers: {} }
+  );
+  assert.equal(commitments.length, 1);
+  const trip = commitments[0];
+  assert.equal(trip.length, 5);
+  assert.equal(trip[3], 6, "restBefore should fall back to the calendar default");
+  assert.equal(trip[4], 12, "restAfter should fall back to the calendar default");
+});
+
+test("bucketEvents: a per-event buffer override beats the calendar default", () => {
+  const events = [timed("Crew - Desk", "10")];
+  const rule = (title) => title === "Crew - Desk";
+  const { commitments } = sw.bucketEvents(
+    events,
+    "RULE",
+    rule,
+    "",
+    [],
+    {},
+    { before: 6, after: 12, eventBuffers: { "Crew - Desk": { before: 1, after: 2 } } }
+  );
+  assert.equal(commitments.length, 1);
+  const trip = commitments[0];
+  assert.equal(trip[3], 1, "per-event restBefore override should win");
+  assert.equal(trip[4], 2, "per-event restAfter override should win");
+});
+
+// Regression: the override lookup is whitespace-normalized, matching how the
+// note set and label map are keyed. Without it, an NBSP (or double space) in a
+// feed title silently drops the override and falls back to the calendar default
+// — the exact failure a reviewer caught.
+test("bucketEvents: a per-event buffer override still applies when the title has a non-break space", () => {
+  const NBSP = "Crew - Tour"; // no-break spaces around the dash, as iCal/Outlook feeds emit
+  const events = [timed(NBSP, "10")];
+  const { commitments } = sw.bucketEvents(
+    events,
+    "REJECT",
+    () => true,
+    "",
+    [],
+    {},
+    { before: 6, after: 12, eventBuffers: { [NBSP]: { before: 1, after: 2 } } }
+  );
+  assert.equal(commitments.length, 1);
+  assert.equal(commitments[0][3], 1, "override must survive whitespace normalization, not fall back to 6");
+  assert.equal(commitments[0][4], 2, "override must survive whitespace normalization, not fall back to 12");
+});
+
+test("bucketEvents: with no bufferOpts at all, the commitment triplet defaults both sides to 0", () => {
+  const events = [timed("Crew - Desk", "10")];
+  const rule = (title) => title === "Crew - Desk";
+  const { commitments } = sw.bucketEvents(events, "RULE", rule, "", [], {});
+  assert.equal(commitments.length, 1);
+  assert.equal(commitments[0][3], 0);
+  assert.equal(commitments[0][4], 0);
 });

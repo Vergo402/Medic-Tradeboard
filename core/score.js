@@ -2,9 +2,21 @@
  * THE RULE, applied to one posted shift against the user's own calendars:
  *   1. reject on any overlap with a hard commitment (an event from a calendar
  *      the user marked REJECT)
- *   2. require >=1 complete open day-or-night tour fully inside the gap on
- *      each side (grids: 08-18/18-08, 07-19/19-07; boundary-touch counts)
+ *   2. honor each commitment's explicit rest buffer: a commitment carries
+ *      `restBefore`/`restAfter` hours (per-calendar default, optionally
+ *      overridden per event; 0 when unset). A shift is rejected when it starts
+ *      fewer than `restAfter` clear hours after a commitment ends, or ends
+ *      fewer than `restBefore` clear hours before a commitment starts. With the
+ *      0/0 default a commitment blocks only direct overlaps. Gaps are TRUE
+ *      elapsed (DST-aware) hours, and gap == buffer passes (strict `<` fails).
  *   3. rank by hours to the nearest commitment (min of before/after)
+ *
+ * The buffer check iterates ALL commitments on each side against their OWN
+ * buffer, because per-commitment buffers are non-monotonic: a farther
+ * commitment with a large buffer can bind when a nearer small-buffer one
+ * passes. `score` (ranking) still measures only the NEAREST commitment each
+ * side, so a buffer reject's `rejectGapHours` (the smallest FAILING gap) can
+ * differ from — even exceed — its `score`.
  *
  * This module is PURE and user-agnostic: it never sees the user's configured
  * commitment label, and every string it emits is neutral. Rejects carry a
@@ -12,14 +24,28 @@
  * string-matching the prose.
  */
 
-import { parseCivil, toEpoch, addDays, addHours, hours, fmt, fmtHM, civilFromEpoch } from "./nytime.js";
+import { parseCivil, toEpoch, addDays, hours, fmt, fmtHM } from "./nytime.js";
 
-const TOUR_STARTS = [
-  [7, 19],
-  [19, 7],
-  [8, 18],
-  [18, 8],
-];
+/**
+ * Sanitize a triplet's rest-buffer field into a non-negative finite number of
+ * hours. Missing/short array, non-number, NaN/Infinity, or a negative value all
+ * collapse to 0 (a 0-buffer commitment blocks only direct overlaps).
+ * @param {unknown} v
+ * @returns {number}
+ */
+function restHours(v) {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+/**
+ * Render a rest-buffer hour count for reason prose: a plain number with no
+ * forced decimal ("12", "12.5"), matching the "(needs 12)" contract.
+ * @param {number} n
+ * @returns {string}
+ */
+function needStr(n) {
+  return String(n);
+}
 
 /**
  * Parse rec.date ("YYYY-MM-DD") + rec.start/rec.end ("HH:MM") into civil and
@@ -51,18 +77,29 @@ export function shiftTimes(rec) {
 }
 
 /**
- * Parse+sort+merge raw [start, end, label] string triplets into commitment
- * blocks: sort by (start, end, label), then merge when the next block's
+ * Parse+sort+merge raw commitment triplets into commitment blocks. A blocking
+ * triplet is [start, end, label, restBefore, restAfter]; the two buffer fields
+ * are optional (old caches are [start, end, label]) and default to 0 via
+ * restHours(). Sort by (start, end, label), then merge when the next block's
  * start touches-or-overlaps the running merge's end (TOUCHING MERGES),
- * extending the end to the max and keeping the FIRST label.
- * @param {Array<[string, string, string]>} triplets
- * @returns {Array<{s:number, e:number, label:string, sCivil:object, eCivil:object}>}
+ * extending the end to the max and keeping the FIRST label. Merged buffers take
+ * the MAX on each side (most restrictive wins).
+ * @param {Array<[string, string, string, number?, number?]>} triplets
+ * @returns {Array<{s:number, e:number, label:string, sCivil:object, eCivil:object, restBefore:number, restAfter:number}>}
  */
 export function loadCommitments(triplets) {
-  const parsed = triplets.map(([a, b, label]) => {
+  const parsed = triplets.map(([a, b, label, rb, ra]) => {
     const sCivil = parseCivil(a);
     const eCivil = parseCivil(b);
-    return { s: toEpoch(sCivil), e: toEpoch(eCivil), label, sCivil, eCivil };
+    return {
+      s: toEpoch(sCivil),
+      e: toEpoch(eCivil),
+      label,
+      sCivil,
+      eCivil,
+      restBefore: restHours(rb),
+      restAfter: restHours(ra),
+    };
   });
   parsed.sort((x, y) => {
     if (x.s !== y.s) return x.s - y.s;
@@ -80,47 +117,15 @@ export function loadCommitments(triplets) {
         last.e = cur.e;
         last.eCivil = cur.eCivil;
       }
-      // first label wins - leave last.label untouched
+      // first label wins - leave last.label untouched; buffers take the max on
+      // each side so the most restrictive rest requirement survives the merge.
+      last.restBefore = Math.max(last.restBefore, cur.restBefore);
+      last.restAfter = Math.max(last.restAfter, cur.restAfter);
     } else {
       merged.push({ ...cur });
     }
   }
   return merged;
-}
-
-/**
- * Checks whether a full open tour fits inside the gap [gs, ge). gs/ge are
- * POSIX-second instants; the calendar date to start scanning from is derived
- * from gs's NY civil date minus one day (mirroring Python's
- * `date - timedelta(days=1)` semantics), since a tour starting the evening
- * before a gap can still fully contain it.
- *
- * t2 is computed via CIVIL wall-clock addHours (not epoch + duration*3600) -
- * this is the DST tripwire: a 12h civil tour starting the evening before a
- * fall-back transition ends 13 REAL hours later, and the containment checks
- * below compare against gs/ge as instants (epochs), so that extra real hour
- * is what lets a tour fully cover a 26h real gap.
- * @param {number} gs gap start, POSIX seconds
- * @param {number} ge gap end, POSIX seconds
- */
-export function openTourInGap(gs, ge) {
-  let day = addDays(civilFromEpoch(gs), -1);
-  // Python re-evaluates `ge + timedelta(days=1)` every loop iteration, but it
-  // never changes, so hoisting it here is behavior-preserving.
-  const geComparisonEpoch = toEpoch(addDays(civilFromEpoch(ge), 1));
-
-  while (true) {
-    for (const [h1, h2] of TOUR_STARTS) {
-      const t1Civil = { y: day.y, mo: day.mo, d: day.d, h: h1, mi: 0 };
-      const t1 = toEpoch(t1Civil);
-      const duration = ((h2 - h1) % 24 + 24) % 24 || 24;
-      const t2 = toEpoch(addHours(t1Civil, duration));
-      if (t1 >= gs && t2 <= ge) return true;
-    }
-    day = addDays(day, 1);
-    const dayMidnightEpoch = toEpoch({ y: day.y, mo: day.mo, d: day.d, h: 0, mi: 0 });
-    if (dayMidnightEpoch > geComparisonEpoch) return false;
-  }
 }
 
 /**
@@ -134,13 +139,14 @@ export function openTourInGap(gs, ge) {
  * Every reject also carries a structured `rejectKind`:
  *   "commitment" — overlaps an event on a REJECT-role calendar
  *   "my_shift"   — collides with one of the user's own W2W shifts
- *   "buffer"     — no complete open tour fits in the gap on one/both sides
+ *   "buffer"     — starts/ends inside a commitment's required rest window
  * plus `rejectGapHours`: for a buffer reject, the smallest FAILING gap in
- * hours (null otherwise). That is deliberately not `score` — score is the min
- * over all gaps, including a side that passed the tour check, so the two
- * differ whenever the smaller gap is the one that passed.
+ * hours (null otherwise). That is deliberately not `score` — score measures
+ * only the NEAREST commitment each side (0-buffer neighbors included), while a
+ * FARTHER commitment with a larger buffer can be the one that fails, so the two
+ * differ whenever the failing gap is not the nearest.
  * @param {{date:string, start:string, end:string}} rec
- * @param {Array<{s:number,e:number,label:string,sCivil:object,eCivil:object}>} commitments
+ * @param {Array<{s:number,e:number,label:string,sCivil:object,eCivil:object,restBefore:number,restAfter:number}>} commitments
  * @param {Array<{s:number,e:number,label:string,sCivil:object,eCivil:object}>} [myShifts]
  * @param {Array<{s:number,e:number,label:string}>} [softEvents]
  */
@@ -191,39 +197,51 @@ export function evaluate(rec, commitments, myShifts = [], softEvents = []) {
     };
   }
 
+  const prevs = commitments.filter((c) => c.e <= startEpoch);
+  const nexts = commitments.filter((c) => c.s >= endEpoch);
+
+  const why = [];
+  // Gaps that FAILED a commitment's rest buffer, in hours. Kept separate from
+  // the gaps that feed `score` (nearest neighbor only) so the display layer can
+  // show the gap that actually caused the reject.
+  const failedGaps = [];
+
+  // Iterate ALL prevs/nexts against their OWN buffer: per-commitment buffers are
+  // non-monotonic, so a farther large-buffer commitment can fail while a nearer
+  // small-buffer one passes. prevs/nexts stay in loadCommitments' start-sorted
+  // order, so the joined clauses are deterministic (prev clauses first).
+  for (const p of prevs) {
+    const gap = hours(p.e, startEpoch);
+    if (gap < p.restAfter) {
+      failedGaps.push(gap);
+      why.push(`only ${gap.toFixed(1)}h after a commitment (needs ${needStr(p.restAfter)})`);
+    }
+  }
+  for (const n of nexts) {
+    const gap = hours(endEpoch, n.s);
+    if (gap < n.restBefore) {
+      failedGaps.push(gap);
+      why.push(`only ${gap.toFixed(1)}h before a commitment (needs ${needStr(n.restBefore)})`);
+    }
+  }
+  const ok = failedGaps.length === 0;
+
+  // `score` and the before/after prose describe only the NEAREST commitment on
+  // each side (0-buffer neighbors included), regardless of which commitment
+  // actually failed above.
   let gb = null;
   let ga = null;
   let before = null;
   let after = null;
-  let ok = true;
-  const why = [];
-  // Gaps that FAILED the open-tour check, in hours. Kept separate from the
-  // gaps that feed `score` so the display layer can show the gap that
-  // actually caused the reject.
-  const failedGaps = [];
-
-  const prevs = commitments.filter((c) => c.e <= startEpoch);
-  const nexts = commitments.filter((c) => c.s >= endEpoch);
-
   if (prevs.length) {
     const p = prevs.reduce((best, c) => (c.e > best.e ? c : best));
     gb = hours(p.e, startEpoch);
     before = `commitment ends ${fmt(p.eCivil)} (${gb.toFixed(1)}h before)`;
-    if (!openTourInGap(p.e, startEpoch)) {
-      ok = false;
-      failedGaps.push(gb);
-      why.push(`no full open tour after the previous commitment (${gb.toFixed(1)}h gap)`);
-    }
   }
   if (nexts.length) {
     const n = nexts.reduce((best, c) => (c.s < best.s ? c : best));
     ga = hours(endEpoch, n.s);
     after = `commitment starts ${fmt(n.sCivil)} (${ga.toFixed(1)}h after)`;
-    if (!openTourInGap(endEpoch, n.s)) {
-      ok = false;
-      failedGaps.push(ga);
-      why.push(`no full open tour before the next commitment (${ga.toFixed(1)}h gap)`);
-    }
   }
 
   const gaps = [gb, ga].filter((g) => g !== null);

@@ -93,6 +93,51 @@ const TITLE_LABELS_KEY = "calTitleLabels";
 // note from that calendar in place of the calendar's full display name.
 const LABEL_OVERRIDE_KEY = "calLabelOverride";
 
+// Per-calendar default "rest" hours required around a blocking (commitment)
+// event before a shift may be considered clear of it: { [calendarId]: number }.
+// restBefore = clear hours required BEFORE the commitment starts (checked
+// against a shift that ends before it); restAfter = clear hours required AFTER
+// the commitment ends (checked against a shift that starts after it). Missing
+// entry ⇒ 0 — a blocking calendar with no configured buffer rejects only a
+// direct overlap, nothing more.
+const BUFFER_BEFORE_KEY = "calBufferBefore";
+const BUFFER_AFTER_KEY = "calBufferAfter";
+
+// Per-calendar PER-EVENT buffer override, keyed by the same exact
+// (whitespace-normalized) title the Block/Note picker uses:
+// { [calendarId]: { [title]: {before:number, after:number} } }. When present
+// for a title it wins over that calendar's BUFFER_BEFORE_KEY/BUFFER_AFTER_KEY
+// default — see effectiveBuffer().
+const EVENT_BUFFERS_KEY = "calEventBuffers";
+
+/**
+ * The effective rest-buffer hours for one commitment event, per the CONTRACT:
+ *   restBefore = eventBuffers[title]?.before ?? calBefore ?? 0
+ *   restAfter  = eventBuffers[title]?.after  ?? calAfter  ?? 0
+ *
+ * `title` must already be whitespace-normalized/trimmed the same way the
+ * eventBuffers map's keys are, so an NBSP in the feed can't disarm an override
+ * the same way it can't disarm a label or note match elsewhere in this file.
+ *
+ * @param {string} title  normalized title
+ * @param {unknown} calBefore  this calendar's default restBefore (may be absent)
+ * @param {unknown} calAfter   this calendar's default restAfter (may be absent)
+ * @param {unknown} eventBuffers  this calendar's { [title]: {before,after} } map
+ * @returns {{before:number, after:number}}
+ */
+export function effectiveBuffer(title, calBefore, calAfter, eventBuffers) {
+  const num = (v, fallback) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
+  const defBefore = num(calBefore, 0);
+  const defAfter = num(calAfter, 0);
+  let override;
+  if (eventBuffers && typeof eventBuffers === "object" && !Array.isArray(eventBuffers)) {
+    override = eventBuffers[title];
+  }
+  const before = override && typeof override === "object" ? num(override.before, defBefore) : defBefore;
+  const after = override && typeof override === "object" ? num(override.after, defAfter) : defAfter;
+  return { before, after };
+}
+
 // The user's explicit opt-in to the legacy regex ("advanced pattern") hatch.
 // Written ONLY by handleSetRuleFilter, i.e. only when the user opened the
 // advanced disclosure on the options page and saved a real pattern.
@@ -471,15 +516,26 @@ function noteLabel(prefix, shown) {
  * calendar from producing hard rejects — a shift would be offered as free while
  * the user is in fact committed.
  *
+ * BUFFER TRIPLET SHAPE: a commitment row is [start, end, label, restBefore,
+ * restAfter] — restBefore/restAfter are the effective rest-buffer hours for
+ * that event (see effectiveBuffer()), 0 when unconfigured. A soft/note row
+ * stays [start, end, label] — buffers are meaningless for a non-blocking note
+ * and are never appended to one.
+ *
  * @param {object[]} events
  * @param {string} role  one of ROLES
  * @param {(title:string)=>boolean} rule  block predicate, called with the raw title only
  * @param {string} prefix  short override or calendar summary ("" for primary)
  * @param {unknown} [noteTitles]  the note set for this calendar (want string[])
  * @param {unknown} [labels]  per-event "show as" map { [title]: shortLabel }
+ * @param {{before?:number, after?:number, eventBuffers?:object}} [bufferOpts]
+ *   this calendar's default restBefore/restAfter and its per-event override
+ *   map ({ [title]: {before,after} }, keyed like `labels`/`noteTitles`).
  * @returns {{commitments: string[][], soft: string[][]}}
  */
-export function bucketEvents(events, role, rule, prefix, noteTitles, labels) {
+export function bucketEvents(events, role, rule, prefix, noteTitles, labels, bufferOpts) {
+  const bufOpts = bufferOpts && typeof bufferOpts === "object" ? bufferOpts : {};
+  const eventBuffers = bufOpts.eventBuffers;
   const commitments = [];
   const soft = [];
   if (role === "OFF") return { commitments, soft };
@@ -499,6 +555,16 @@ export function bucketEvents(events, role, rule, prefix, noteTitles, labels) {
       const nk = normalizeTitleWhitespace(k).trim();
       const nv = v.trim();
       if (nk && nv) labelMap.set(nk, nv);
+    }
+  }
+  // Same normalization as noteSet/labelMap: a per-event buffer override is keyed
+  // by whitespace-normalized title, so an NBSP or double space in the feed can't
+  // silently drop the override and fall back to the calendar default.
+  const bufferMap = {};
+  if (eventBuffers && typeof eventBuffers === "object" && !Array.isArray(eventBuffers)) {
+    for (const [k, v] of Object.entries(eventBuffers)) {
+      const nk = normalizeTitleWhitespace(k).trim();
+      if (nk) bufferMap[nk] = v;
     }
   }
 
@@ -533,9 +599,12 @@ export function bucketEvents(events, role, rule, prefix, noteTitles, labels) {
     }
 
     if (bucket === null) continue;
-    const row = [trip[0], trip[1], label];
-    if (bucket === "commitment") commitments.push(row);
-    else soft.push(row);
+    if (bucket === "commitment") {
+      const buf = effectiveBuffer(normTitle, bufOpts.before, bufOpts.after, bufferMap);
+      commitments.push([trip[0], trip[1], label, buf.before, buf.after]);
+    } else {
+      soft.push([trip[0], trip[1], label]);
+    }
   }
   return { commitments, soft };
 }
@@ -959,12 +1028,18 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
     NOTE_TITLES_KEY,
     TITLE_LABELS_KEY,
     LABEL_OVERRIDE_KEY,
+    BUFFER_BEFORE_KEY,
+    BUFFER_AFTER_KEY,
+    EVENT_BUFFERS_KEY,
   ]);
   const cals = resolveRoles(calItems, store[ROLES_KEY]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
   const noteTitles = store[NOTE_TITLES_KEY] || {};
   const titleLabels = store[TITLE_LABELS_KEY] || {};
   const labelOverride = store[LABEL_OVERRIDE_KEY] || {};
+  const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
+  const bufferAfter = store[BUFFER_AFTER_KEY] || {};
+  const eventBuffers = store[EVENT_BUFFERS_KEY] || {};
 
   const timeMin = nyMidnightRfc3339(windowStart, 0);
   const timeMax = nyMidnightRfc3339(windowEnd, 1); // +1 day: exclusive upper bound
@@ -984,7 +1059,11 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
       // name as the prefix on every note from it.
       const override = typeof labelOverride[cal.id] === "string" ? labelOverride[cal.id].trim() : "";
       const prefix = override || cal.prefix;
-      const b = bucketEvents(evs, cal.role, rule, prefix, noteTitles[cal.id], titleLabels[cal.id]);
+      const b = bucketEvents(evs, cal.role, rule, prefix, noteTitles[cal.id], titleLabels[cal.id], {
+        before: bufferBefore[cal.id],
+        after: bufferAfter[cal.id],
+        eventBuffers: eventBuffers[cal.id],
+      });
       commitments.push(...b.commitments);
       soft.push(...b.soft);
       dlog("calendar events", cal.role, mode, evs.length);
@@ -1077,8 +1156,12 @@ async function handleListCalendars(msg) {
     PATTERN_OPT_IN_KEY,
     "ruleInclude",
     "ruleExclude",
+    BUFFER_BEFORE_KEY,
+    BUFFER_AFTER_KEY,
   ]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
+  const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
+  const bufferAfter = store[BUFFER_AFTER_KEY] || {};
   const calendars = resolveRoles(calItems, store[ROLES_KEY]).map((c) => ({
     id: c.id,
     summary: c.summary,
@@ -1092,6 +1175,10 @@ async function handleListCalendars(msg) {
     // so, or it looks like it conjured up a calendar the user cannot find.
     hiddenInGoogle: c.hiddenInGoogle,
     blockTitles: Array.isArray(blockTitles[c.id]) ? blockTitles[c.id] : [],
+    // Default rest-buffer hours for this calendar's blocking events (0 when
+    // unconfigured) — see BUFFER_BEFORE_KEY/BUFFER_AFTER_KEY.
+    bufferBefore: typeof bufferBefore[c.id] === "number" ? bufferBefore[c.id] : 0,
+    bufferAfter: typeof bufferAfter[c.id] === "number" ? bufferAfter[c.id] : 0,
   }));
 
   return {
@@ -1118,6 +1205,49 @@ async function handleSetCalendarRole(msg) {
   const roles = (await chrome.storage.local.get(ROLES_KEY))[ROLES_KEY] || {};
   roles[msg.calendarId] = msg.role;
   await chrome.storage.local.set({ [ROLES_KEY]: roles });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
+/**
+ * Coerce a candidate buffer-hours value to a valid, storable number: finite,
+ * non-negative, rounded to at most 2 decimal places. Returns null for anything
+ * else (NaN, Infinity, negative, non-numeric) so the caller can reject rather
+ * than silently store a nonsensical buffer.
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function coerceBufferHours(v) {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Persist this calendar's default rest-buffer hours (calBufferBefore/After).
+ * Per-event overrides (calEventBuffers) are untouched — they are written by
+ * setEventRules.
+ *
+ * -> { type:"setCalendarBuffer", calendarId, before:number, after:number }
+ * <- { ok:true } | { ok:false, error:"bad_calendar_id"|"bad_buffer" }
+ */
+async function handleSetCalendarBuffer(msg) {
+  const calendarId = msg && msg.calendarId;
+  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+
+  const before = coerceBufferHours(msg && msg.before);
+  const after = coerceBufferHours(msg && msg.after);
+  if (before === null || after === null) return { ok: false, error: "bad_buffer" };
+
+  const cur = await chrome.storage.local.get([BUFFER_BEFORE_KEY, BUFFER_AFTER_KEY]);
+  const beforeMap = cur[BUFFER_BEFORE_KEY] || {};
+  const afterMap = cur[BUFFER_AFTER_KEY] || {};
+  beforeMap[calendarId] = before;
+  afterMap[calendarId] = after;
+  await chrome.storage.local.set({
+    [BUFFER_BEFORE_KEY]: beforeMap,
+    [BUFFER_AFTER_KEY]: afterMap,
+  });
   await chrome.storage.local.remove(CACHE_KEY);
   return { ok: true };
 }
@@ -1194,6 +1324,7 @@ async function handleListCalendarTitles(msg) {
     NOTE_TITLES_KEY,
     TITLE_LABELS_KEY,
     LABEL_OVERRIDE_KEY,
+    EVENT_BUFFERS_KEY,
   ]);
   const cal = resolveRoles(calItems, stored[ROLES_KEY]).find((c) => c.id === calendarId);
   if (!cal) return { ok: false, error: "unknown_calendar" };
@@ -1228,12 +1359,26 @@ async function handleListCalendarTitles(msg) {
   const calLabel = typeof (stored[LABEL_OVERRIDE_KEY] || {})[calendarId] === "string"
     ? stored[LABEL_OVERRIDE_KEY][calendarId]
     : "";
+  const rawEventBuffers = (stored[EVENT_BUFFERS_KEY] || {})[calendarId];
+  const eventBuffers =
+    rawEventBuffers && typeof rawEventBuffers === "object" && !Array.isArray(rawEventBuffers)
+      ? rawEventBuffers
+      : {};
 
   // A freeBusyReader grant returns events with no summary at all. Return the
   // empty list and the accessRole so the UI can say why, instead of drawing
   // rows of blanks that read as a broken picker.
   if (cal.accessRole === "freeBusyReader") {
-    return { ok: true, titles: [], accessRole: cal.accessRole, blockTitles, noteTitles, titleLabels, calLabel };
+    return {
+      ok: true,
+      titles: [],
+      accessRole: cal.accessRole,
+      blockTitles,
+      noteTitles,
+      titleLabels,
+      calLabel,
+      eventBuffers,
+    };
   }
 
   try {
@@ -1245,7 +1390,16 @@ async function handleListCalendarTitles(msg) {
     );
     const titles = summarizeTitles(evs);
     dlog("listCalendarTitles", evs.length, titles.length);
-    return { ok: true, titles, accessRole: cal.accessRole, blockTitles, noteTitles, titleLabels, calLabel };
+    return {
+      ok: true,
+      titles,
+      accessRole: cal.accessRole,
+      blockTitles,
+      noteTitles,
+      titleLabels,
+      calLabel,
+      eventBuffers,
+    };
   } catch (e) {
     return errorResponse(e);
   }
@@ -1297,23 +1451,32 @@ function cleanTitleArray(arr) {
  * Persist the WHOLE three-way picker state for one calendar in a single write.
  *
  * -> { type:"setEventRules", calendarId, block:string[], note:string[],
- *      labels:{ [title]:shortLabel }, calLabel:string }
+ *      labels:{ [title]:shortLabel }, calLabel:string,
+ *      eventBuffers?:{ [title]:{before:number, after:number} } }
  * <- { ok:true } | { ok:false, error }
  *
- * This is the ONLY handler the rebuilt picker uses. It writes all four
+ * This is the ONLY handler the rebuilt picker uses. It writes all five
  * per-calendar keys atomically (block set, note set, per-event labels, the
- * calendar short name) in one chrome.storage.local.set, so there are no
- * per-checkbox races: whatever the caller last sent is exactly what is stored.
- * The legacy setBlockTitles handler stays in place for its existing tests, but
- * the UI no longer calls it.
+ * calendar short name, per-event rest-buffer overrides) in one
+ * chrome.storage.local.set, so there are no per-checkbox races: whatever the
+ * caller last sent is exactly what is stored. The legacy setBlockTitles
+ * handler stays in place for its existing tests, but the UI no longer calls it.
  *
  * Every field is validated and cleaned: block/note must be arrays (trimmed,
  * de-duped, empties dropped); labels must be a plain object (empty titles and
  * empty labels dropped, both sides trimmed); calLabel is trimmed, and an empty
- * one REMOVES the override rather than storing "".
+ * one REMOVES the override rather than storing "". eventBuffers, when present,
+ * must be a plain object; each entry's title is trimmed (empty titles
+ * dropped) and its before/after coerced with the same non-negative
+ * finite/2-decimal rule as setCalendarBuffer — an entry with either side
+ * invalid is dropped rather than partially stored. eventBuffers is OPTIONAL:
+ * an absent field leaves the calendar's stored overrides untouched, but a
+ * present field (including {}) REPLACES them wholesale, mirroring how
+ * block/note/labels already work.
  *
  * Drops the cache for the same reason the other mutators do: a cache bucketed
- * under the old rules would keep applying blocks/notes the user just changed.
+ * under the old rules would keep applying blocks/notes/buffers the user just
+ * changed.
  */
 async function handleSetEventRules(msg) {
   const calendarId = msg && msg.calendarId;
@@ -1322,6 +1485,13 @@ async function handleSetEventRules(msg) {
   if (!Array.isArray(msg.note)) return { ok: false, error: "bad_note" };
   if (!msg.labels || typeof msg.labels !== "object" || Array.isArray(msg.labels)) {
     return { ok: false, error: "bad_labels" };
+  }
+  const hasEventBuffers = Object.prototype.hasOwnProperty.call(msg, "eventBuffers");
+  if (
+    hasEventBuffers &&
+    (!msg.eventBuffers || typeof msg.eventBuffers !== "object" || Array.isArray(msg.eventBuffers))
+  ) {
+    return { ok: false, error: "bad_event_buffers" };
   }
 
   const block = cleanTitleArray(msg.block);
@@ -1335,28 +1505,46 @@ async function handleSetEventRules(msg) {
   }
   const calLabel = typeof msg.calLabel === "string" ? msg.calLabel.trim() : "";
 
+  let newEventBuffers = null;
+  if (hasEventBuffers) {
+    newEventBuffers = {};
+    for (const [k, v] of Object.entries(msg.eventBuffers)) {
+      if (typeof k !== "string") continue;
+      const kk = k.trim();
+      if (kk === "" || !v || typeof v !== "object") continue;
+      const before = coerceBufferHours(v.before);
+      const after = coerceBufferHours(v.after);
+      if (before === null || after === null) continue;
+      newEventBuffers[kk] = { before, after };
+    }
+  }
+
   const cur = await chrome.storage.local.get([
     BLOCK_TITLES_KEY,
     NOTE_TITLES_KEY,
     TITLE_LABELS_KEY,
     LABEL_OVERRIDE_KEY,
+    EVENT_BUFFERS_KEY,
   ]);
   const blockMap = cur[BLOCK_TITLES_KEY] || {};
   const noteMap = cur[NOTE_TITLES_KEY] || {};
   const labelMap = cur[TITLE_LABELS_KEY] || {};
   const overrideMap = cur[LABEL_OVERRIDE_KEY] || {};
+  const eventBufferMap = cur[EVENT_BUFFERS_KEY] || {};
 
   blockMap[calendarId] = block;
   noteMap[calendarId] = note;
   labelMap[calendarId] = labels;
   if (calLabel) overrideMap[calendarId] = calLabel;
   else delete overrideMap[calendarId];
+  if (newEventBuffers !== null) eventBufferMap[calendarId] = newEventBuffers;
 
   await chrome.storage.local.set({
     [BLOCK_TITLES_KEY]: blockMap,
     [NOTE_TITLES_KEY]: noteMap,
     [TITLE_LABELS_KEY]: labelMap,
     [LABEL_OVERRIDE_KEY]: overrideMap,
+    [EVENT_BUFFERS_KEY]: eventBufferMap,
   });
   await chrome.storage.local.remove(CACHE_KEY);
   return { ok: true };
@@ -1384,6 +1572,7 @@ const HANDLERS = {
   listCalendars: handleListCalendars,
   listCalendarTitles: handleListCalendarTitles,
   setCalendarRole: handleSetCalendarRole,
+  setCalendarBuffer: handleSetCalendarBuffer,
   setBlockTitles: handleSetBlockTitles,
   setEventRules: handleSetEventRules,
   setRuleFilter: handleSetRuleFilter,
