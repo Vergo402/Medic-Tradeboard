@@ -147,7 +147,13 @@ export function openTourInGap(gs, ge) {
 export function evaluate(rec, commitments, myShifts = [], softEvents = []) {
   const { startEpoch, endEpoch } = shiftTimes(rec);
 
-  const fam = softEvents.filter((e) => e.s < endEpoch && e.e > startEpoch).map((e) => e.label);
+  // Dedupe by label: an overnight shift spans two calendar days, so it overlaps
+  // BOTH days' copies of an all-day note (and the same event reached from two
+  // calendars lands twice too). The commitment side already merges; notes must
+  // collapse the same way, or an overnight shift's badge reads the same note twice.
+  const fam = [...new Set(
+    softEvents.filter((e) => e.s < endEpoch && e.e > startEpoch).map((e) => e.label)
+  )];
 
   const overlap = commitments.filter((c) => c.s < endEpoch && c.e > startEpoch);
   if (overlap.length) {

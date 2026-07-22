@@ -313,6 +313,23 @@ test("evaluate: fam attaches on reject too", () => {
   assert.deepEqual(result.fam, ["Anniversary"]);
 });
 
+// An overnight shift spans two calendar days, so it overlaps BOTH days' copies
+// of an all-day note. Those are two distinct events with the same label; fam
+// must collapse them, or the badge reads the label twice ("Standby · Backup ·
+// Standby · Backup") on a 19:00-07:00 shift.
+test("evaluate: fam dedupes an all-day note that both days of an overnight shift touch", () => {
+  const softEvents = [
+    triplet("2026-09-25 00:00", "2026-09-26 00:00", "Standby"),
+    triplet("2026-09-25 00:00", "2026-09-26 00:00", "Backup"),
+    triplet("2026-09-26 00:00", "2026-09-27 00:00", "Standby"),
+    triplet("2026-09-26 00:00", "2026-09-27 00:00", "Backup"),
+  ];
+  const rec = { date: "2026-09-25", start: "19:00", end: "07:00" }; // overnight
+  const result = evaluate(rec, [], [], softEvents);
+  // Each label appears once, first-occurrence order preserved.
+  assert.deepEqual(result.fam, ["Standby", "Backup"]);
+});
+
 // --- rankEligible(): descending-score sort, stable, rejects untouched ------
 //
 // Eligible rows sort by descending score (stable, so ties keep the caller's
