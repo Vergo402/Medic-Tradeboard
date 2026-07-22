@@ -133,6 +133,41 @@ const REJECT_CHIP_LABEL_CASES = [
     expected: `\u2715 ${DEFAULT_COMMITMENT_LABEL}`,
   },
   {
+    // A per-event "show as" override wins over the global commitment label.
+    id: "commitment_reject_label_overrides_global",
+    reject: { rejectKind: "commitment", rejectLabel: "Drill", rejectGapHours: null },
+    label: "Fire Dept",
+    expected: "\u2715 Drill",
+  },
+  {
+    // An empty override falls back to the global commitment label.
+    id: "commitment_empty_reject_label_falls_back_to_global",
+    reject: { rejectKind: "commitment", rejectLabel: "", rejectGapHours: null },
+    label: "Fire Dept",
+    expected: "\u2715 Fire Dept",
+  },
+  {
+    // Empty override AND unset global \u21d2 the neutral default.
+    id: "commitment_empty_reject_label_and_no_global_uses_default",
+    reject: { rejectKind: "commitment", rejectLabel: "", rejectGapHours: null },
+    label: undefined,
+    expected: `\u2715 ${DEFAULT_COMMITMENT_LABEL}`,
+  },
+  {
+    // A whitespace-only override is not a real label \u2014 fall back.
+    id: "commitment_blank_reject_label_falls_back_to_global",
+    reject: { rejectKind: "commitment", rejectLabel: "   ", rejectGapHours: null },
+    label: "Fire Dept",
+    expected: "\u2715 Fire Dept",
+  },
+  {
+    // The override is trimmed like the global label.
+    id: "commitment_reject_label_is_trimmed",
+    reject: { rejectKind: "commitment", rejectLabel: "  Drill  ", rejectGapHours: null },
+    label: "Fire Dept",
+    expected: "\u2715 Drill",
+  },
+  {
     id: "my_shift_ignores_the_configured_label",
     reject: { rejectKind: "my_shift", rejectGapHours: null },
     label: "Fire Dept",

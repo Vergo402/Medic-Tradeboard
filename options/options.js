@@ -31,9 +31,8 @@
  * ---------------------------------------------------------------------------
  * SERVICE-WORKER CONTRACT ASSUMED BY THIS PAGE
  * ---------------------------------------------------------------------------
- * listCalendarTitles and setBlockTitles are being written concurrently in
- * sw.js. These are the exact shapes this page sends and expects; a mismatch
- * should be fixed here, not papered over.
+ * These are the exact shapes this page sends and expects; a mismatch should be
+ * fixed here, not papered over.
  *
  *   → { type: "listCalendarTitles", calendarId }
  *     NOTE: no time window is sent. The options page has no board month, so the
@@ -43,14 +42,28 @@
  *       titles: [ { title: string,
  *                   count: number,            // occurrences in the sampled range
  *                   minutes: number } ],      // typical duration, minutes
- *       blockTitles: string[] }               // currently persisted ticks
+ *       blockTitles: string[],                // persisted Block set (stem match)
+ *       noteTitles: string[],                 // persisted Note set (exact match)
+ *       titleLabels: { [title]: shortLabel }, // per-event "show as" overrides
+ *       calLabel: string }                    // per-calendar short name ("" = none)
  *   ← { ok: false, error: string, accessRole?: string }
  *     error "calendar_off": the worker refuses to read a calendar that is not
  *     switched on, whoever asked. Reachable only out of order — setRole() awaits
  *     setCalendarRole before it asks for titles.
+ *     The block/note/label sets are the FULL persisted state, including titles
+ *     whose events fall outside the sample and so never render as rows. The
+ *     picker seeds its authoritative sets from these and re-sends them whole via
+ *     setEventRules, so an off-sample Block title is never dropped — dropping it
+ *     would silently weaken blocking.
  *
- *   → { type: "setBlockTitles", calendarId, titles: string[] }
+ *   → { type: "setEventRules", calendarId,
+ *       block: string[], note: string[],
+ *       labels: { [title]: shortLabel }, calLabel: string }
  *   ← { ok: true } | { ok: false, error: string }
+ *     ONE atomic write of the whole three-way picker state for the calendar.
+ *     The page sends the entire current sets on every change (snapshot at send
+ *     time), so there are no per-control races. The legacy setBlockTitles
+ *     handler still exists in sw.js but this page no longer calls it.
  *
  * Tolerated aliases (defensive only — the names above are the contract):
  *   titles[].typicalMinutes / durationMinutes as alternates for `minutes`,
@@ -104,7 +117,16 @@ const ROLE_ON_ENABLE = 'FLAG';
 const state = {
   calendars: [],          // [{id, summary, primary, role}]
   loadError: null,        // string | null — set means the LOUD load banner shows
-  titles: new Map(),      // calId -> {status, accessRole, items:[{title,count,minutes}], blocked:Set, error}
+  // calId -> { status, accessRole, error, saveError,
+  //            items:[{title,count,minutes}],  // distinct titles in the sample
+  //            blockSet:Set<title>,            // Block — stem match, safety-critical
+  //            noteSet:Set<title>,             // Note — exact match, cosmetic
+  //            labels:Map<title,shortLabel>,   // per-event "show as"
+  //            calLabel:string }               // per-calendar short name
+  // blockSet/noteSet/labels are seeded from the FULL persisted arrays and may
+  // hold titles with no row in the current sample; they are re-sent whole so
+  // those never get dropped.
+  titles: new Map(),
   search: new Map(),      // calId -> current search box text
   ruleUsePattern: false   // the advanced regex hatch — the RAW ruleUsePattern key, the
                           // same value content/boot.js feeds anyoneBlocks(), so the two
@@ -206,7 +228,7 @@ function calBlocks(cal) {
   // open, where a pattern-armed RULE calendar returned false and the banner
   // over-warned.
   const t = state.titles.get(cal.id);
-  const blockTitles = t && t.blocked ? Array.from(t.blocked) : [];
+  const blockTitles = t && t.blockSet ? Array.from(t.blockSet) : [];
   return calendarBlocks(cal.role, blockTitles, state.ruleUsePattern);
 }
 
@@ -276,10 +298,39 @@ function normalizeTitleItems(raw) {
   return out;
 }
 
+function emptyThreeWay() {
+  return { blockSet: new Set(), noteSet: new Set(), labels: new Map(), calLabel: '' };
+}
+
+// Seed the authoritative Block/Note/label/calLabel state from the handler's FULL
+// persisted arrays — not from the visible rows — so a Block title whose events
+// are outside the sample survives the next save. See the contract note above.
+function seedThreeWay(resp) {
+  const strs = (arr) => (Array.isArray(arr) ? arr : []).filter((t) => typeof t === 'string');
+  const labels = new Map();
+  const raw = resp.titleLabels;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof k === 'string' && typeof v === 'string') labels.set(k, v);
+    }
+  }
+  const noteSet = new Set(strs(resp.noteTitles));
+  const blockSet = new Set(strs(resp.blockTitles));
+  // A title can only be one thing; if storage ever holds it in both, Block wins
+  // (it is the safety-critical, forward-looking rule) — mirror bucketEvents.
+  for (const b of blockSet) noteSet.delete(b);
+  return {
+    blockSet,
+    noteSet,
+    labels,
+    calLabel: typeof resp.calLabel === 'string' ? resp.calLabel : ''
+  };
+}
+
 async function loadTitles(calId, force) {
   const existing = state.titles.get(calId);
   if (!force && existing && existing.status === 'ok') return existing;
-  state.titles.set(calId, { status: 'loading', items: [], blocked: new Set() });
+  state.titles.set(calId, { status: 'loading', items: [], ...emptyThreeWay() });
   render();
 
   const resp = await send({ type: 'listCalendarTitles', calendarId: calId });
@@ -289,18 +340,14 @@ async function loadTitles(calId, force) {
       error: resp.error,
       accessRole: resp.accessRole,
       items: [],
-      blocked: new Set()
+      ...emptyThreeWay()
     });
   } else {
-    const items = normalizeTitleItems(resp.titles);
-    const blocked = new Set(
-      (Array.isArray(resp.blockTitles) ? resp.blockTitles : []).filter((t) => typeof t === 'string')
-    );
     state.titles.set(calId, {
       status: 'ok',
       accessRole: resp.accessRole || '',
-      items,
-      blocked
+      items: normalizeTitleItems(resp.titles),
+      ...seedThreeWay(resp)
     });
   }
   render();
@@ -309,43 +356,93 @@ async function loadTitles(calId, force) {
 
 // One in-flight save per calendar, chained.
 //
-// WHY. Every checkbox change fires a save carrying a FULL snapshot of the ticked
-// set, and the worker handles it with an awaited read-modify-write. Fired
-// concurrently, two saves can be applied out of order, so an older snapshot
-// wins: a tick the user can still see on screen is silently not persisted, and
-// the page reports success because its own request succeeded. Ticking fast is
-// exactly what a user does when configuring a calendar for the first time.
+// WHY. Every change fires a save carrying a FULL snapshot of the calendar's
+// three-way state, and the worker handles it with an awaited read-modify-write.
+// Fired concurrently, two saves can be applied out of order, so an older
+// snapshot wins: a change the user can still see on screen is silently not
+// persisted, and the page reports success because its own request succeeded.
+// Marking events fast is exactly what a user does when configuring a calendar.
 //
 // Chaining per calendar makes last-write-wins correct by construction: the
-// snapshot is taken when the request is about to GO OUT, not when it was
-// queued, so the final write always carries what is on screen and the
-// intermediate states collapse harmlessly.
+// snapshot is taken when the request is about to GO OUT (in sendEventRules), not
+// when it was queued, so the final write always carries what is on screen and
+// the intermediate states collapse harmlessly.
 const saveChains = new Map();
+const saveTimers = new Map();
 
-function persistBlockTitles(calId) {
+function persistEventRules(calId) {
+  const timer = saveTimers.get(calId);
+  if (timer) { clearTimeout(timer); saveTimers.delete(calId); }
   const previous = saveChains.get(calId) || Promise.resolve();
-  const next = previous.then(() => sendBlockTitles(calId));
+  const next = previous.then(() => sendEventRules(calId));
   saveChains.set(calId, next);
   return next;
 }
 
+// Typing in a "show as" field would fire a save per keystroke; debounce it. The
+// snapshot is still taken at send time, so a debounced save and an immediate one
+// (a segment click) both persist exactly what is on screen when they go out.
+function persistEventRulesDebounced(calId, ms = 400) {
+  const existing = saveTimers.get(calId);
+  if (existing) clearTimeout(existing);
+  saveTimers.set(calId, setTimeout(() => {
+    saveTimers.delete(calId);
+    persistEventRules(calId);
+  }, ms));
+}
+
 // Never throws: a rejection here would poison the chain above and every later
-// tick for this calendar would silently stop being saved.
-async function sendBlockTitles(calId) {
+// change for this calendar would silently stop being saved.
+async function sendEventRules(calId) {
   const t = state.titles.get(calId);
   if (!t) return;
+  const hadError = Boolean(t.saveError);
   try {
-    // Snapshotted HERE, at send time — see the note above.
+    // Snapshotted HERE, at send time — see the note above. Labels are sent only
+    // for titles that are actually Block or Note (an Ignored title has no label
+    // to show), trimmed, empties dropped.
+    const labels = {};
+    for (const [title, lab] of t.labels) {
+      if (!t.blockSet.has(title) && !t.noteSet.has(title)) continue;
+      const v = (typeof lab === 'string' ? lab : '').trim();
+      if (v) labels[title] = v;
+    }
     const resp = await send({
-      type: 'setBlockTitles',
+      type: 'setEventRules',
       calendarId: calId,
-      titles: Array.from(t.blocked)
+      block: Array.from(t.blockSet),
+      note: Array.from(t.noteSet),
+      labels,
+      calLabel: (typeof t.calLabel === 'string' ? t.calLabel : '').trim()
     });
     t.saveError = resp.ok ? null : resp.error;
   } catch (e) {
     t.saveError = e && e.message ? e.message : String(e);
   }
-  render();
+  // Only re-render when the error state changed. On the happy path nothing
+  // visual changed, and a re-render would steal focus from a "show as" field the
+  // user is still typing in (the debounced save can fire mid-edit).
+  if (t.saveError || hadError) render();
+}
+
+// Move a title to exactly one of the three states, preserving any typed label.
+function setTitleMode(calId, title, mode) {
+  const t = state.titles.get(calId);
+  if (!t) return;
+  t.blockSet.delete(title);
+  t.noteSet.delete(title);
+  if (mode === 'block') t.blockSet.add(title);
+  else if (mode === 'note') t.noteSet.add(title);
+  persistEventRules(calId);
+  // The row's "show as" field appears/disappears and the totals move, so a
+  // re-render is needed; keep the clicked segment focused for keyboard users.
+  render({ focus: { calId, kind: 'seg', title, mode } });
+}
+
+function modeOf(t, title) {
+  if (t.blockSet.has(title)) return 'block';
+  if (t.noteSet.has(title)) return 'note';
+  return 'ignore';
 }
 
 function buildFreeBusyNotice(cal) {
@@ -369,11 +466,59 @@ function buildFreeBusyNotice(cal) {
   return box;
 }
 
+// One title row: a header line (title + meta + the Block/Note/Ignore segmented
+// control), then a "show as" line revealed only when the row is Block or Note.
+function buildTitleRow(cal, t, item) {
+  const mode = modeOf(t, item.title);
+  const row = el('div', 'title-row');
+
+  const main = el('div', 'title-main');
+  main.appendChild(el('span', 't', item.title));
+  const meta = metaFor(item);
+  if (meta) main.appendChild(el('span', 'meta', meta));
+
+  const seg = el('div', 'seg');
+  for (const [m, label] of [['block', 'Block'], ['note', 'Note'], ['ignore', 'Ignore']]) {
+    const btn = el('button', mode === m ? 'on-' + m : null, label);
+    btn.type = 'button';
+    btn.dataset.title = item.title;
+    btn.dataset.mode = m;
+    btn.setAttribute('aria-pressed', String(mode === m));
+    btn.addEventListener('click', () => {
+      if (modeOf(t, item.title) !== m) setTitleMode(cal.id, item.title, m);
+    });
+    seg.appendChild(btn);
+  }
+  main.appendChild(seg);
+  row.appendChild(main);
+
+  if (mode === 'block' || mode === 'note') {
+    const showas = el('div', 'showas');
+    showas.appendChild(el('span', 'arrow', '↳ show as'));
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = mode === 'block' ? 'reject chip (optional)' : 'note text (optional)';
+    input.value = t.labels.get(item.title) || '';
+    input.dataset.title = item.title;
+    input.addEventListener('input', () => {
+      t.labels.set(item.title, input.value);
+      // Debounced, and deliberately no render(): the field's presence does not
+      // change as its own text is typed, and a re-render would drop the caret.
+      // Totals and the blocking banner do not depend on labels.
+      persistEventRulesDebounced(cal.id);
+    });
+    showas.appendChild(input);
+    row.appendChild(showas);
+  }
+  return row;
+}
+
 function buildPicker(cal) {
   const wrap = el('div', 'picker');
-  wrap.appendChild(el('h3', null, 'Which events mean you’re unavailable?'));
+  wrap.appendChild(el('h3', null, 'What matters on this calendar?'));
   wrap.appendChild(el('p', 'hint',
-    'Tick anything that should block a shift. Everything else becomes a note.'));
+    'Mark an event Block to knock out an overlapping shift, or Note to leave a '
+    + 'reminder. Everything you leave on Ignore is dropped.'));
 
   const t = state.titles.get(cal.id);
 
@@ -406,6 +551,21 @@ function buildPicker(cal) {
     return wrap;
   }
 
+  // Per-calendar short name: prefixes every note from this calendar in place of
+  // its full display name. No render() on input — same reasoning as "show as".
+  const calLabelRow = el('div', 'cal-label-row');
+  calLabelRow.appendChild(el('label', null, 'Show this calendar as →'));
+  const calInput = document.createElement('input');
+  calInput.type = 'text';
+  calInput.placeholder = calDisplayName(cal);
+  calInput.value = t.calLabel || '';
+  calInput.addEventListener('input', () => {
+    t.calLabel = calInput.value;
+    persistEventRulesDebounced(cal.id);
+  });
+  calLabelRow.appendChild(calInput);
+  wrap.appendChild(calLabelRow);
+
   // Search — some accounts have 200+ distinct titles.
   const query = (state.search.get(cal.id) || '');
   const search = document.createElement('input');
@@ -419,56 +579,38 @@ function buildPicker(cal) {
   wrap.appendChild(search);
 
   const q = query.trim().toLowerCase();
-  const matches = (item) => !q || item.title.toLowerCase().includes(q);
-  const ticked = t.items.filter((i) => t.blocked.has(i.title));
-  const unticked = t.items.filter((i) => !t.blocked.has(i.title));
+  const shown = t.items.filter((i) => !q || i.title.toLowerCase().includes(q));
+  if (shown.length === 0) {
+    wrap.appendChild(el('div', 'empty-group', 'No matches for “' + query.trim() + '”.'));
+  } else {
+    for (const item of shown) wrap.appendChild(buildTitleRow(cal, t, item));
+  }
 
-  const addGroup = (labelText, items, isTicked) => {
-    wrap.appendChild(el('div', 'group-label', labelText));
-    const shown = items.filter(matches);
-    if (shown.length === 0) {
-      wrap.appendChild(el('div', 'empty-group',
-        items.length === 0
-          ? (isTicked ? 'Nothing ticked yet — this calendar blocks nothing.' : 'Nothing here.')
-          : 'No matches for “' + query.trim() + '”.'));
-      return;
-    }
-    for (const item of shown) {
-      const row = el('label', 'title-row');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = isTicked;
-      cb.dataset.title = item.title;
-      cb.addEventListener('change', () => {
-        if (cb.checked) t.blocked.add(item.title);
-        else t.blocked.delete(item.title);
-        persistBlockTitles(cal.id);
-        // Ticking moves the row between the two groups, which rebuilds the
-        // list — without this the keyboard user is dumped back to the top.
-        render({ focus: { calId: cal.id, kind: 'title', title: item.title } });
-      });
-      row.appendChild(cb);
-      row.appendChild(el('span', 't', item.title));
-      const meta = metaFor(item);
-      if (meta) row.appendChild(el('span', 'meta', meta));
-      wrap.appendChild(row);
-    }
-  };
-
-  addGroup('Ticked — these block shifts', ticked, true);
-  addGroup('Not ticked — these just show as notes', unticked, false);
-
-  const sum = (items) => items.reduce((n, i) => n + (Number.isFinite(i.count) ? i.count : 1), 0);
+  // Running total, counted over the titles in this sample so it always sums to
+  // the number of rows. Off-sample Block/Note titles (kept in the sets so they
+  // are not dropped) have no row and are not counted here.
+  let nBlock = 0;
+  let nNote = 0;
+  let nIgnore = 0;
+  for (const i of t.items) {
+    const m = modeOf(t, i.title);
+    if (m === 'block') nBlock += 1;
+    else if (m === 'note') nNote += 1;
+    else nIgnore += 1;
+  }
   const totals = el('div', 'totals');
-  totals.appendChild(el('strong', null, String(sum(ticked))));
-  totals.appendChild(document.createTextNode(' event' + (sum(ticked) === 1 ? '' : 's') + ' will block shifts · '));
-  totals.appendChild(el('strong', null, String(sum(unticked))));
-  totals.appendChild(document.createTextNode(' will show as notes'));
+  totals.appendChild(el('strong', null, nBlock + ' block'));
+  totals.appendChild(document.createTextNode(' · '));
+  totals.appendChild(el('strong', null, nNote + ' note'));
+  totals.appendChild(document.createTextNode(' · '));
+  totals.appendChild(el('strong', null, nIgnore + ' ignored'));
+  totals.appendChild(document.createTextNode(
+    ' — anything you don’t mark is ignored, so the board stays quiet by default.'));
   wrap.appendChild(totals);
 
   if (t.saveError) {
     wrap.appendChild(el('div', 'cal-status error',
-      'Your last change was NOT saved (' + t.saveError + ') — these ticks are not blocking anything yet.'));
+      'Your last change was NOT saved (' + t.saveError + ') — it is not being applied yet.'));
   }
   return wrap;
 }
@@ -601,10 +743,12 @@ function render(opts) {
       box.focus();
       if (f.pos !== null && f.pos !== undefined) box.setSelectionRange(f.pos, f.pos);
     }
-  } else if (f.kind === 'title') {
-    const rows = card.querySelectorAll('.title-row input[type="checkbox"]');
-    for (const cb of rows) {
-      if (cb.dataset.title === f.title) { cb.focus(); break; }
+  } else if (f.kind === 'seg') {
+    // Marking a title rebuilds the list; keep the just-clicked segment focused so
+    // a keyboard user is not dumped back to the top of the page.
+    const btns = card.querySelectorAll('.seg button');
+    for (const btn of btns) {
+      if (btn.dataset.title === f.title && btn.dataset.mode === f.mode) { btn.focus(); break; }
     }
   }
 }

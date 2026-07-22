@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Options picker harness — synthetic data</title>
+<!--
+  Offline fidelity harness for the calendar event picker. No extension APIs:
+  window.chrome is stubbed with canned listCalendars / listCalendarTitles /
+  setEventRules responses so the REAL options.js renders against synthetic data.
+  All data here is fictional. Serve the repo root and open this file.
+-->
+<div id="mount"></div>
+<script>
+  // ---- synthetic canned data (no real calendars/names) --------------------
+  const CALS = [
+    { id: 'primary', summary: 'me@example.com', primary: true, role: 'RULE',
+      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: ['ACME - Desk'] },
+    { id: 'crew', summary: 'Crew Schedule', primary: false, role: 'REJECT',
+      accessRole: 'reader', selected: true, hiddenInGoogle: false, blockTitles: [] },
+    { id: 'fam', summary: 'Family calendar', primary: false, role: 'OFF',
+      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: [] },
+  ];
+  const TITLES = {
+    primary: {
+      ok: true, accessRole: 'owner',
+      titles: [
+        { title: 'ACME - Desk', count: 2, minutes: 1440 },
+        { title: 'ACME - Water Rescue Drill', count: 2, minutes: 300 },
+        { title: 'Kid book and drink', count: 1, minutes: 120 },
+        { title: 'Music Class', count: 5, minutes: 60 },
+        { title: 'Session', count: 8, minutes: 60 },
+      ],
+      blockTitles: ['ACME - Desk'],
+      noteTitles: ['Kid book and drink'],
+      titleLabels: { 'ACME - Water Rescue Drill': 'Drill', 'Kid book and drink': 'Kid' },
+      calLabel: 'Fam',
+    },
+  };
+  const storage = { commitmentLabel: 'Fire Dept', ruleInclude: '', ruleExclude: '', ruleUsePattern: false };
+
+  window.chrome = {
+    runtime: {
+      lastError: null,
+      getURL: (p) => p,
+      sendMessage(msg, cb) {
+        let r = { ok: false, error: 'unhandled: ' + msg.type };
+        if (msg.type === 'listCalendars') r = { ok: true, calendars: CALS, ruleFilter: { include: '', exclude: '', usePattern: false } };
+        else if (msg.type === 'listCalendarTitles') r = TITLES[msg.calendarId] || { ok: true, accessRole: 'owner', titles: [], blockTitles: [], noteTitles: [], titleLabels: {}, calLabel: '' };
+        else if (msg.type === 'setEventRules') { console.log('[harness] setEventRules', JSON.stringify(msg)); r = { ok: true }; }
+        else if (msg.type === 'setCalendarRole') { console.log('[harness] setCalendarRole', msg.calendarId, msg.role); r = { ok: true }; }
+        else if (msg.type === 'setRuleFilter') r = { ok: true };
+        setTimeout(() => cb(r), 0);
+      },
+    },
+    storage: { local: {
+      get(keys, cb) {
+        const out = {};
+        if (typeof keys === 'string') out[keys] = storage[keys];
+        else if (Array.isArray(keys)) keys.forEach(k => out[k] = storage[k]);
+        else if (keys && typeof keys === 'object') Object.keys(keys).forEach(k => out[k] = (k in storage) ? storage[k] : keys[k]);
+        setTimeout(() => cb(out), 0);
+      },
+      set(obj, cb) { Object.assign(storage, obj); console.log('[harness] storage.set', JSON.stringify(obj)); if (cb) setTimeout(cb, 0); },
+    } },
+  };
+
+  // ---- pull the real options.html markup in, then run the real module -----
+  (async () => {
+    const html = await (await fetch('/options/options.html')).text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const style = doc.querySelector('style');
+    if (style) document.head.appendChild(style.cloneNode(true));
+    // Move the options body markup into our mount (minus its own <script>).
+    doc.querySelectorAll('script').forEach(s => s.remove());
+    document.getElementById('mount').innerHTML = doc.body.innerHTML;
+    await import('/options/options.js');   // readyState is 'complete' → init() runs now
+  })();
+</script>

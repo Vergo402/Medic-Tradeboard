@@ -69,21 +69,32 @@ test("bucketEvents: FLAG sends every event to soft, even rule-matching ones", ()
   assert.equal(out.commitments.length, 0);
 });
 
-test("bucketEvents: RULE splits on the predicate", () => {
-  const out = bucketEvents([timed("Work day"), timed("Dentist")], "RULE", RULE, "");
-  assert.deepEqual(
-    out.commitments.map((r) => r[2]),
-    ["Work day"]
+// THREE-WAY (approved change): on a RULE calendar a title is Block (stem match →
+// commitment), Note (exact match in the note set → soft), or Ignore (in neither
+// → dropped). Ignore is the DEFAULT: unmarked titles used to become notes; they
+// are now dropped. Blocking is unchanged — only notes/ignore moved.
+test("bucketEvents: RULE blocks a stem match, notes a note-set title, ignores the rest", () => {
+  // Work day matches the block rule; Dentist is in the note set; Lunch is in
+  // neither, so it is ignored (dropped).
+  const out = bucketEvents(
+    [timed("Work day"), timed("Dentist"), timed("Lunch")],
+    "RULE", RULE, "", ["Dentist"], {}
   );
-  assert.deepEqual(
-    out.soft.map((r) => r[2]),
-    ["Dentist"]
-  );
+  // Work day blocked. A block's triplet label is the per-event "show as" or ""
+  // (empty ⇒ the reject chip falls back to the global commitment label).
+  assert.equal(out.commitments.length, 1);
+  assert.equal(out.commitments[0][2], "");
+  // Dentist is noted (exact note-set match).
+  assert.deepEqual(out.soft.map((r) => r[2]), ["Dentist"]);
+  // Lunch is in neither set → dropped: nothing else survives.
+  assert.equal(out.commitments.length + out.soft.length, 2);
 });
 
-test("bucketEvents: RULE sends an excluded title to soft, not commitments", () => {
-  const out = bucketEvents([timed("Work training")], "RULE", RULE, "");
-  assert.equal(out.commitments.length, 0);
+test("bucketEvents: RULE never blocks a rule-excluded title (it can still be a note)", () => {
+  // "training" is in EXCLUDES, so the rule rejects it → it must not block.
+  // Unmarked it would be ignored; put it in the note set to prove it can note.
+  const out = bucketEvents([timed("Work training")], "RULE", RULE, "", ["Work training"], {});
+  assert.equal(out.commitments.length, 0, "an excluded title must never block");
   assert.deepEqual(
     out.soft.map((r) => r[2]),
     ["Work training"]
@@ -154,11 +165,18 @@ test("bucketEvents: a non-empty prefix is joined with the middot separator", () 
 // unanchored pattern it would pass even with the bug present. Do not neutralize
 // either one.
 test("bucketEvents: RULE matches the RAW title, not the prefixed label", () => {
-  const out = bucketEvents([timed("Work day"), timed("Dentist")], "RULE", RULE, "Shared Cal");
-  assert.deepEqual(
-    out.commitments.map((r) => r[2]),
-    ["Shared Cal · Work day"]
+  // Dentist is in the note set so its prefixed note is also exercised here.
+  const out = bucketEvents(
+    [timed("Work day"), timed("Dentist")], "RULE", RULE, "Shared Cal", ["Dentist"], {}
   );
+  // Work day blocked — proof the rule saw the RAW title: with an anchored
+  // "^Work\b" against the prefixed label "Shared Cal · Work day" it could not
+  // match, and commitments.length would be 0. Do not neutralize the anchor or
+  // the non-empty prefix. The block's triplet label is "" — a note prefix never
+  // leaks onto a hard commitment.
+  assert.equal(out.commitments.length, 1);
+  assert.equal(out.commitments[0][2], "");
+  // A NOTE, by contrast, does carry the calendar prefix.
   assert.deepEqual(
     out.soft.map((r) => r[2]),
     ["Shared Cal · Dentist"]
@@ -177,6 +195,90 @@ test("bucketEvents: the rule receives the raw title as its only argument", () =>
 test("bucketEvents: null/undefined event list is safe", () => {
   assert.deepEqual(bucketEvents(null, "FLAG", RULE, ""), { commitments: [], soft: [] });
   assert.deepEqual(bucketEvents(undefined, "REJECT", RULE, ""), { commitments: [], soft: [] });
+});
+
+// ---------------------------------------------------------------------------
+// bucketEvents — the THREE-WAY model (Block / Note / Ignore)
+//
+// On a RULE calendar a title is Block (stem-matches the block set → hard
+// commitment), Note (exact-matches the note set → soft), or Ignore (in neither →
+// dropped). Ignore is the DEFAULT. A block title may carry a per-event "show as"
+// label (empty ⇒ fall back to the global commitment label); a note carries the
+// calendar prefix plus the per-event label or the raw title.
+// ---------------------------------------------------------------------------
+
+// A stem block matcher for "Crew - Desk", the way calendarRule would build it.
+const CREW_BLOCK = titlesToMatcher(["Crew - Desk"]);
+
+test("bucketEvents three-way: block→commitment, note→soft, neither→dropped", () => {
+  const events = [timed("Crew - Desk"), timed("Music Class"), timed("Brunch")];
+  const out = bucketEvents(events, "RULE", CREW_BLOCK, "", ["Music Class"], {});
+  // Crew - Desk stem-matches the block set → commitment.
+  assert.equal(out.commitments.length, 1);
+  // Music Class is in the note set → soft.
+  assert.deepEqual(out.soft.map((r) => r[2]), ["Music Class"]);
+  // Brunch is in NEITHER set → dropped: it must appear in neither array.
+  const all = [...out.commitments.map((r) => r[2]), ...out.soft.map((r) => r[2])];
+  assert.equal(all.includes("Brunch"), false);
+  assert.equal(all.length, 2);
+});
+
+test("bucketEvents three-way: default ignore — empty block and note sets yield nothing", () => {
+  const out = bucketEvents(
+    [timed("Anything"), timed("Crew - Desk"), timed("Music Class")],
+    "RULE", titlesToMatcher([]), "", [], {}
+  );
+  assert.equal(out.commitments.length, 0, "no block set ⇒ zero commitments");
+  assert.equal(out.soft.length, 0, "no note set ⇒ zero soft notes (Ignore is the default)");
+});
+
+test("bucketEvents three-way: a block title's label becomes the commitment triplet label", () => {
+  const out = bucketEvents(
+    [timed("Crew - Desk")], "RULE", CREW_BLOCK, "", [], { "Crew - Desk": "Desk" }
+  );
+  assert.equal(out.commitments.length, 1);
+  assert.equal(out.commitments[0][2], "Desk");
+});
+
+test("bucketEvents three-way: a block title with no label gets an empty commitment label", () => {
+  const out = bucketEvents([timed("Crew - Desk")], "RULE", CREW_BLOCK, "", [], {});
+  assert.equal(out.commitments[0][2], "");
+});
+
+test("bucketEvents three-way: a note title's label replaces the title, keeping the prefix", () => {
+  const out = bucketEvents(
+    [timed("Music Class")], "RULE", CREW_BLOCK, "Shared", ["Music Class"], { "Music Class": "Music" }
+  );
+  assert.deepEqual(out.soft.map((r) => r[2]), ["Shared · Music"]);
+});
+
+test("bucketEvents three-way: a per-calendar prefix leads every note label", () => {
+  // The caller passes the resolved prefix (a calLabelOverride like "Fam" or the
+  // calendar's display name); bucketEvents just prepends it to each note.
+  const out = bucketEvents(
+    [timed("Music Class")], "RULE", CREW_BLOCK, "Fam", ["Music Class"], {}
+  );
+  assert.equal(out.soft.length, 1);
+  assert.ok(out.soft[0][2].startsWith("Fam · "), out.soft[0][2]);
+  assert.equal(out.soft[0][2], "Fam · Music Class");
+});
+
+test("bucketEvents three-way: notes match EXACTLY, not by stem", () => {
+  // "Music Class" is noted; "Music Class Recital" is a DIFFERENT title and must
+  // NOT be auto-noted — a new title defaults to Ignore.
+  const out = bucketEvents(
+    [timed("Music Class"), timed("Music Class Recital")],
+    "RULE", CREW_BLOCK, "", ["Music Class"], {}
+  );
+  assert.deepEqual(out.soft.map((r) => r[2]), ["Music Class"]);
+  assert.equal(out.commitments.length, 0);
+});
+
+test("bucketEvents three-way: blocks STILL match by stem (unchanged, safety-critical)", () => {
+  // Ticking "Crew - Desk" must block a future, unseen "Crew - Night".
+  const out = bucketEvents([timed("Crew - Night")], "RULE", CREW_BLOCK, "", [], {});
+  assert.equal(out.commitments.length, 1, "a stem sibling of a blocked title must block");
+  assert.equal(out.soft.length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -429,7 +531,9 @@ test("resolveIncludeRegex + bucketEvents: an empty include pattern does not hard
   const rule = (title) => ruleMatches(title, includeRe, []);
   const out = bucketEvents([timed("Dentist"), timed("Lunch"), timed("Kid pickup")], "RULE", rule, "");
   assert.equal(out.commitments.length, 0, "no event should become a hard commitment");
-  assert.equal(out.soft.length, 3);
+  // With nothing in the note set the unmarked titles are ignored (dropped), not
+  // noted — the deliberate default. The safety point is the zero commitments.
+  assert.equal(out.soft.length, 0);
 });
 
 test("resolveIncludeRegex: a non-string stored value is treated as not configured", () => {
@@ -646,8 +750,11 @@ test("titlesToMatcher + bucketEvents: a ticked title hard-rejects, a memorial do
   ];
   const out = bucketEvents(events, "RULE", titlesToMatcher(["ACME - Desk"]), "");
   assert.equal(out.commitments.length, 1);
-  assert.equal(out.commitments[0][2], "ACME - Desk");
-  assert.equal(out.soft.length, 1);
+  // The ticked title blocks; its triplet label is "" (no per-event override).
+  assert.equal(out.commitments[0][2], "");
+  // The memorial CONTAINS "ACME" but does not START with the stem, so it never
+  // blocks — and, being unmarked (not in the note set), it is now ignored.
+  assert.equal(out.soft.length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -723,10 +830,9 @@ test("calendarRule + bucketEvents: [] ticked yields ZERO commitments for 'Work�
     ""
   );
   assert.equal(out.commitments.length, 0, "an empty ticked list must block nothing");
-  assert.deepEqual(
-    out.soft.map((r) => r[2]),
-    ["Work day", "Work from home", "Dentist"]
-  );
+  // Unmarked titles are now ignored, not noted — the deliberate default. The
+  // required end-to-end assertion is the zero commitments above.
+  assert.equal(out.soft.length, 0);
 });
 
 // Same shape, but through the real regex resolver rather than a hand-built one —
@@ -741,7 +847,8 @@ test("calendarRule + resolveIncludeRegex: an unconfigured RULE calendar blocks n
   assert.equal(mode, "none");
   const out = bucketEvents([timed("Work day"), timed("Work from home")], "RULE", rule, "");
   assert.equal(out.commitments.length, 0);
-  assert.equal(out.soft.length, 2);
+  // Unmarked ⇒ ignored (dropped), not noted. The point is the zero commitments.
+  assert.equal(out.soft.length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -1238,7 +1345,9 @@ test("resolveRoles + bucketEvents: a hidden REJECT calendar still produces commi
   })[0];
   const out = bucketEvents([timed("Night Tour")], cal.role, () => false, cal.prefix);
   assert.equal(out.commitments.length, 1);
-  assert.equal(out.commitments[0][2], "Crew Schedule · Night Tour");
+  // A REJECT commitment's triplet label is the per-event "show as" or "" — the
+  // reject chip uses the user's global commitment label, not the calendar name.
+  assert.equal(out.commitments[0][2], "");
 });
 
 test("defaultRole: no input of any shape yields REJECT, FLAG or RULE", () => {

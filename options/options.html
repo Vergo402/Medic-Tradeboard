@@ -126,14 +126,44 @@
       font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
       color: var(--ink-soft); font-weight: 700; margin: 14px 0 6px;
     }
-    .title-row {
-      display: flex; align-items: center; gap: 10px;
-      padding: 6px 8px; border-radius: 5px; font-size: 14px;
+
+    /* per-calendar "show as" short name, at the top of the picker */
+    .cal-label-row {
+      display: flex; align-items: center; gap: 8px; margin: 2px 0 12px;
+      font-size: 13.5px; flex-wrap: wrap;
     }
+    .cal-label-row label { color: var(--ink-soft); white-space: nowrap; }
+    .cal-label-row input { flex: 1; min-width: 140px; max-width: 260px; }
+
+    /* one title row: header line (title + meta + segmented control), then an
+       optional "show as" line revealed when the row is Block or Note */
+    .title-row { padding: 7px 8px; border-radius: 5px; }
     .title-row:hover { background: var(--bg-soft); }
-    .title-row input { margin: 0; flex: none; }
-    .title-row .t { flex: 1; word-break: break-word; }
-    .title-row .meta { color: var(--ink-soft); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .title-main { display: flex; align-items: center; gap: 10px; }
+    .title-main .t { flex: 1; word-break: break-word; font-size: 14px; }
+    .title-main .meta { color: var(--ink-soft); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+    /* Block / Note / Ignore segmented control */
+    .seg { display: inline-flex; flex: none; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+    .seg button {
+      border: none; border-radius: 0; background: #fff; color: var(--ink-soft);
+      padding: 4px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; line-height: 1.4;
+    }
+    .seg button + button { border-left: 1px solid var(--line); }
+    .seg button:hover { background: var(--bg-soft); }
+    .seg button.on-block { background: var(--danger); color: #fff; }
+    .seg button.on-note { background: #d9a824; color: #3a2c00; }
+    .seg button.on-ignore { background: #e7ebf0; color: var(--ink); }
+    .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+    /* per-event "show as" override */
+    .showas {
+      display: flex; align-items: center; gap: 6px; margin: 6px 0 0 4px;
+      font-size: 13px; color: var(--ink-soft);
+    }
+    .showas .arrow { flex: none; }
+    .showas input { flex: 1; min-width: 120px; max-width: 240px; padding: 5px 8px; font-size: 13px; }
+
     .empty-group { font-size: 13px; color: var(--ink-soft); padding: 4px 8px; }
     .totals {
       margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);

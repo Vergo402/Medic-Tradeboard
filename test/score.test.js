@@ -188,6 +188,27 @@ test("evaluate: reject reasons stay neutral and carry a structured kind", () => 
   assert.doesNotMatch(result.reason, /Day Tour/);
 });
 
+// The per-event "show as" override rides from the overlapping commitment's
+// triplet label into evaluate()'s rejectLabel; rowshape.rejectChipLabel turns
+// it into the chip. This pins the score→rowshape seam directly: the CASES above
+// never assert rejectLabel, and the rowshape test uses a synthetic reject, so
+// without this a wrong field name in evaluate() would leave all suites green.
+test("evaluate: a commitment reject carries the overlapping block's label as rejectLabel", () => {
+  const commitments = loadCommitments([["2026-07-13 08:00", "2026-07-13 18:00", "Drill"]]);
+  const rec = { date: "2026-07-13", start: "10:00", end: "14:00" };
+  const result = evaluate(rec, commitments);
+  assert.equal(result.rejectKind, "commitment");
+  assert.equal(result.rejectLabel, "Drill");
+});
+
+test("evaluate: a commitment with an empty label yields an empty rejectLabel", () => {
+  const commitments = loadCommitments([["2026-07-13 08:00", "2026-07-13 18:00", ""]]);
+  const rec = { date: "2026-07-13", start: "10:00", end: "14:00" };
+  const result = evaluate(rec, commitments);
+  assert.equal(result.rejectKind, "commitment");
+  assert.equal(result.rejectLabel, "");
+});
+
 // --- shiftTimes(): midnight-spanning ----------------------------------------
 
 test("shiftTimes(): end <= start rolls end's civil date forward one day", () => {

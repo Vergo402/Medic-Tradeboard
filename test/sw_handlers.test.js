@@ -182,7 +182,10 @@ test("getCalendarData: a hidden REJECT calendar is still fetched and still block
     "hiding a calendar in Google must not stop the extension reading it"
   );
   assert.equal(resp.commitments.length, 1);
-  assert.equal(resp.commitments[0][2], "Crew Schedule · Night Tour");
+  // A REJECT commitment's triplet label is now "" (no per-event override), so
+  // the reject chip falls back to the user's global commitment label rather than
+  // the calendar name. The calendar still BLOCKS — that is the assertion above.
+  assert.equal(resp.commitments[0][2], "");
 });
 
 test("getCalendarData: a deleted calendar is never fetched, whatever role it carries", async () => {
@@ -215,7 +218,9 @@ test("getCalendarData: a RULE calendar with [] ticked produces ZERO commitments"
     0,
     'the leaked default "^Work\\b" must not hard-reject an untouched RULE calendar'
   );
-  assert.equal(resp.soft.length, 2);
+  // With no note titles configured, the unmarked events are ignored (dropped),
+  // not noted — the deliberate default. The safety point is zero commitments.
+  assert.equal(resp.soft.length, 0);
 });
 
 test("getCalendarData: an absent calBlockTitles entry also blocks nothing", async () => {
@@ -226,7 +231,8 @@ test("getCalendarData: an absent calBlockTitles entry also blocks nothing", asyn
 
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
   assert.equal(resp.commitments.length, 0);
-  assert.equal(resp.soft.length, 1);
+  // Nothing configured ⇒ nothing blocks AND nothing notes: the event is ignored.
+  assert.equal(resp.soft.length, 0);
 });
 
 test("getCalendarData: the pattern hatch blocks only once explicitly armed", async () => {
@@ -239,14 +245,14 @@ test("getCalendarData: the pattern hatch blocks only once explicitly armed", asy
   EVENTS["cal-r"] = [timed("Work day", "10"), timed("Dentist", "11")];
 
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  // With the pattern hatch armed, Work day matches the regex and BLOCKS (its
+  // triplet label is "" — the reject chip uses the global commitment label).
+  // Dentist matches neither the regex nor any note title, so it is ignored.
   assert.deepEqual(
     resp.commitments.map((r) => r[2]),
-    ["Crew Schedule · Work day"]
+    [""]
   );
-  assert.deepEqual(
-    resp.soft.map((r) => r[2]),
-    ["Crew Schedule · Dentist"]
-  );
+  assert.deepEqual(resp.soft.map((r) => r[2]), []);
 });
 
 test("setRuleFilter: saving a pattern arms the opt-in flag in the same write", async () => {
@@ -269,6 +275,154 @@ test("setRuleFilter: a blank or invalid pattern is refused and arms nothing", as
   });
   assert.equal(STORE.ruleUsePattern, undefined);
   assert.equal(STORE.ruleInclude, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// setEventRules — the atomic three-way write the rebuilt picker uses
+// ---------------------------------------------------------------------------
+
+test("setEventRules: writes all four per-calendar keys in one shot", async () => {
+  reset();
+  const resp = await send({
+    type: "setEventRules",
+    calendarId: "cal-1",
+    block: ["Crew - Desk"],
+    note: ["Music Class"],
+    labels: { "Crew - Desk": "Desk", "Music Class": "Music" },
+    calLabel: "Fam",
+  });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockTitles, { "cal-1": ["Crew - Desk"] });
+  assert.deepEqual(STORE.calNoteTitles, { "cal-1": ["Music Class"] });
+  assert.deepEqual(STORE.calTitleLabels, { "cal-1": { "Crew - Desk": "Desk", "Music Class": "Music" } });
+  assert.deepEqual(STORE.calLabelOverride, { "cal-1": "Fam" });
+});
+
+test("setEventRules: trims and de-dupes arrays and drops empty-string titles", async () => {
+  reset();
+  const resp = await send({
+    type: "setEventRules",
+    calendarId: "cal-1",
+    block: ["  Crew - Desk  ", "Crew - Desk", "", "   ", 5, null],
+    note: ["Music Class", "Music Class", ""],
+    labels: { "Crew - Desk": "  Desk  ", "": "x", "Music Class": "   " },
+    calLabel: "  ",
+  });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockTitles["cal-1"], ["Crew - Desk"]);
+  assert.deepEqual(STORE.calNoteTitles["cal-1"], ["Music Class"]);
+  // Label value is trimmed; an empty-title key and an empty-value label drop.
+  assert.deepEqual(STORE.calTitleLabels["cal-1"], { "Crew - Desk": "Desk" });
+  // A whitespace-only calLabel is treated as empty ⇒ no override stored.
+  assert.equal("cal-1" in (STORE.calLabelOverride || {}), false);
+});
+
+test("setEventRules: an empty calLabel removes a previously stored override", async () => {
+  reset();
+  STORE.calLabelOverride = { "cal-1": "Fam" };
+  const resp = await send({
+    type: "setEventRules", calendarId: "cal-1", block: [], note: [], labels: {}, calLabel: "",
+  });
+  assert.equal(resp.ok, true);
+  assert.equal("cal-1" in STORE.calLabelOverride, false);
+});
+
+test("setEventRules: bad shapes are refused and nothing is written", async () => {
+  reset();
+  assert.deepEqual(
+    await send({ type: "setEventRules", block: [], note: [], labels: {}, calLabel: "" }),
+    { ok: false, error: "bad_calendar_id" }
+  );
+  assert.deepEqual(
+    await send({ type: "setEventRules", calendarId: "c", block: "nope", note: [], labels: {}, calLabel: "" }),
+    { ok: false, error: "bad_block" }
+  );
+  assert.deepEqual(
+    await send({ type: "setEventRules", calendarId: "c", block: [], note: "nope", labels: {}, calLabel: "" }),
+    { ok: false, error: "bad_note" }
+  );
+  // A non-plain-object (including an array) is not a valid labels map.
+  for (const bad of [null, "x", 5, ["a"]]) {
+    assert.deepEqual(
+      await send({ type: "setEventRules", calendarId: "c", block: [], note: [], labels: bad, calLabel: "" }),
+      { ok: false, error: "bad_labels" }
+    );
+  }
+  assert.equal(STORE.calBlockTitles, undefined);
+  assert.equal(STORE.calNoteTitles, undefined);
+  assert.equal(STORE.calTitleLabels, undefined);
+});
+
+test("setEventRules: merges into the maps, preserving OTHER calendars", async () => {
+  reset();
+  STORE.calBlockTitles = { "cal-other": ["Keep"] };
+  STORE.calNoteTitles = { "cal-other": ["KeepNote"] };
+  const resp = await send({
+    type: "setEventRules", calendarId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
+  });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockTitles["cal-other"], ["Keep"]);
+  assert.deepEqual(STORE.calBlockTitles["cal-1"], ["Crew - Desk"]);
+  assert.deepEqual(STORE.calNoteTitles["cal-other"], ["KeepNote"]);
+});
+
+test("setEventRules: drops the calCache so stale rules are not served", async () => {
+  reset();
+  STORE.calCache = {
+    fetchedAt: 1, commitments: [], soft: [], windowStart: "2026-08-01", windowEnd: "2026-08-31",
+  };
+  await send({ type: "setEventRules", calendarId: "cal-1", block: [], note: [], labels: {}, calLabel: "" });
+  assert.equal(STORE.calCache, undefined);
+});
+
+// The WIRING advisor asked to pin: calLabelOverride must actually override the
+// note prefix inside refreshCalendarData (override || cal.prefix), not just in
+// bucketEvents. If the override were dropped the label would read
+// "Crew Schedule · Music Class" instead.
+test("getCalendarData: calLabelOverride prefixes the notes from a calendar", async () => {
+  reset();
+  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calNoteTitles = { "cal-r": ["Music Class"] };
+  STORE.calLabelOverride = { "cal-r": "Fam" };
+  EVENTS["cal-r"] = [timed("Music Class", "10")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.soft.map((r) => r[2]), ["Fam · Music Class"]);
+  assert.equal(resp.commitments.length, 0);
+});
+
+// A block title's per-event label reaches the commitment triplet end to end.
+test("getCalendarData: a Block title's per-event label becomes the commitment label", async () => {
+  reset();
+  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calTitleLabels = { "cal-r": { "Crew - Desk": "Desk" } };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.commitments.map((r) => r[2]), ["Desk"]);
+});
+
+test("listCalendarTitles: echoes back the full three-way state for restore", async () => {
+  reset();
+  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  STORE.calRoles = { "cal-on": "RULE" };
+  STORE.calBlockTitles = { "cal-on": ["Crew - Desk"] };
+  STORE.calNoteTitles = { "cal-on": ["Music Class"] };
+  STORE.calTitleLabels = { "cal-on": { "Crew - Desk": "Desk" } };
+  STORE.calLabelOverride = { "cal-on": "Fam" };
+  EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.blockTitles, ["Crew - Desk"]);
+  assert.deepEqual(resp.noteTitles, ["Music Class"]);
+  assert.deepEqual(resp.titleLabels, { "Crew - Desk": "Desk" });
+  assert.equal(resp.calLabel, "Fam");
 });
 
 // ---------------------------------------------------------------------------

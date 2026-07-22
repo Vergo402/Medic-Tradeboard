@@ -337,11 +337,16 @@
         pos: posShort(rec.position),
         locLine: loc(rec.text),
         reason: rec.reason,
+        // The overlapping commitment's per-event "show as" override (or
+        // undefined/""). It reaches here through scoreRecords' spread of the
+        // evaluate() result onto rec, and rejectChipLabel reads it below; kept
+        // on the reject row too so the field's path to the chip is explicit.
+        rejectLabel: rec.rejectLabel,
         // Short label for the reject's board-anchor reason chip (e.g.
-        // "✕ Fire Dept", "✕ Medic Shift", "✕ BUFFER 9h") -- badges.js's
-        // paintBadges paints this verbatim, it never re-derives it. Keyed off
-        // rec.rejectKind/rejectGapHours (structured), plus this user's own
-        // commitment label; no prose is string-matched.
+        // "✕ Fire Dept", "✕ Drill", "✕ Medic Shift", "✕ BUFFER 9h") --
+        // badges.js's paintBadges paints this verbatim, it never re-derives it.
+        // Keyed off rec.rejectKind/rejectGapHours/rejectLabel (structured), plus
+        // this user's own commitment label; no prose is string-matched.
         chipLabel: rejectChipLabel(rec, commitmentLabel),
       };
     }

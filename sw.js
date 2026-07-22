@@ -75,6 +75,24 @@ const ROLES_KEY = "calRoles";
 // that calendar blocks nothing.
 const BLOCK_TITLES_KEY = "calBlockTitles";
 
+// Per-calendar NOTE set: { [calendarId]: string[] }. Titles the user marked
+// "Note" in the three-way picker, matched by EXACT (whitespace-normalized)
+// title, never by stem. A note is cosmetic — it annotates a shift, it never
+// blocks it — so exact match is correct: marking "Music Class" notes all its
+// occurrences, but a new, different title is NOT auto-noted (it defaults to
+// Ignore). Additive to BLOCK_TITLES_KEY, which is unchanged.
+const NOTE_TITLES_KEY = "calNoteTitles";
+
+// Per-calendar per-event "show as" overrides: { [calendarId]: { [title]:
+// shortLabel } }. For a Block title the label replaces the reject chip text;
+// for a Note title it replaces the note body. Keyed by the same exact title the
+// picker rows show.
+const TITLE_LABELS_KEY = "calTitleLabels";
+
+// Per-calendar short name: { [calendarId]: string }. When set it PREFIXES every
+// note from that calendar in place of the calendar's full display name.
+const LABEL_OVERRIDE_KEY = "calLabelOverride";
+
 // The user's explicit opt-in to the legacy regex ("advanced pattern") hatch.
 // Written ONLY by handleSetRuleFilter, i.e. only when the user opened the
 // advanced disclosure on the options page and saved a real pattern.
@@ -410,9 +428,42 @@ export function resolveRoles(items, storedRoles) {
 }
 
 /**
- * Split one calendar's events into hard commitments vs soft flags according to
- * its role. Cancelled and un-triplet-able events are dropped in every role.
- * Each output row is a [start, end, label] triplet.
+ * Compose a note's triplet label: the calendar prefix (a short override or the
+ * calendar's display name, "" for the primary) joined to the shown text with
+ * the middot separator. An empty prefix leaves the text bare — the primary
+ * calendar's notes must not open with a stray " · ".
+ * @param {string} prefix
+ * @param {string} shown
+ * @returns {string}
+ */
+function noteLabel(prefix, shown) {
+  return prefix ? prefix + LABEL_SEP + shown : shown;
+}
+
+/**
+ * Split one calendar's events into hard commitments vs soft notes according to
+ * its role, under the THREE-WAY model (Block / Note / Ignore). Cancelled and
+ * un-triplet-able events are dropped in every role. Each output row is a
+ * [start, end, label] triplet.
+ *
+ * THE THREE-WAY BRANCH (RULE role):
+ *   - Block: title STEM-matches the block set (`rule`, from titlesToMatcher) →
+ *     hard commitment. Triplet label = the per-event "show as" label if one is
+ *     set, ELSE the empty string. Empty is deliberate: it means "no custom
+ *     label", and the reject chip then falls back to the user's global
+ *     commitmentLabel (the display layer, not here). Stem match is the
+ *     safety-critical, forward-looking rule and is UNCHANGED.
+ *   - Note: title EXACT-matches (whitespace-normalized) the note set → soft
+ *     note. Triplet label = prefix + (per-event "show as" || the raw title).
+ *     Exact — not stem — because a note is cosmetic: marking "Music Class" must
+ *     not silently start noting a future, different "Music Class Recital".
+ *   - Ignore: title in NEITHER set → DROPPED entirely, not even a note. Ignore
+ *     is the default, so a RULE calendar the user has not configured produces
+ *     nothing and the board stays quiet.
+ *
+ * REJECT notes nothing and blocks everything (label = per-event "show as" ||
+ * ""). FLAG (and any unknown role) blocks nothing and notes everything, honoring
+ * the prefix and per-event labels. OFF produces nothing.
  *
  * The rule predicate runs on the RAW event title, NEVER on the prefixed label.
  * An anchored user regex like "^Work\b" could never match "Shared Cal · Work
@@ -422,22 +473,68 @@ export function resolveRoles(items, storedRoles) {
  *
  * @param {object[]} events
  * @param {string} role  one of ROLES
- * @param {(title:string)=>boolean} rule  called with the raw title only
- * @param {string} prefix  "" for primary, the calendar summary otherwise
+ * @param {(title:string)=>boolean} rule  block predicate, called with the raw title only
+ * @param {string} prefix  short override or calendar summary ("" for primary)
+ * @param {unknown} [noteTitles]  the note set for this calendar (want string[])
+ * @param {unknown} [labels]  per-event "show as" map { [title]: shortLabel }
  * @returns {{commitments: string[][], soft: string[][]}}
  */
-export function bucketEvents(events, role, rule, prefix) {
+export function bucketEvents(events, role, rule, prefix, noteTitles, labels) {
   const commitments = [];
   const soft = [];
   if (role === "OFF") return { commitments, soft };
+
+  // Normalized lookups, built once. Both the note set and the label map are
+  // matched by EXACT whitespace-normalized title, the same normalization the
+  // stem matcher applies, so an NBSP in the feed cannot disarm either.
+  const noteSet = new Set();
+  for (const t of Array.isArray(noteTitles) ? noteTitles : []) {
+    const k = normalizeTitleWhitespace(t).trim();
+    if (k) noteSet.add(k);
+  }
+  const labelMap = new Map();
+  if (labels && typeof labels === "object" && !Array.isArray(labels)) {
+    for (const [k, v] of Object.entries(labels)) {
+      if (typeof v !== "string") continue;
+      const nk = normalizeTitleWhitespace(k).trim();
+      const nv = v.trim();
+      if (nk && nv) labelMap.set(nk, nv);
+    }
+  }
+
   for (const ev of events || []) {
     if (ev.status === "cancelled") continue;
     const trip = buildTriplet(ev);
     if (!trip) continue;
-    const title = ev.summary || "";
-    const row = [trip[0], trip[1], prefix ? prefix + LABEL_SEP + title : title];
-    const hard = role === "REJECT" || (role === "RULE" && rule(title));
-    if (hard) commitments.push(row);
+    const rawTitle = ev.summary || "";
+    const normTitle = normalizeTitleWhitespace(rawTitle).trim();
+    const perEventLabel = labelMap.get(normTitle) || "";
+
+    // Bucket the event: "commitment" (hard block), "soft" (note), or null (drop).
+    let bucket;
+    let label;
+    if (role === "REJECT") {
+      bucket = "commitment";
+      label = perEventLabel; // "" ⇒ reject chip falls back to the global label
+    } else if (role === "RULE") {
+      if (rule(rawTitle)) {
+        bucket = "commitment"; // Block — stem match
+        label = perEventLabel;
+      } else if (noteSet.has(normTitle)) {
+        bucket = "soft"; // Note — exact match
+        label = noteLabel(prefix, perEventLabel || rawTitle);
+      } else {
+        bucket = null; // Ignore — the default
+      }
+    } else {
+      // FLAG, and defensively any unknown role: note everything.
+      bucket = "soft";
+      label = noteLabel(prefix, perEventLabel || rawTitle);
+    }
+
+    if (bucket === null) continue;
+    const row = [trip[0], trip[1], label];
+    if (bucket === "commitment") commitments.push(row);
     else soft.push(row);
   }
   return { commitments, soft };
@@ -856,9 +953,18 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
     return errorResponse(e);
   }
 
-  const store = await chrome.storage.local.get([ROLES_KEY, BLOCK_TITLES_KEY]);
+  const store = await chrome.storage.local.get([
+    ROLES_KEY,
+    BLOCK_TITLES_KEY,
+    NOTE_TITLES_KEY,
+    TITLE_LABELS_KEY,
+    LABEL_OVERRIDE_KEY,
+  ]);
   const cals = resolveRoles(calItems, store[ROLES_KEY]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
+  const noteTitles = store[NOTE_TITLES_KEY] || {};
+  const titleLabels = store[TITLE_LABELS_KEY] || {};
+  const labelOverride = store[LABEL_OVERRIDE_KEY] || {};
 
   const timeMin = nyMidnightRfc3339(windowStart, 0);
   const timeMax = nyMidnightRfc3339(windowEnd, 1); // +1 day: exclusive upper bound
@@ -874,7 +980,11 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
       // Ticked titles are per-calendar and are the whole blocking set. The
       // legacy regex is consulted ONLY for a user who explicitly armed it.
       const { rule, mode } = calendarRule(blockTitles[cal.id], regexRule, cfg.usePattern);
-      const b = bucketEvents(evs, cal.role, rule, cal.prefix);
+      // A per-calendar short name, when set, replaces the calendar's display
+      // name as the prefix on every note from it.
+      const override = typeof labelOverride[cal.id] === "string" ? labelOverride[cal.id].trim() : "";
+      const prefix = override || cal.prefix;
+      const b = bucketEvents(evs, cal.role, rule, prefix, noteTitles[cal.id], titleLabels[cal.id]);
       commitments.push(...b.commitments);
       soft.push(...b.soft);
       dlog("calendar events", cal.role, mode, evs.length);
@@ -1078,7 +1188,13 @@ async function handleListCalendarTitles(msg) {
   } catch (e) {
     return errorResponse(e);
   }
-  const stored = await chrome.storage.local.get([ROLES_KEY, BLOCK_TITLES_KEY]);
+  const stored = await chrome.storage.local.get([
+    ROLES_KEY,
+    BLOCK_TITLES_KEY,
+    NOTE_TITLES_KEY,
+    TITLE_LABELS_KEY,
+    LABEL_OVERRIDE_KEY,
+  ]);
   const cal = resolveRoles(calItems, stored[ROLES_KEY]).find((c) => c.id === calendarId);
   if (!cal) return { ok: false, error: "unknown_calendar" };
 
@@ -1093,15 +1209,31 @@ async function handleListCalendarTitles(msg) {
   // time this runs the calendar the user just switched on is already non-OFF.
   if (cal.role === "OFF") return { ok: false, error: "calendar_off" };
 
+  // Echo back the FULL persisted three-way state for this calendar, so the
+  // picker restores every Block/Note/label — including titles whose events fall
+  // outside the sampling window and so never appear as rows. The picker seeds
+  // its authoritative sets from these and re-sends them whole, which is what
+  // keeps an off-sample block title from being silently dropped on the next
+  // save (that would weaken blocking — see options.js).
   const blockTitles = Array.isArray((stored[BLOCK_TITLES_KEY] || {})[calendarId])
     ? stored[BLOCK_TITLES_KEY][calendarId]
     : [];
+  const noteTitles = Array.isArray((stored[NOTE_TITLES_KEY] || {})[calendarId])
+    ? stored[NOTE_TITLES_KEY][calendarId]
+    : [];
+  const rawLabels = (stored[TITLE_LABELS_KEY] || {})[calendarId];
+  const titleLabels = rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)
+    ? rawLabels
+    : {};
+  const calLabel = typeof (stored[LABEL_OVERRIDE_KEY] || {})[calendarId] === "string"
+    ? stored[LABEL_OVERRIDE_KEY][calendarId]
+    : "";
 
   // A freeBusyReader grant returns events with no summary at all. Return the
   // empty list and the accessRole so the UI can say why, instead of drawing
   // rows of blanks that read as a broken picker.
   if (cal.accessRole === "freeBusyReader") {
-    return { ok: true, titles: [], accessRole: cal.accessRole, blockTitles };
+    return { ok: true, titles: [], accessRole: cal.accessRole, blockTitles, noteTitles, titleLabels, calLabel };
   }
 
   try {
@@ -1113,7 +1245,7 @@ async function handleListCalendarTitles(msg) {
     );
     const titles = summarizeTitles(evs);
     dlog("listCalendarTitles", evs.length, titles.length);
-    return { ok: true, titles, accessRole: cal.accessRole, blockTitles };
+    return { ok: true, titles, accessRole: cal.accessRole, blockTitles, noteTitles, titleLabels, calLabel };
   } catch (e) {
     return errorResponse(e);
   }
@@ -1149,6 +1281,87 @@ async function handleSetBlockTitles(msg) {
   return { ok: true };
 }
 
+// Trim, drop empties, and dedupe an incoming title array. Non-strings are
+// discarded rather than coerced — the array is user data off the wire.
+function cleanTitleArray(arr) {
+  const out = [];
+  for (const t of arr) {
+    if (typeof t !== "string") continue;
+    const trimmed = t.trim();
+    if (trimmed !== "" && !out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+}
+
+/**
+ * Persist the WHOLE three-way picker state for one calendar in a single write.
+ *
+ * -> { type:"setEventRules", calendarId, block:string[], note:string[],
+ *      labels:{ [title]:shortLabel }, calLabel:string }
+ * <- { ok:true } | { ok:false, error }
+ *
+ * This is the ONLY handler the rebuilt picker uses. It writes all four
+ * per-calendar keys atomically (block set, note set, per-event labels, the
+ * calendar short name) in one chrome.storage.local.set, so there are no
+ * per-checkbox races: whatever the caller last sent is exactly what is stored.
+ * The legacy setBlockTitles handler stays in place for its existing tests, but
+ * the UI no longer calls it.
+ *
+ * Every field is validated and cleaned: block/note must be arrays (trimmed,
+ * de-duped, empties dropped); labels must be a plain object (empty titles and
+ * empty labels dropped, both sides trimmed); calLabel is trimmed, and an empty
+ * one REMOVES the override rather than storing "".
+ *
+ * Drops the cache for the same reason the other mutators do: a cache bucketed
+ * under the old rules would keep applying blocks/notes the user just changed.
+ */
+async function handleSetEventRules(msg) {
+  const calendarId = msg && msg.calendarId;
+  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  if (!Array.isArray(msg.block)) return { ok: false, error: "bad_block" };
+  if (!Array.isArray(msg.note)) return { ok: false, error: "bad_note" };
+  if (!msg.labels || typeof msg.labels !== "object" || Array.isArray(msg.labels)) {
+    return { ok: false, error: "bad_labels" };
+  }
+
+  const block = cleanTitleArray(msg.block);
+  const note = cleanTitleArray(msg.note);
+  const labels = {};
+  for (const [k, v] of Object.entries(msg.labels)) {
+    if (typeof k !== "string" || typeof v !== "string") continue;
+    const kk = k.trim();
+    const vv = v.trim();
+    if (kk !== "" && vv !== "") labels[kk] = vv;
+  }
+  const calLabel = typeof msg.calLabel === "string" ? msg.calLabel.trim() : "";
+
+  const cur = await chrome.storage.local.get([
+    BLOCK_TITLES_KEY,
+    NOTE_TITLES_KEY,
+    TITLE_LABELS_KEY,
+    LABEL_OVERRIDE_KEY,
+  ]);
+  const blockMap = cur[BLOCK_TITLES_KEY] || {};
+  const noteMap = cur[NOTE_TITLES_KEY] || {};
+  const labelMap = cur[TITLE_LABELS_KEY] || {};
+  const overrideMap = cur[LABEL_OVERRIDE_KEY] || {};
+
+  blockMap[calendarId] = block;
+  noteMap[calendarId] = note;
+  labelMap[calendarId] = labels;
+  if (calLabel) overrideMap[calendarId] = calLabel;
+  else delete overrideMap[calendarId];
+
+  await chrome.storage.local.set({
+    [BLOCK_TITLES_KEY]: blockMap,
+    [NOTE_TITLES_KEY]: noteMap,
+    [TITLE_LABELS_KEY]: labelMap,
+    [LABEL_OVERRIDE_KEY]: overrideMap,
+  });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
 /**
  * Open the extension's own options page.
  *
@@ -1172,6 +1385,7 @@ const HANDLERS = {
   listCalendarTitles: handleListCalendarTitles,
   setCalendarRole: handleSetCalendarRole,
   setBlockTitles: handleSetBlockTitles,
+  setEventRules: handleSetEventRules,
   setRuleFilter: handleSetRuleFilter,
   openOptions: handleOpenOptions,
 };
