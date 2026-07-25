@@ -1,18 +1,17 @@
 /**
  * core/ics.js — iCalendar (RFC 5545) feed parser for the Medic Tradeboard.
  *
- * Converts a raw .ics feed into the SAME event objects the old Google Calendar
- * REST path produced, so everything below buildTriplet (the scorer, the drawer,
- * the title picker) stays byte-for-byte unchanged. Emitted events are
- * Google-shaped:
+ * Converts a raw .ics feed into normalized event objects, so everything below
+ * buildTriplet (the scorer, the drawer, the title picker) stays byte-for-byte
+ * unchanged. Emitted events have the normalized shape:
  *
  *     { summary, status, start:{dateTime}|{date}, end:{dateTime}|{date} }
  *
  * A timed start/end.dateTime is always a UTC "…Z" RFC3339 string — buildTriplet
  * runs Date.parse on it and re-expresses it in NY civil time, so the source
  * timezone is fully resolved here and never leaks downstream. An all-day date
- * keeps Google's exclusive-end convention (end.date is the day AFTER the last
- * day). One parser covers Google, iCloud, Aladtec and any RFC 5545 feed.
+ * keeps the exclusive-end convention (end.date is the day AFTER the last day).
+ * One parser covers any RFC 5545 feed.
  *
  * WHY IT FAILS LOUD. This is the layer that decides whether a shift looks free.
  * A silently dropped commitment mis-scores a shift, so nothing is dropped in
@@ -31,8 +30,16 @@ const DAY_MS = 86400000;
 // Guard against a pathological series (a corrupt feed with a far-past DTSTART
 // and no COUNT/UNTIL). The scan window sits near "today", so even a daily rule
 // running since ~2010 reaches it in a few thousand steps; this cap is orders of
-// magnitude above any real feed and only trips on corruption.
+// magnitude above any real feed and only trips on corruption. It bounds BOTH the
+// candidates a consumer draws AND each generator's own outer iterations — a rule
+// like FREQ=MONTHLY;BYMONTH=2;BYMONTHDAY=30 selects no day in any month, so it
+// would otherwise spin forever without ever yielding for a consumer to count.
 const MAX_STEPS = 200000;
+
+// Sentinel a generator yields when it hits its iteration backstop; the consumer
+// turns it into a named skip. Distinct from "yielded nothing", which is a
+// perfectly correct empty expansion and warns about nothing.
+const OVERFLOW = { overflow: true };
 
 const WD = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
 const EMPTY_SET = new Set();
@@ -172,18 +179,56 @@ function unfold(text) {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n[ \t]/g, "").split("\n");
 }
 
-// "NAME;PARAM=v;PARAM2=v2:VALUE" -> { name, params, value }. Split at the FIRST
-// colon (the name/value separator); the value keeps any later colons (URLs etc.).
+// Split `s` on `sep`, but a DQUOTE-delimited run (RFC 5545 §3.1 quoted-string)
+// hides any `sep` inside it — needed because a param value may itself contain
+// ';' or ':' when quoted (X;P="a:b":v).
+function splitUnquoted(s, sep) {
+  const out = [];
+  let cur = "";
+  let inQ = false;
+  for (const ch of s) {
+    if (ch === '"') inQ = !inQ;
+    if (ch === sep && !inQ) {
+      out.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+// A param-value may be a quoted-string (param-value = paramtext / quoted-string);
+// the DQUOTEs are delimiters, not part of the value.
+function unquote(v) {
+  return v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"' ? v.slice(1, -1) : v;
+}
+
+// "NAME;PARAM=v;PARAM2=v2:VALUE" -> { name, params, value }. The name/value
+// colon is found by scanning for the first UNQUOTED ':' — a quoted param value
+// may itself contain ':' or ';', so a naive indexOf/split breaks on those.
 function splitProp(line) {
-  const ci = line.indexOf(":");
+  let ci = -1;
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') inQ = !inQ;
+    else if (ch === ":" && !inQ) { ci = i; break; }
+  }
   if (ci === -1) return null;
-  const segs = line.slice(0, ci).split(";");
+  const segs = splitUnquoted(line.slice(0, ci), ";");
   const params = {};
   for (let i = 1; i < segs.length; i++) {
     const eq = segs[i].indexOf("=");
-    if (eq > -1) params[segs[i].slice(0, eq).toUpperCase()] = segs[i].slice(eq + 1);
+    if (eq > -1) params[segs[i].slice(0, eq).toUpperCase()] = unquote(segs[i].slice(eq + 1));
   }
   return { name: segs[0].toUpperCase(), params, value: line.slice(ci + 1) };
+}
+
+// RFC 5545 §3.3.11 TEXT escapes: \\ \, \; are literal chars, \n / \N is a line
+// break. Decode ONLY for TEXT-valued props actually consumed as text (SUMMARY,
+// X-WR-CALNAME) — date/rule values are never run through this.
+function decodeText(v) {
+  return v.replace(/\\([\\,;nN])/g, (_m, c) => (c === "n" || c === "N" ? "\n" : c));
 }
 
 function parseDateOnly(v) {
@@ -217,26 +262,36 @@ function classifyValue(value, params) {
   return d ? { allDay: true, date: d } : null;
 }
 
-// ISO 8601 duration (PT10H, P1D, P1DT2H30M, -PT1H, PT0S) -> signed milliseconds,
-// or null. Days/weeks are treated as fixed 24h/168h — a safety fallback for
-// feeds that use DURATION instead of DTEND (Google and Aladtec use neither).
+// ISO 8601 duration (PT10H, P1D, P1DT2H30M, -PT1H, PT0S) -> {days, ms}, or null
+// when the value cannot be read at all (the caller then skips the event loudly).
+// RFC 5545 §3.3.6 splits the two halves: W/D parts are NOMINAL (calendar days,
+// wall-clock preserving, so a day across spring-forward is 23 real hours) and T
+// parts are EXACT elapsed time. They are kept apart here and resolved per
+// occurrence in the event's own zone.
 function parseDuration(v) {
   const m = /^([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(v || "");
   if (!m) return null;
   const sign = m[1] === "-" ? -1 : 1;
-  const secs = ((+(m[2] || 0) * 7 + +(m[3] || 0)) * 86400) + +(m[4] || 0) * 3600 + +(m[5] || 0) * 60 + +(m[6] || 0);
-  return sign * secs * 1000;
+  const secs = +(m[4] || 0) * 3600 + +(m[5] || 0) * 60 + +(m[6] || 0);
+  return { days: sign * (+(m[2] || 0) * 7 + +(m[3] || 0)), ms: sign * secs * 1000 };
 }
 
 // ---------------------------------------------------------------------------
 // RRULE
 // ---------------------------------------------------------------------------
 
-function untilToMs(v) {
+// `zone` is the master event's own DTSTART zone. RFC 5545 §3.3.10 requires UNTIL
+// to be UTC when DTSTART carries a TZID, but some real-world producers emit a
+// local-time UNTIL anyway; resolving it in the event's own zone (rather than a
+// hardcoded NY) is what keeps a western-zone series from being truncated a day
+// early. Returns null for a value that parses as neither DATE-TIME nor DATE —
+// the caller treats that as a malformed, loudly-skipped rule.
+function untilToMs(v, zone) {
   const dt = parseDateTime(v);
-  if (dt) return dt.utc ? Date.UTC(dt.y, dt.mo - 1, dt.d, dt.h, dt.mi, dt.s) : civilToMs(dt, NY);
+  if (dt) return dt.utc ? Date.UTC(dt.y, dt.mo - 1, dt.d, dt.h, dt.mi, dt.s) : civilToMs(dt, zone || NY);
   const d = parseDateOnly(v);
-  // Date-only UNTIL is inclusive through that whole day (NY frame).
+  // Date-only UNTIL is inclusive through that whole day (NY frame, the app's
+  // civil frame for date-only values).
   if (d) return civilToMs({ y: d.y, mo: d.mo, d: d.d, h: 23, mi: 59, s: 59 }, NY);
   return null;
 }
@@ -244,34 +299,51 @@ function untilToMs(v) {
 function parseByday(rule, v) {
   const out = [];
   for (const tok of v.split(",")) {
-    const m = /^([+-]?\d+)?(SU|MO|TU|WE|TH|FR|SA)$/.exec(tok.trim());
+    const m = /^([+-]?\d+)?(SU|MO|TU|WE|TH|FR|SA)$/i.exec(tok.trim());
     if (!m) return "BYDAY=" + tok;
-    out.push({ ord: m[1] ? parseInt(m[1], 10) : null, day: WD[m[2]] });
+    out.push({ ord: m[1] ? parseInt(m[1], 10) : null, day: WD[m[2].toUpperCase()] });
   }
   rule.byday = out;
   return null;
 }
 
 // Fold one recognized RRULE part into `rule`; return a reason string if the part
-// is malformed, else null.
-function applyRulePart(rule, k, v) {
+// is malformed, else null. An UNTIL or COUNT the engine cannot read must NOT
+// silently become "no bound" (a NaN COUNT or null UNTIL defeats the guards in
+// emitMaster and the series runs forever) — both are rejected here instead.
+function applyRulePart(rule, k, v, zone) {
   if (k === "FREQ") rule.freq = v.toUpperCase();
   else if (k === "INTERVAL") rule.interval = Math.max(1, parseInt(v, 10) || 1);
-  else if (k === "COUNT") rule.count = parseInt(v, 10);
-  else if (k === "UNTIL") rule.until = untilToMs(v);
-  else if (k === "WKST") rule.wkst = v.toUpperCase();
-  else if (k === "BYMONTH") rule.bymonth = v.split(",").map(Number);
-  else if (k === "BYMONTHDAY") rule.bymonthday = v.split(",").map(Number);
-  else if (k === "BYDAY") return parseByday(rule, v);
+  else if (k === "COUNT") {
+    if (!/^\d+$/.test(v.trim())) return "COUNT=" + v;
+    rule.count = parseInt(v, 10);
+  } else if (k === "UNTIL") {
+    const ms = untilToMs(v, zone);
+    if (ms === null) return "UNTIL=" + v;
+    rule.until = ms;
+  } else if (k === "WKST") rule.wkst = v.toUpperCase();
+  else if (k === "BYMONTH") {
+    // Same non-silence rule as COUNT/UNTIL: an out-of-range or non-numeric
+    // BY* part would select no day in ANY period, so the series would vanish
+    // as a clean-looking empty expansion instead of a named skip.
+    const ms = v.split(",").map(Number);
+    if (ms.some((n) => !Number.isInteger(n) || n < 1 || n > 12)) return "BYMONTH=" + v;
+    rule.bymonth = ms;
+  } else if (k === "BYMONTHDAY") {
+    const ds = v.split(",").map(Number);
+    if (ds.some((n) => !Number.isInteger(n) || n === 0 || n < -31 || n > 31)) return "BYMONTHDAY=" + v;
+    rule.bymonthday = ds;
+  } else if (k === "BYDAY") return parseByday(rule, v);
   return null;
 }
 
 /**
  * Parse an RRULE value into a structured rule, or {unsupported:"<why>"} when it
  * uses a part or FREQ the expander does not implement. `<why>` names the exact
- * offender so the skip warning is actionable.
+ * offender so the skip warning is actionable. `zone` is the master event's own
+ * DTSTART zone, needed to resolve a local-time UNTIL correctly.
  */
-function parseRRule(value) {
+function parseRRule(value, zone) {
   const rule = {
     freq: null, interval: 1, count: null, until: null,
     byday: null, bymonthday: null, bymonth: null, wkst: "MO",
@@ -282,22 +354,42 @@ function parseRRule(value) {
     if (eq === -1) return { unsupported: "malformed_rrule" };
     const k = part.slice(0, eq).toUpperCase();
     if (!RRULE_PARTS.has(k)) return { unsupported: k };
-    const bad = applyRulePart(rule, k, part.slice(eq + 1));
+    const bad = applyRulePart(rule, k, part.slice(eq + 1), zone);
     if (bad) return { unsupported: bad };
   }
   if (!RRULE_FREQS.has(rule.freq)) return { unsupported: "FREQ=" + rule.freq };
+  // RFC 5545 §3.3.10: the BYDAY numeric ordinal is only meaningful for
+  // MONTHLY/YEARLY. Honestly unsupported for WEEKLY and DAILY rather than
+  // silently reinterpreted as every matching weekday.
+  if ((rule.freq === "WEEKLY" || rule.freq === "DAILY") && rule.byday && rule.byday.some((b) => b.ord !== null)) {
+    return { unsupported: "ordinal_byday_with_" + rule.freq.toLowerCase() };
+  }
   return rule;
 }
 
 // ---------------------------------------------------------------------------
-// Occurrence-date generators (each yields {y,mo,d} in ascending order; the
-// caller bounds them by COUNT/UNTIL/window and the MAX_STEPS guard)
+// Occurrence-date generators (each yields {y,mo,d} in ascending order). Every
+// one is self-bounding: it stops when its cursor passes `ceil` (the window's
+// upper civil date, so nothing later could start in-window) and yields OVERFLOW
+// after MAX_STEPS outer ITERATIONS. Counting iterations rather than yields is
+// what makes a rule that selects no day in any period terminate — the consumer's
+// own guard only runs once per yielded candidate. The caller still bounds the
+// yields it draws by COUNT/UNTIL/window.
 // ---------------------------------------------------------------------------
 
-function* genDaily(start, interval) {
+// BYDAY (day-of-week only; ordinals are meaningless for DAILY) and BYMONTH are
+// LIMITS for FREQ=DAILY (RFC 5545 §3.3.10 Note): a candidate whose weekday/month
+// isn't selected is filtered out. Filtering here never changes the iteration
+// count — `i` still advances one calendar day per step regardless of match, so
+// the MAX_STEPS/ceil termination is untouched by the filter.
+function* genDaily(start, interval, byday, bymonth, ceil) {
   let c = { ...start };
-  for (;;) {
-    yield c;
+  for (let i = 0; cmpYMD(c, ceil) <= 0; i++) {
+    if (i > MAX_STEPS) return yield OVERFLOW;
+    const wd = weekdayOf(c.y, c.mo, c.d);
+    const dayOk = !byday || !byday.length || byday.some((b) => b.day === wd);
+    const monOk = !bymonth || bymonth.includes(c.mo);
+    if (dayOk && monOk) yield c;
     c = addDaysYMD(c, interval);
   }
 }
@@ -307,13 +399,20 @@ function weekStart(c, wkstDay) {
   return addDaysYMD(c, -((wd - wkstDay + 7) % 7));
 }
 
-function* genWeekly(start, interval, byday, wkst) {
+// BYMONTH is a LIMIT for FREQ=WEEKLY (RFC 5545 §3.3.10 Note): filtered per
+// candidate day, same non-widening rationale as genDaily above — the block
+// cursor still advances one week per outer iteration either way.
+function* genWeekly(start, interval, byday, wkst, bymonth, ceil) {
   const wkstDay = wkst in WD ? WD[wkst] : 1;
   const days = byday && byday.length ? byday.map((b) => b.day) : [weekdayOf(start.y, start.mo, start.d)];
   const offsets = [...new Set(days.map((d) => (d - wkstDay + 7) % 7))].sort((a, b) => a - b);
   let block = weekStart(start, wkstDay);
-  for (;;) {
-    for (const off of offsets) yield addDaysYMD(block, off);
+  for (let i = 0; cmpYMD(block, ceil) <= 0; i++) {
+    if (i > MAX_STEPS) return yield OVERFLOW;
+    for (const off of offsets) {
+      const cand = addDaysYMD(block, off);
+      if (!bymonth || bymonth.includes(cand.mo)) yield cand;
+    }
     block = addDaysYMD(block, interval * 7);
   }
 }
@@ -330,21 +429,33 @@ function nthWeekday(y, mo, weekday, ord) {
   return day >= 1 ? day : null;
 }
 
+// BYDAY (ordinal or every-weekday) days within one month.
+function bydayDaysInMonth(y, mo, byday) {
+  const days = [];
+  for (const b of byday) {
+    if (b.ord === null) {
+      for (let d = 1; d <= daysInMonth(y, mo); d++) if (weekdayOf(y, mo, d) === b.day) days.push(d);
+    } else {
+      const d = nthWeekday(y, mo, b.day, b.ord);
+      if (d) days.push(d);
+    }
+  }
+  return days;
+}
+
 // The sorted, in-range day numbers a monthly/yearly rule selects within one
-// month: BYDAY (ordinal or every-weekday) wins, else BYMONTHDAY (negative =
-// from month end), else the series' own start day-of-month.
+// month. RFC 5545 §3.3.10 Notes 1/2: when BOTH BYDAY and BYMONTHDAY are present
+// for MONTHLY/YEARLY, BYDAY LIMITS the BYMONTHDAY expansion (intersect) rather
+// than one silently winning. BYMONTHDAY alone (negative = from month end), or
+// BYDAY alone, or neither (the series' own start day-of-month) fall through.
 function monthDays(y, mo, rule, startDay) {
   let days;
-  if (rule.byday) {
-    days = [];
-    for (const b of rule.byday) {
-      if (b.ord === null) {
-        for (let d = 1; d <= daysInMonth(y, mo); d++) if (weekdayOf(y, mo, d) === b.day) days.push(d);
-      } else {
-        const d = nthWeekday(y, mo, b.day, b.ord);
-        if (d) days.push(d);
-      }
-    }
+  if (rule.byday && rule.bymonthday) {
+    const bySet = new Set(bydayDaysInMonth(y, mo, rule.byday));
+    const mdays = rule.bymonthday.map((d) => (d < 0 ? daysInMonth(y, mo) + 1 + d : d));
+    days = mdays.filter((d) => bySet.has(d));
+  } else if (rule.byday) {
+    days = bydayDaysInMonth(y, mo, rule.byday);
   } else if (rule.bymonthday) {
     days = rule.bymonthday.map((d) => (d < 0 ? daysInMonth(y, mo) + 1 + d : d));
   } else {
@@ -354,9 +465,10 @@ function monthDays(y, mo, rule, startDay) {
   return [...new Set(days)].filter((d) => d >= 1 && d <= dim).sort((a, b) => a - b);
 }
 
-function* genMonthly(start, rule) {
+function* genMonthly(start, rule, ceil) {
   let ym = { y: start.y, mo: start.mo };
-  for (;;) {
+  for (let i = 0; ym.y * 12 + ym.mo <= ceil.y * 12 + ceil.mo; i++) {
+    if (i > MAX_STEPS) return yield OVERFLOW;
     if (!rule.bymonth || rule.bymonth.includes(ym.mo)) {
       for (const d of monthDays(ym.y, ym.mo, rule, start.d)) yield { y: ym.y, mo: ym.mo, d };
     }
@@ -364,20 +476,28 @@ function* genMonthly(start, rule) {
   }
 }
 
-function* genYearly(start, rule) {
+function* genYearly(start, rule, ceil) {
   const months = [...(rule.bymonth || [start.mo])].sort((a, b) => a - b);
   let y = start.y;
-  for (;;) {
+  for (let i = 0; y <= ceil.y; i++) {
+    if (i > MAX_STEPS) return yield OVERFLOW;
     for (const mo of months) for (const d of monthDays(y, mo, rule, start.d)) yield { y, mo, d };
     y += rule.interval;
   }
 }
 
-function candidateGen(start, rule) {
-  if (rule.freq === "DAILY") return genDaily(start, rule.interval);
-  if (rule.freq === "WEEKLY") return genWeekly(start, rule.interval, rule.byday, rule.wkst);
-  if (rule.freq === "MONTHLY") return genMonthly(start, rule);
-  return genYearly(start, rule);
+function candidateGen(start, rule, ceil) {
+  if (rule.freq === "DAILY") return genDaily(start, rule.interval, rule.byday, rule.bymonth, ceil);
+  if (rule.freq === "WEEKLY") return genWeekly(start, rule.interval, rule.byday, rule.wkst, rule.bymonth, ceil);
+  if (rule.freq === "MONTHLY") return genMonthly(start, rule, ceil);
+  return genYearly(start, rule, ceil);
+}
+
+// The last civil date a generator has to reach: the window's upper bound plus
+// two days of slack for any zone offset. Nothing after it can start in-window.
+function winCeil(ms) {
+  const d = new Date(ms);
+  return addDaysYMD({ y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate() }, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -385,43 +505,76 @@ function candidateGen(start, rule) {
 // ---------------------------------------------------------------------------
 
 function evTitle(props) {
-  return props.SUMMARY ? props.SUMMARY.value : "(untitled)";
+  return props.SUMMARY ? decodeText(props.SUMMARY.value) : "(untitled)";
 }
 function skipMsg(title, why) {
   return `skipped_event: "${title || "(untitled)"}" (${why})`;
 }
 
-// The event's nominal end, resolved per occurrence:
-//   all-day  -> { kind:"days", n }        (DTEND is exclusive; absent -> +1 day)
-//   DTEND    -> { kind:"wall", ms }        (wall duration, re-resolved each occ)
-//   DURATION -> { kind:"fixed", ms }       (fixed offset from each occ start)
-//   neither  -> { kind:"fixed", ms:0 }     (RFC point-in-time / zero length)
-function computeEndShape(start, props) {
-  if (start.allDay) {
-    let n = 1;
-    if (props.DTEND) {
-      const e = classifyValue(props.DTEND.value, props.DTEND.params);
-      if (e && e.allDay) n = dayDiff(start.date, e.date);
-    }
-    return { kind: "days", n: n >= 1 ? n : 1 };
-  }
+// How far a spring-forward gap pushed a wall time: the civil fields `ms` really
+// lands on, minus the ones asked for. 0 whenever the wall time exists.
+function gapShift(civil, zone, ms) {
+  const p = zoneParts(ms, zone);
+  return Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) -
+    Date.UTC(civil.y, civil.mo - 1, civil.d, civil.h, civil.mi, civil.s);
+}
+
+// The event's duration, resolved per occurrence:
+//   all-day  -> { kind:"days", n }           (DTEND is exclusive; absent -> +1 day)
+//   DTEND    -> { kind:"exact", ms }         (RFC 5545 §3.8.5.3: EXACT instant delta)
+//   DURATION -> { kind:"nominal", days, ms } (D/W are calendar days; T is exact)
+//   neither  -> { kind:"exact", ms:0 }       (RFC point-in-time; the emit-time
+//                                             invariant skips it loudly)
+// or { err } when the event cannot be given a usable duration — the caller turns
+// that into a named skip, so a broken value never degrades to zero length.
+//
+// Each endpoint is resolved to an instant IN ITS OWN ZONE (DTSTART and DTEND may
+// legally differ, or one may be UTC), which is what the old civil-field
+// subtraction threw away. The one wall-clock correction: when DTSTART lands in a
+// spring-forward gap it is pushed past the gap, so a SAME-ZONE DTEND — authored
+// against the same pre-gap clock — is pushed with it and the wall duration holds.
+// All-day half of computeEndShape. Same non-silence rule as the timed branch:
+// a DTEND/DURATION the engine cannot honor is a loud skip, never a silently
+// mis-sized block.
+function allDayEndShape(start, props) {
   if (props.DTEND) {
     const e = classifyValue(props.DTEND.value, props.DTEND.params);
-    if (e && !e.allDay) {
-      const s = start.civil, ec = e.civil;
-      const ms = Date.UTC(ec.y, ec.mo - 1, ec.d, ec.h, ec.mi, ec.s) -
-        Date.UTC(s.y, s.mo - 1, s.d, s.h, s.mi, s.s);
-      return { kind: "wall", ms: ms >= 0 ? ms : 0 };
-    }
+    if (!e || !e.allDay) return { err: "unusable DTEND on all-day event: " + props.DTEND.value };
+    const n = dayDiff(start.date, e.date);
+    return n >= 1 ? { kind: "days", n } : { err: "DTEND at or before DTSTART" };
   }
   if (props.DURATION) {
     const d = parseDuration(props.DURATION.value);
-    if (d !== null) return { kind: "fixed", ms: d >= 0 ? d : 0 };
+    if (!d) return { err: "unparseable DURATION: " + props.DURATION.value };
+    // RFC 5545 §3.6.1: a DATE-valued event's DURATION must be dur-day/dur-week.
+    if (d.ms !== 0) return { err: "time-part DURATION on all-day event: " + props.DURATION.value };
+    if (d.days < 1) return { err: "non-positive DURATION: " + props.DURATION.value };
+    return { kind: "days", n: d.days };
   }
-  return { kind: "fixed", ms: 0 };
+  return { kind: "days", n: 1 };
 }
 
-// Build one concrete occurrence (Google-shaped event + instant bounds + the
+function computeEndShape(start, props) {
+  if (start.allDay) return allDayEndShape(start, props);
+  if (props.DTEND) {
+    const e = classifyValue(props.DTEND.value, props.DTEND.params);
+    if (!e || e.allDay) return { err: "unusable DTEND: " + props.DTEND.value };
+    if (e.zone !== "UTC" && !isValidZone(e.zone)) return { err: "unresolvable DTEND timezone: " + e.zone };
+    const startMs = civilToMs(start.civil, start.zone);
+    const gap = e.zone === start.zone ? gapShift(start.civil, start.zone, startMs) : 0;
+    const ms = civilToMs(gap ? shiftWall(e.civil, gap) : e.civil, e.zone) - startMs;
+    return ms > 0 ? { kind: "exact", ms } : { err: "DTEND at or before DTSTART" };
+  }
+  if (props.DURATION) {
+    const d = parseDuration(props.DURATION.value);
+    if (!d) return { err: "unparseable DURATION: " + props.DURATION.value };
+    if (d.days <= 0 && d.ms <= 0) return { err: "non-positive DURATION: " + props.DURATION.value };
+    return { kind: "nominal", days: d.days, ms: d.ms };
+  }
+  return { kind: "exact", ms: 0 };
+}
+
+// Build one concrete occurrence (normalized event + instant bounds + the
 // recurrence key used for EXDATE/override matching) for a base event at date
 // `cand`. For a non-recurring event `cand` is just the event's own start date.
 function buildOccurrence(base, cand) {
@@ -434,11 +587,15 @@ function buildOccurrence(base, cand) {
   }
   const zone = base.start.zone;
   const sc = base.start.civil;
+  const sh = base.endShape;
+  // The start keeps its wall clock on every occurrence (a 08:00 series is 08:00
+  // on both sides of a transition); the end is then measured FROM THAT INSTANT,
+  // so it can never invert or collapse the way a re-resolved wall delta could.
   const startCivil = { y: cand.y, mo: cand.mo, d: cand.d, h: sc.h, mi: sc.mi, s: sc.s };
   const startMs = civilToMs(startCivil, zone);
-  const endMs = base.endShape.kind === "wall"
-    ? civilToMs(shiftWall(startCivil, base.endShape.ms), zone)
-    : startMs + base.endShape.ms;
+  const endMs = sh.kind === "nominal" && sh.days
+    ? civilToMs(shiftWall(startCivil, sh.days * DAY_MS), zone) + sh.ms
+    : startMs + sh.ms;
   const ev = mkEvent(base, { dateTime: iso(startMs) }, { dateTime: iso(endMs) });
   return { startMs, endMs, key: "t" + startMs, ev };
 }
@@ -468,13 +625,18 @@ function toEvent(props, warnings) {
   const anchor = start.allDay
     ? { y: start.date.y, mo: start.date.mo, d: start.date.d }
     : { y: start.civil.y, mo: start.civil.mo, d: start.civil.d };
+  const endShape = computeEndShape(start, props);
+  if (endShape.err) {
+    warnings.push(skipMsg(evTitle(props), endShape.err));
+    return null;
+  }
   const status = props.STATUS && props.STATUS.value.toUpperCase() === "CANCELLED" ? "cancelled" : "confirmed";
   return {
-    summary: props.SUMMARY ? props.SUMMARY.value : "",
+    summary: props.SUMMARY ? decodeText(props.SUMMARY.value) : "",
     status,
     uid: props.UID ? props.UID.value : "",
     start,
-    endShape: computeEndShape(start, props),
+    endShape,
     anchor,
   };
 }
@@ -487,13 +649,14 @@ function occKey(cv) {
   return null;
 }
 
-function parseExdates(props) {
+function parseExdates(props, warnings) {
   const set = new Set();
   for (const p of props._EXDATE) {
     for (const v of p.value.split(",")) {
       const cv = classifyValue(v, p.params);
       const k = cv && occKey(cv);
       if (k) set.add(k);
+      else warnings.push("unresolvable_exdate: " + v + (p.params.TZID ? " (timezone " + p.params.TZID + ")" : ""));
     }
   }
   return set;
@@ -502,13 +665,17 @@ function parseExdates(props) {
 // Index override VEVENTs (those carrying RECURRENCE-ID) by UID -> set of the
 // original-occurrence keys they replace, so master expansion can suppress the
 // base occurrence at each moved/cancelled instance.
-function indexOverrides(overrides) {
+function indexOverrides(overrides, warnings) {
   const map = new Map();
   for (const props of overrides) {
     const rid = props["RECURRENCE-ID"];
     const cv = rid && classifyValue(rid.value, rid.params);
     const k = cv && occKey(cv);
-    if (!k) continue;
+    if (!k) {
+      const why = rid ? (rid.params.TZID ? "timezone " + rid.params.TZID : "unparseable value " + rid.value) : "missing value";
+      warnings.push("unresolvable_recurrence_id: " + evTitle(props) + " (" + why + ")");
+      continue;
+    }
     const uid = props.UID ? props.UID.value : "";
     if (!map.has(uid)) map.set(uid, new Set());
     map.get(uid).add(k);
@@ -516,27 +683,40 @@ function indexOverrides(overrides) {
   return map;
 }
 
+// Backstop invariant: an in-window occurrence that ends at or before it starts
+// blocks nothing downstream, so it is skipped LOUDLY rather than emitted as a
+// zero-width commitment. Only the point-in-time case (no DTEND, no DURATION) can
+// still reach it — every other shape is validated positive at parse time.
+function keep(built, base, out, warnings) {
+  if (built.endMs > built.startMs) {
+    out.push(built.ev);
+    return true;
+  }
+  warnings.push(skipMsg(base.summary, "occurrence ends at or before it starts"));
+  return false;
+}
+
 function emitSingle(props, winMin, winMax, out, warnings) {
   const base = toEvent(props, warnings);
   if (!base) return;
   const built = buildOccurrence(base, base.anchor);
-  if (built.endMs > winMin && built.startMs < winMax) out.push(built.ev);
+  if (built.endMs > winMin && built.startMs < winMax) keep(built, base, out, warnings);
 }
 
 function emitMaster(props, overrideKeys, winMin, winMax, out, warnings) {
   const base = toEvent(props, warnings);
   if (!base) return;
-  const rule = parseRRule(props.RRULE.value);
+  const rule = parseRRule(props.RRULE.value, base.start.allDay ? NY : base.start.zone);
   if (rule.unsupported) {
     warnings.push(skipMsg(base.summary, "unsupported recurrence: " + rule.unsupported));
     return;
   }
-  const exdates = parseExdates(props);
+  const exdates = parseExdates(props, warnings);
   const okeys = overrideKeys.get(base.uid) || EMPTY_SET;
   let count = 0;
   let steps = 0;
-  for (const cand of candidateGen(base.anchor, rule)) {
-    if (++steps > MAX_STEPS) {
+  for (const cand of candidateGen(base.anchor, rule, winCeil(winMax))) {
+    if (cand === OVERFLOW || ++steps > MAX_STEPS) {
       warnings.push(skipMsg(base.summary, "recurrence too large"));
       return;
     }
@@ -547,7 +727,9 @@ function emitMaster(props, overrideKeys, winMin, winMax, out, warnings) {
     if (rule.until !== null && built.startMs > rule.until) return;
     if (built.startMs >= winMax) return; // monotonic: nothing later is in-window
     if (exdates.has(built.key) || okeys.has(built.key)) continue;
-    if (built.endMs > winMin && built.startMs < winMax) out.push(built.ev);
+    // One bad occurrence means a bad duration, which is a property of the whole
+    // series — warn once and drop the rest rather than repeating per instance.
+    if (built.endMs > winMin && !keep(built, base, out, warnings)) return;
   }
 }
 
@@ -565,43 +747,54 @@ function addProp(map, p) {
 // suppressed so a reminder's own TRIGGER/DTSTART can't be mistaken for the
 // event's; VTIMEZONE and other components are ignored (IANA zones are resolved
 // via Intl).
+// BEGIN:<comp> — st is the collector's mutable {cur, depth, inAlarm} state.
+function beginComponent(st, comp) {
+  if (comp === "VEVENT" && st.depth === 1) st.cur = { _EXDATE: [] };
+  else if (st.cur && comp === "VALARM") st.inAlarm++;
+  st.depth++;
+}
+
+// END:<comp> — throws on any imbalance (depth going negative, or an
+// END:VEVENT with no open VEVENT to close); see collectComponents header.
+function endComponent(st, comp, vevents) {
+  st.depth--;
+  if (st.depth < 0) throw new IcsError("unbalanced_component: END:" + comp + " with no matching BEGIN");
+  if (comp === "VEVENT") {
+    if (!st.cur) throw new IcsError("unbalanced_component: END:VEVENT with no matching BEGIN:VEVENT");
+    vevents.push(st.cur);
+    st.cur = null;
+  } else if (comp === "VALARM" && st.inAlarm) st.inAlarm--;
+}
+
+// One unbalanced BEGIN:/END: anywhere in the feed must throw rather than
+// silently yield 0 (or partial) events — a structurally broken feed should
+// read as broken, never as a clean empty calendar.
 function collectComponents(lines) {
   const vevents = [];
   let calName = null;
   let tz = null;
-  let cur = null;
-  let depth = 0;
-  let inAlarm = 0;
+  const st = { cur: null, depth: 0, inAlarm: 0 };
   for (const line of lines) {
-    if (line.startsWith("BEGIN:")) {
-      const comp = line.slice(6).toUpperCase();
-      if (comp === "VEVENT" && depth === 1) cur = { _EXDATE: [] };
-      else if (cur && comp === "VALARM") inAlarm++;
-      depth++;
-    } else if (line.startsWith("END:")) {
-      const comp = line.slice(4).toUpperCase();
-      if (comp === "VEVENT" && cur) {
-        vevents.push(cur);
-        cur = null;
-      } else if (comp === "VALARM" && inAlarm) inAlarm--;
-      depth--;
-    } else if (cur && !inAlarm) {
+    const uline = line.toUpperCase(); // BEGIN:/END: are property names -> case-insensitive (§3.1)
+    if (uline.startsWith("BEGIN:")) beginComponent(st, uline.slice(6));
+    else if (uline.startsWith("END:")) endComponent(st, uline.slice(4), vevents);
+    else if (st.cur && !st.inAlarm) {
       const p = splitProp(line);
-      if (p) addProp(cur, p);
-    } else if (!cur) {
+      if (p) addProp(st.cur, p);
+    } else if (!st.cur) {
       const p = splitProp(line);
-      if (p && p.name === "X-WR-CALNAME") calName = p.value;
+      if (p && p.name === "X-WR-CALNAME") calName = decodeText(p.value);
       else if (p && p.name === "X-WR-TIMEZONE") tz = p.value;
     }
   }
+  if (st.depth !== 0) throw new IcsError("unbalanced_component: unclosed BEGIN at end of feed");
   return { vevents, calName, tz };
 }
 
 /**
- * Parse a raw .ics feed into Google-shaped events overlapping [timeMinIso,
- * timeMaxIso] (the same exclusive-end window semantics Google's singleEvents
- * REST call uses: an event is kept when its end is after timeMin AND its start
- * is before timeMax).
+ * Parse a raw .ics feed into normalized events overlapping [timeMinIso,
+ * timeMaxIso] (using exclusive-end window semantics: an event is kept when its
+ * end is after timeMin AND its start is before timeMax).
  *
  * @param {string} text  raw .ics feed body
  * @param {string} timeMinIso  window lower bound, an RFC3339 instant
@@ -627,10 +820,10 @@ export function parseIcs(text, timeMinIso, timeMaxIso) {
     else if (props.RRULE) masters.push(props);
     else singles.push(props);
   }
-  const overrideKeys = indexOverrides(overrides);
-
   const events = [];
   const warnings = [];
+  const overrideKeys = indexOverrides(overrides, warnings);
+
   for (const props of singles) emitSingle(props, winMin, winMax, events, warnings);
   for (const props of overrides) emitSingle(props, winMin, winMax, events, warnings);
   for (const props of masters) emitMaster(props, overrideKeys, winMin, winMax, events, warnings);

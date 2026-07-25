@@ -7,8 +7,8 @@ import { buildTriplet, bucketEvents } from "../sw.js";
 // Every fixture here is SYNTHETIC. This repo is public and its git history is
 // permanent: no real calendar id, event title, or person's name may appear.
 //
-// The load-bearing assertion is parse -> buildTriplet == the Google REST path
-// for equivalent input: an .ics event and the Google-shaped object it stands in
+// The load-bearing assertion is parse -> buildTriplet == the normalized calendar-feed path
+// for equivalent input: an .ics event and the normalized object it stands in
 // for must civil-ize to the SAME NY triplet, because everything below
 // buildTriplet (scorer, drawer, picker) is unchanged by the ICS swap.
 
@@ -70,7 +70,7 @@ test("all-day with omitted DTEND synthesizes an exclusive next-day end", () => {
   assert.deepEqual(buildTriplet(r.events[0]), ["2026-08-04 00:00", "2026-08-05 00:00"]);
 });
 
-test("multi-day all-day keeps the feed's exclusive DTEND (matches Google)", () => {
+test("multi-day all-day keeps the feed's exclusive DTEND", () => {
   const r = parse(ev("UID:a\nDTSTART;VALUE=DATE:20260804\nDTEND;VALUE=DATE:20260807"));
   assert.deepEqual(buildTriplet(r.events[0]), ["2026-08-04 00:00", "2026-08-07 00:00"]);
 });
@@ -81,11 +81,11 @@ test("DURATION (no DTEND) computes the end — never a zero-length block", () =>
 });
 
 // ---------------------------------------------------------------------------
-// Equivalence: ICS path == Google path for the SAME logical event
+// Equivalence: ICS path == normalized path for the SAME logical event
 // ---------------------------------------------------------------------------
 
-test("equivalence: timed ICS event == its Google-shaped twin", () => {
-  const google = {
+test("equivalence: timed ICS event == its normalized twin", () => {
+  const normalized = {
     summary: "S",
     status: "confirmed",
     start: { dateTime: "2026-08-04T08:00:00-04:00" },
@@ -94,13 +94,13 @@ test("equivalence: timed ICS event == its Google-shaped twin", () => {
   const r = parse(
     ev("UID:a\nSUMMARY:S\nDTSTART;TZID=America/New_York:20260804T080000\nDTEND;TZID=America/New_York:20260804T180000")
   );
-  assert.deepEqual(buildTriplet(r.events[0]), buildTriplet(google));
+  assert.deepEqual(buildTriplet(r.events[0]), buildTriplet(normalized));
 });
 
-test("equivalence: all-day ICS event == its Google-shaped twin", () => {
-  const google = { summary: "S", start: { date: "2026-08-04" }, end: { date: "2026-08-05" } };
+test("equivalence: all-day ICS event == its normalized twin", () => {
+  const normalized = { summary: "S", start: { date: "2026-08-04" }, end: { date: "2026-08-05" } };
   const r = parse(ev("UID:a\nSUMMARY:S\nDTSTART;VALUE=DATE:20260804"));
-  assert.deepEqual(buildTriplet(r.events[0]), buildTriplet(google));
+  assert.deepEqual(buildTriplet(r.events[0]), buildTriplet(normalized));
 });
 
 // ---------------------------------------------------------------------------
@@ -273,4 +273,587 @@ test("X-WR-CALNAME and X-WR-TIMEZONE are surfaced as UI defaults", () => {
   const r = parse(ev("UID:a\nDTSTART;VALUE=DATE:20260804"));
   assert.equal(r.calName, "Test Cal");
   assert.equal(r.tz, "America/New_York");
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial regression pins (session-handoff 2026-07-25, 26 findings).
+// Each .ics body below is the finding's VERBATIM reproducer — a full VCALENDAR,
+// so it is fed straight to parseIcs (NOT through the local ev()/parse() helper,
+// which would double-wrap it in its own BEGIN/END:VCALENDAR).
+// ---------------------------------------------------------------------------
+
+test("DTEND is resolved in its OWN zone, not naive civil-field subtraction against DTSTART's zone", () => {
+  // Two mixed-zone VEVENTs in one feed: a UTC DTEND against an NY DTSTART, and an
+  // LA DTEND against an NY DTSTART. Before the fix, computeEndShape threw away
+  // DTEND's resolved zone and subtracted raw civil fields, so "Class" came out 4h
+  // too long and "Call" collapsed to zero length.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:endz
+SUMMARY:Class
+DTSTART;TZID=America/New_York:20260315T080000
+DTEND:20260315T170000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:endla
+SUMMARY:Call
+DTSTART;TZID=America/New_York:20260315T090000
+DTEND;TZID=America/Los_Angeles:20260315T090000
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, W_MIN, W_MAX);
+  assert.equal(r.warnings.length, 0);
+  const [cls, call] = r.events;
+  assert.deepEqual(buildTriplet(cls), ["2026-03-15 08:00", "2026-03-15 13:00"]); // 5h
+  assert.deepEqual(buildTriplet(call), ["2026-03-15 09:00", "2026-03-15 12:00"]); // 3h
+});
+
+test("a spring-forward-gap start carries its shift onto the resolved duration", () => {
+  // 02:30 NY on 2026-03-08 does not exist (spring-forward). Before the fix the
+  // start took the pre-gap offset while the end (03:00, which DOES exist) took
+  // the post-gap offset, inverting the event (end before start). The gap shift
+  // must be carried onto a same-zone DTEND so the 30-minute duration holds.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:neg
+SUMMARY:Med check
+DTSTART;TZID=America/New_York:20260308T023000
+DTEND;TZID=America/New_York:20260308T030000
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, W_MIN, W_MAX);
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(buildTriplet(r.events[0]), ["2026-03-08 03:30", "2026-03-08 04:00"]);
+});
+
+test("a quoted TZID param value is unquoted before zone resolution (DTSTART)", () => {
+  // RFC 5545 3.1 allows a quoted-string param value; the DQUOTEs are delimiters,
+  // not part of the zone name. Two independent findings hit the same DTSTART/DTEND
+  // TZID-unquoting root cause on different VEVENTs — both pinned here.
+  const drill = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:q
+SUMMARY:Drill
+DTSTART;TZID="America/New_York":20260315T080000
+DTEND;TZID="America/New_York":20260315T200000
+END:VEVENT
+END:VCALENDAR`;
+  const rDrill = parseIcs(drill, W_MIN, W_MAX);
+  assert.equal(rDrill.warnings.length, 0);
+  assert.equal(rDrill.events.length, 1);
+  assert.deepEqual(buildTriplet(rDrill.events[0]), ["2026-03-15 08:00", "2026-03-15 20:00"]);
+
+  const quotedTz = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:j
+SUMMARY:QuotedTz
+DTSTART;TZID="America/New_York":20260710T180000
+DTEND;TZID="America/New_York":20260710T200000
+END:VEVENT
+END:VCALENDAR`;
+  const rQ = parseIcs(quotedTz, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(rQ.warnings.length, 0);
+  assert.equal(rQ.events.length, 1);
+  assert.deepEqual(buildTriplet(rQ.events[0]), ["2026-07-10 18:00", "2026-07-10 20:00"]);
+});
+
+test("a local (non-Z) UNTIL is resolved in DTSTART's own zone, not hardcoded NY", () => {
+  // DTSTART is America/Los_Angeles; UNTIL=20260705T090000 carries no TZID/Z.
+  // Resolving it hardcoded-NY truncated the series a day early because NY's
+  // 09:00 local is earlier than LA's. Resolved in LA, Jul 5 09:00 PDT is kept.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:u
+SUMMARY:Standby
+DTSTART;TZID=America/Los_Angeles:20260703T090000
+DTEND;TZID=America/Los_Angeles:20260703T100000
+RRULE:FREQ=DAILY;UNTIL=20260705T090000
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, W_MIN, W_MAX);
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(
+    r.events.map((e) => buildTriplet(e)),
+    [
+      ["2026-07-03 12:00", "2026-07-03 13:00"],
+      ["2026-07-04 12:00", "2026-07-04 13:00"],
+      ["2026-07-05 12:00", "2026-07-05 13:00"],
+    ]
+  );
+});
+
+test("DURATION:P1D is NOMINAL (a calendar day, wall-clock preserving) across a DST transition", () => {
+  // RFC 5545 3.3.6: day/week DURATION parts are nominal, not an exact 86400s.
+  // Two independent findings hit the same nominal-vs-exact confusion.
+  const camping = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:d
+SUMMARY:Camping
+DTSTART;TZID=America/New_York:20260307T200000
+DURATION:P1D
+END:VEVENT
+END:VCALENDAR`;
+  const rCamping = parseIcs(camping, W_MIN, W_MAX);
+  assert.equal(rCamping.warnings.length, 0);
+  assert.deepEqual(buildTriplet(rCamping.events[0]), ["2026-03-07 20:00", "2026-03-08 20:00"]);
+
+  const nominalDay = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:e4
+SUMMARY:NominalDay
+DTSTART;TZID=America/New_York:20260307T120000
+DURATION:P1D
+END:VEVENT
+END:VCALENDAR`;
+  const rNominal = parseIcs(nominalDay, "2026-03-01T00:00:00-05:00", "2026-03-20T00:00:00-04:00");
+  assert.equal(rNominal.warnings.length, 0);
+  assert.deepEqual(buildTriplet(rNominal.events[0]), ["2026-03-07 12:00", "2026-03-08 12:00"]);
+});
+
+test("a MONTHLY rule selecting zero days in every month (Feb 30) returns [] promptly, no warnings, no hang", () => {
+  // FREQ=MONTHLY;BYMONTH=2;BYMONTHDAY=30 never lands on a real date. The
+  // generator must terminate via its own outer-iteration cap even though it
+  // never yields a single candidate for the consumer's own step guard to see.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:hang@t
+SUMMARY:Feb 30 rule
+DTSTART;TZID=America/New_York:20260215T090000
+DTEND;TZID=America/New_York:20260215T100000
+RRULE:FREQ=MONTHLY;BYMONTH=2;BYMONTHDAY=30
+END:VEVENT
+END:VCALENDAR`;
+  const startedAt = Date.now();
+  const r = parseIcs(text, "2026-01-01T00:00:00Z", "2026-12-31T00:00:00Z");
+  assert.ok(Date.now() - startedAt < 5000, "must return promptly, not spin to the generator's step cap");
+  assert.deepEqual(r.events, []);
+  assert.deepEqual(r.warnings, []);
+});
+
+test("FREQ=DAILY honors BYDAY as a LIMIT — weekday-only rules exclude weekends", () => {
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:daily-byday@t
+SUMMARY:Weekday day tour
+DTSTART;TZID=America/New_York:20260706T090000
+DTEND;TZID=America/New_York:20260706T100000
+RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-06T00:00:00Z", "2026-07-13T00:00:00Z");
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(startsOf(r), [
+    "2026-07-06 09:00", // Mon
+    "2026-07-07 09:00", // Tue
+    "2026-07-08 09:00", // Wed
+    "2026-07-09 09:00", // Thu
+    "2026-07-10 09:00", // Fri
+  ]); // no Sat 07-11, no Sun 07-12
+});
+
+test("MONTHLY BYDAY intersects with BYMONTHDAY, not replaces it (Friday the 13th)", () => {
+  // RFC 5545 3.3.10 Notes 1/2: for MONTHLY/YEARLY, when both are present BYDAY
+  // LIMITS the BYMONTHDAY expansion (an intersection), rather than BYDAY winning
+  // outright and running every Friday.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:fri13@t
+SUMMARY:Friday the 13th
+DTSTART;TZID=America/New_York:20260213T090000
+DTEND;TZID=America/New_York:20260213T100000
+RRULE:FREQ=MONTHLY;BYDAY=FR;BYMONTHDAY=13
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-02-01T00:00:00Z", "2026-04-01T00:00:00Z");
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(startsOf(r), ["2026-02-13 09:00", "2026-03-13 09:00"]);
+});
+
+test("FREQ=WEEKLY honors BYMONTH as a LIMIT — a seasonal weekly rule stays in-season", () => {
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:janmon@t
+SUMMARY:January Monday drill
+DTSTART;TZID=America/New_York:20260105T090000
+DTEND;TZID=America/New_York:20260105T100000
+RRULE:FREQ=WEEKLY;BYMONTH=1;BYDAY=MO
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z");
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(startsOf(r), [
+    "2026-01-05 09:00",
+    "2026-01-12 09:00",
+    "2026-01-19 09:00",
+    "2026-01-26 09:00",
+  ]); // no February Mondays
+});
+
+test("an unparseable UNTIL skips the event loudly rather than becoming an unbounded series", () => {
+  // Truncated seconds field: UNTIL=20260706T1400Z is not a valid DATE-TIME/DATE.
+  // untilToMs must return null so the rule is rejected up front, not silently
+  // treated as "no UNTIL was given".
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:baduntil@t
+SUMMARY:Series that ended July 6
+DTSTART;TZID=America/New_York:20260701T090000
+DTEND;TZID=America/New_York:20260701T100000
+RRULE:FREQ=DAILY;UNTIL=20260706T1400Z
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(r.events, []);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /Series that ended July 6/);
+  assert.match(r.warnings[0], /UNTIL=20260706T1400Z/);
+});
+
+test("an unparseable COUNT skips the event loudly rather than becoming an unbounded series", () => {
+  // COUNT= (empty) parses as NaN; `count > NaN` is always false, so a naive
+  // guard never fires. applyRulePart must reject a non-numeric COUNT up front.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:badcount@t
+SUMMARY:Three-day series
+DTSTART;TZID=America/New_York:20260701T090000
+DTEND;TZID=America/New_York:20260701T100000
+RRULE:FREQ=DAILY;COUNT=
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(r.events, []);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /Three-day series/);
+  assert.match(r.warnings[0], /COUNT=/);
+});
+
+test("an ordinal BYDAY is rejected for WEEKLY (and, by the same rule, for DAILY)", () => {
+  // RFC 5545 3.3.10: the BYDAY numeric ordinal is only meaningful for
+  // MONTHLY/YEARLY. FREQ=WEEKLY;BYDAY=2MO must be a named, loud skip rather
+  // than silently reinterpreted as "every Monday".
+  const weekly = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:w2mo@t
+SUMMARY:Second Monday
+DTSTART;TZID=America/New_York:20260713T090000
+DTEND;TZID=America/New_York:20260713T100000
+RRULE:FREQ=WEEKLY;BYDAY=2MO
+END:VEVENT
+END:VCALENDAR`;
+  const rWeekly = parseIcs(weekly, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(rWeekly.events, []);
+  assert.equal(rWeekly.warnings.length, 1);
+  assert.match(rWeekly.warnings[0], /ordinal_byday_with_weekly/);
+
+  // Same rule, DAILY side: encodes the documented parallel warning shape
+  // (the core/ics.js frequency check names the offending FREQ in the reason).
+  const daily = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:d2mo@t
+SUMMARY:Second weekday
+DTSTART;TZID=America/New_York:20260713T090000
+DTEND;TZID=America/New_York:20260713T100000
+RRULE:FREQ=DAILY;BYDAY=2MO
+END:VEVENT
+END:VCALENDAR`;
+  const rDaily = parseIcs(daily, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(rDaily.events, []);
+  assert.equal(rDaily.warnings.length, 1);
+  assert.match(rDaily.warnings[0], /ordinal_byday_with_daily/);
+});
+
+test("an unresolvable RECURRENCE-ID timezone warns but does NOT change event flow (documented gap)", () => {
+  // Per the module's design, an unresolvable EXDATE/RECURRENCE-ID key is a named
+  // warning, not a silent change to which occurrences are emitted — it is NOT
+  // treated the same as an unresolvable DTSTART timezone (which skips the whole
+  // event). Concretely: the override event is still emitted, and the base
+  // occurrence at that slot is NOT suppressed, so Jul 10 appears twice. This test
+  // pins that current, documented behavior rather than demanding a flow change.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:s1
+DTSTART;TZID=America/New_York:20260703T090000
+DTEND;TZID=America/New_York:20260703T170000
+RRULE:FREQ=WEEKLY;BYDAY=FR;COUNT=2
+SUMMARY:Medic
+END:VEVENT
+BEGIN:VEVENT
+UID:s1
+RECURRENCE-ID;TZID=Mars/Phobos:20260710T090000
+DTSTART;TZID=America/New_York:20260710T150000
+DTEND;TZID=America/New_York:20260710T230000
+SUMMARY:Medic moved
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /^unresolvable_recurrence_id: Medic moved \(timezone Mars\/Phobos\)$/);
+  const trips = r.events.map((e) => [e.summary, ...buildTriplet(e)]).sort((a, b) => a[1].localeCompare(b[1]));
+  assert.deepEqual(trips, [
+    ["Medic", "2026-07-03 09:00", "2026-07-03 17:00"],
+    ["Medic", "2026-07-10 09:00", "2026-07-10 17:00"], // base NOT suppressed
+    ["Medic moved", "2026-07-10 15:00", "2026-07-10 23:00"], // override still emitted
+  ]);
+});
+
+test("an unresolvable EXDATE timezone warns but does NOT change event flow (documented gap)", () => {
+  // Same design as the RECURRENCE-ID case above: an EXDATE key the parser
+  // cannot resolve is named in a warning; the exclusion it names is simply not
+  // applied (the occurrence still appears) — pinning current behavior, not a
+  // flow change.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:s2
+DTSTART;TZID=America/New_York:20260703T090000
+DTEND;TZID=America/New_York:20260703T170000
+RRULE:FREQ=WEEKLY;BYDAY=FR;COUNT=2
+EXDATE;TZID=Mars/Phobos:20260710T090000
+SUMMARY:Medic
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /^unresolvable_exdate: 20260710T090000 \(timezone Mars\/Phobos\)$/);
+  assert.deepEqual(startsOf(r), ["2026-07-03 09:00", "2026-07-10 09:00"]); // exclusion NOT applied
+});
+
+test("RECURRENCE-ID;RANGE=THISANDFUTURE applies to one slot only (documented gap, not expanded)", () => {
+  // RFC 5545 3.8.4.4 says RANGE=THISANDFUTURE should move the target instance AND
+  // every later one. core/ics.js does not implement RANGE — it only suppresses
+  // the single targeted occurrence — so later occurrences (Jul 17) keep the
+  // pre-override wall time. This is an intentional, documented gap: RANGE is
+  // parsed but not applied to more than the one slot. Pinning current behavior.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:s4
+DTSTART;TZID=America/New_York:20260703T090000
+DTEND;TZID=America/New_York:20260703T170000
+RRULE:FREQ=WEEKLY;BYDAY=FR;COUNT=3
+SUMMARY:Medic
+END:VEVENT
+BEGIN:VEVENT
+UID:s4
+RECURRENCE-ID;TZID=America/New_York;RANGE=THISANDFUTURE:20260710T090000
+DTSTART;TZID=America/New_York:20260710T140000
+DTEND;TZID=America/New_York:20260710T220000
+SUMMARY:Medic
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.equal(r.warnings.length, 0);
+  const trips = r.events.map((e) => buildTriplet(e)).sort((a, b) => a[0].localeCompare(b[0]));
+  assert.deepEqual(trips, [
+    ["2026-07-03 09:00", "2026-07-03 17:00"], // untouched
+    ["2026-07-10 14:00", "2026-07-10 22:00"], // moved slot itself
+    ["2026-07-17 09:00", "2026-07-17 17:00"], // NOT carried forward (the gap)
+  ]);
+});
+
+test("a quoted TZID on EXDATE/RECURRENCE-ID is unquoted, so the exclusion/override actually applies", () => {
+  // Contrast with the Mars/Phobos cases above: HERE the zone is perfectly valid
+  // once unquoted, so the fix (splitProp/unquote) makes the exclusion and the
+  // override both take effect as intended, instead of reading as unresolvable.
+  const exdate1 = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:s3
+DTSTART;TZID=America/New_York:20260703T090000
+DTEND;TZID=America/New_York:20260703T170000
+RRULE:FREQ=WEEKLY;BYDAY=FR;COUNT=2
+EXDATE;TZID="America/New_York":20260710T090000
+SUMMARY:Medic
+END:VEVENT
+END:VCALENDAR`;
+  const r1 = parseIcs(exdate1, "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.equal(r1.warnings.length, 0);
+  assert.deepEqual(startsOf(r1), ["2026-07-03 09:00"]); // Jul 10 excluded
+
+  const exdate2 = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:m
+SUMMARY:WeeklyEx
+DTSTART;TZID=America/New_York:20260706T180000
+DTEND;TZID=America/New_York:20260706T200000
+RRULE:FREQ=WEEKLY;COUNT=4
+EXDATE;TZID="America/New_York":20260713T180000
+END:VEVENT
+END:VCALENDAR`;
+  const r2 = parseIcs(exdate2, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r2.warnings.length, 0);
+  assert.deepEqual(startsOf(r2), ["2026-07-06 18:00", "2026-07-20 18:00", "2026-07-27 18:00"]); // Jul 13 excluded
+
+  const recid = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:n
+SUMMARY:WeeklyMaster
+DTSTART;TZID=America/New_York:20260706T180000
+DTEND;TZID=America/New_York:20260706T200000
+RRULE:FREQ=WEEKLY;COUNT=3
+END:VEVENT
+BEGIN:VEVENT
+UID:n
+SUMMARY:Moved Instance
+RECURRENCE-ID;TZID="America/New_York":20260713T180000
+DTSTART;TZID=America/New_York:20260713T090000
+DTEND;TZID=America/New_York:20260713T110000
+END:VEVENT
+END:VCALENDAR`;
+  const r3 = parseIcs(recid, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r3.warnings.length, 0);
+  const trips = r3.events.map((e) => [e.summary, ...buildTriplet(e)]).sort((a, b) => a[1].localeCompare(b[1]));
+  assert.deepEqual(trips, [
+    ["WeeklyMaster", "2026-07-06 18:00", "2026-07-06 20:00"],
+    ["Moved Instance", "2026-07-13 09:00", "2026-07-13 11:00"], // replaces the base slot
+    ["WeeklyMaster", "2026-07-20 18:00", "2026-07-20 20:00"],
+  ].sort((a, b) => a[1].localeCompare(b[1])));
+});
+
+test("RFC 5545 TEXT escapes (\\, \\; \\n) are decoded in SUMMARY and X-WR-CALNAME", () => {
+  const text = `BEGIN:VCALENDAR
+X-WR-CALNAME:Alex\\, HFD Duty
+BEGIN:VEVENT
+UID:esc
+SUMMARY:Medic Shift\\, Cortlandt\\; Tour 3\\nSecond line
+DTSTART;TZID=America/New_York:20260710T180000
+DTEND;TZID=America/New_York:20260710T200000
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r.warnings.length, 0);
+  assert.equal(r.calName, "Alex, HFD Duty");
+  assert.equal(r.events[0].summary, "Medic Shift, Cortlandt; Tour 3\nSecond line");
+});
+
+test("a floating DTSTART with a differently-zoned DTEND resolves each endpoint in its own zone", () => {
+  // DTSTART has no TZID/Z (floating -> NY); DTEND is an explicit UTC instant.
+  // The two are one real hour apart; the naive civil-subtraction bug (fixed
+  // above for the TZID/TZID case) applied here too.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:h1
+SUMMARY:FloatZ
+DTSTART:20260710T180000
+DTEND:20260710T230000Z
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(buildTriplet(r.events[0]), ["2026-07-10 18:00", "2026-07-10 19:00"]);
+});
+
+test("one unbalanced BEGIN/END anywhere in the feed throws IcsError (never a quiet empty calendar)", () => {
+  // The VTIMEZONE here is missing its END, leaving depth permanently off by one.
+  // The nested VEVENT is itself well-formed; under no reading may the result be
+  // a clean, empty parse.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:VEVENT
+UID:b1
+SUMMARY:Real Shift
+DTSTART;TZID=America/New_York:20260710T180000
+DTEND;TZID=America/New_York:20260710T200000
+END:VEVENT
+END:VCALENDAR`;
+  assert.throws(
+    () => parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00"),
+    (e) => e instanceof IcsError && /^unbalanced_component/.test(e.message)
+  );
+});
+
+test("lowercase begin:/end: component delimiters are recognized (case-insensitive per RFC 5545 3.1)", () => {
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+begin:vevent
+UID:g3
+SUMMARY:LowerComp
+DTSTART;TZID=America/New_York:20260710T180000
+DTEND;TZID=America/New_York:20260710T200000
+end:vevent
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r.warnings.length, 0);
+  assert.equal(r.events.length, 1);
+  assert.deepEqual(buildTriplet(r.events[0]), ["2026-07-10 18:00", "2026-07-10 20:00"]);
+});
+
+test("lowercase BYDAY weekday tokens (and freq=/count=) are recognized case-insensitively", () => {
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:g4
+SUMMARY:LowerRrule
+DTSTART;TZID=America/New_York:20260706T180000
+DTEND;TZID=America/New_York:20260706T200000
+RRULE:freq=weekly;byday=mo,we;count=4
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.equal(r.warnings.length, 0);
+  assert.deepEqual(startsOf(r), [
+    "2026-07-06 18:00", // Mon
+    "2026-07-08 18:00", // Wed
+    "2026-07-13 18:00", // Mon
+    "2026-07-15 18:00", // Wed
+  ]);
+});
+
+test("an unparseable DURATION skips the event loudly instead of degrading to zero length", () => {
+  // "pt10h" is lowercase (parseDuration's regex is case-sensitive by design) and
+  // so parses as null; computeEndShape must turn that into a named skip, not a
+  // silent zero-length event ({kind:"fixed", ms:0}), which the "occurrence ends
+  // at or before it starts" invariant would then also need to catch.
+  const text = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:x
+SUMMARY:LowerDur
+DTSTART;TZID=America/New_York:20260710T180000
+DURATION:pt10h
+END:VEVENT
+END:VCALENDAR`;
+  const r = parseIcs(text, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.deepEqual(r.events, []);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /unparseable DURATION: pt10h/);
+
+  // Documented parallel case: a value that DOES parse but resolves to zero or
+  // negative (e.g. DURATION:P with every component omitted) must be rejected as
+  // "non-positive DURATION", not silently accepted as a valid zero-length event.
+  const nonPositive = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:zp
+SUMMARY:EmptyDur
+DTSTART;TZID=America/New_York:20260710T180000
+DURATION:P
+END:VEVENT
+END:VCALENDAR`;
+  const rNonPositive = parseIcs(nonPositive, "2026-07-01T00:00:00-04:00", "2026-08-01T00:00:00-04:00");
+  assert.deepEqual(rNonPositive.events, []);
+  assert.equal(rNonPositive.warnings.length, 1);
+  assert.match(rNonPositive.warnings[0], /non-positive DURATION: P/);
 });
