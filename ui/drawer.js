@@ -2,8 +2,7 @@
  * ESM module -- dynamic-imported via chrome.runtime.getURL('ui/drawer.js').
  *
  * export function initDrawer(callbacks) -> controller
- *   callbacks = { onScanAll(), onRowClick(w2w_id), onConnectCalendar(),
- *                 onOpenSetup() }
+ *   callbacks = { onScanAll(), onRowClick(w2w_id), onOpenSetup() }
  *   controller.update(state) fully rerenders the drawer from `state`.
  *
  * Mounting: a single fixed-position host <div> is appended to
@@ -79,16 +78,14 @@ function myschedHtml(status) {
 }
 
 function calSegmentHtml(state) {
-  if (state.calError === "auth_required") {
-    return '<button type="button" class="chip chip-connect" data-action="connect-calendar">CONNECT GOOGLE</button>';
-  }
   if (state.calError) {
-    // Brief only spells out UI for calError === "auth_required"; any other
-    // truthy error string still needs *some* visible signal rather than
-    // silently falling back to the healthy age display. Documented
-    // assumption: render a compact red "CAL ERR" with the raw string in
-    // the title tooltip.
-    return `<span class="cal-age cal-red" title="${escapeHtml(state.calError)}">CAL ERR</span>`;
+    // Any truthy error needs a visible signal rather than silently falling back
+    // to the healthy age display. A feed that did not load gets its own wording,
+    // because it is the actionable case: the user has a link to fix.
+    const isFeed = String(state.calError).startsWith("feed_failed");
+    return `<span class="cal-age cal-red" title="${escapeHtml(state.calError)}">${
+      isFeed ? "FEED ERR" : "CAL ERR"
+    }</span>`;
   }
   const { text, cls } = calAgeInfo(state.calAgeMs);
   return `<span class="cal-age cal-${cls}">${escapeHtml(text)}</span>`;
@@ -168,13 +165,43 @@ function mutedStatsHtml(openCount) {
 }
 
 /** The red "we are not checking your calendar" block, shown above the stats
- * whenever the drawer is connected but no calendar is set to block. Its CTA
- * shares the gear's data-action so both routes reach onOpenSetup(). */
+ * whenever no feed is set to block. Its CTA shares the gear's data-action so
+ * both routes reach onOpenSetup(). */
 function deconfidenceBannerHtml() {
   return `<div class="deconf-banner">
     <div class="deconf-head">Not checking your calendar</div>
-    <div class="deconf-body">No calendar is set to block, so these are all open shifts — not shifts you're free for. Some may overlap what you already have.</div>
-    <button type="button" class="deconf-cta" data-action="open-setup">Set up calendars →</button>
+    <div class="deconf-body">No feed is set to block, so these are all open shifts — not shifts you're free for. Some may overlap what you already have.</div>
+    <button type="button" class="deconf-cta" data-action="open-setup">Add a feed →</button>
+  </div>`;
+}
+
+/**
+ * Pull the feed name out of sw.js's `feed_failed: "<name>" — <why>` error so the
+ * banner can say WHICH feed to go fix. Falls back to neutral wording rather than
+ * rendering the raw error string at a user.
+ */
+function feedErrorDetail(err) {
+  const m = /^feed_failed: "([^"]*)"/.exec(String(err || ""));
+  const who = m ? m[1] : "";
+  return who
+    ? `${who} didn't load, so these shifts aren't checked against it.`
+    : "A calendar feed didn't load, so these shifts aren't checked against it.";
+}
+
+/**
+ * The red "a blocking feed did not load" block. Reuses the de-confidence
+ * styling because it means the same thing to the user — nothing here is a real
+ * ranking — and it replaces that banner rather than stacking with it.
+ *
+ * This is the visible half of sw.js's failure policy: a feed that can hard-reject
+ * shifts failed to load, so the board is NOT scored at all. Scoring anyway would
+ * render every shift as free, including the ones the user is already committed to.
+ */
+function feedErrorBannerHtml(state) {
+  return `<div class="deconf-banner">
+    <div class="deconf-head">Not scoring right now</div>
+    <div class="deconf-body">${escapeHtml(feedErrorDetail(state.calError))}</div>
+    <button type="button" class="deconf-cta" data-action="open-setup">Fix feed →</button>
   </div>`;
 }
 
@@ -308,7 +335,7 @@ function collapsedTabHtml() {
 }
 
 /**
- * @param {{onScanAll?:Function, onRowClick?:Function, onConnectCalendar?:Function, onOpenSetup?:Function}} callbacks
+ * @param {{onScanAll?:Function, onRowClick?:Function, onOpenSetup?:Function}} callbacks
  */
 export function initDrawer(callbacks) {
   const cb = callbacks || {};
@@ -429,14 +456,16 @@ export function initDrawer(callbacks) {
     // STATE 1: the normal list view, plus the compose bar when >=1 shift
     // is selected.
     //
-    // The de-confidence ("muted") pass fires when the drawer is CONNECTED but
-    // no calendar is set to block. Precedence: an auth error wins — when
-    // calError === "auth_required" the status line already shows CONNECT
-    // GOOGLE, and "connect" comes before "set up", so the muted state stays
-    // off. Only connected-but-unconfigured shows it. When anyCalendarBlocks is
-    // true, EVERYTHING below renders exactly as it did before this state
-    // existed (muted stays false end to end).
-    const muted = !state.anyCalendarBlocks && state.calError !== "auth_required";
+    // The "muted" pass strips every rank number, tier colour and score, so
+    // nothing on screen can read as a real ranking. It fires for BOTH ways the
+    // board can be unscored:
+    //   - no feed is set to block (nothing was ever going to be checked), or
+    //   - a blocking feed failed to load, so sw.js refused to score at all.
+    // The feed failure wins the banner slot: it names something the user can go
+    // fix, and stacking both would just dilute it. When neither holds,
+    // EVERYTHING below renders exactly as it did before these states existed.
+    const feedBroken = Boolean(state.calError);
+    const muted = !state.anyCalendarBlocks || feedBroken;
 
     let html = headerHtml();
     // Gear, always present, at the end of the status line. It pulses amber
@@ -452,7 +481,8 @@ export function initDrawer(callbacks) {
     );
     if (bannerHasContent) html += bannerHtml(banner);
 
-    if (muted) html += deconfidenceBannerHtml();
+    if (feedBroken) html += feedErrorBannerHtml(state);
+    else if (muted) html += deconfidenceBannerHtml();
 
     html += muted
       ? mutedStatsHtml(state.rows ? state.rows.length : 0)
@@ -496,8 +526,6 @@ export function initDrawer(callbacks) {
     if (action === "toggle-collapse") {
       collapsed = !collapsed;
       render();
-    } else if (action === "connect-calendar") {
-      cb.onConnectCalendar && cb.onConnectCalendar();
     } else if (action === "open-setup") {
       cb.onOpenSetup && cb.onOpenSetup();
     } else if (action === "filter") {

@@ -73,7 +73,7 @@
     const docHtml = document.documentElement.outerHTML;
     if (isLoggedOut(docHtml)) {
       const { initDrawer } = await import(chrome.runtime.getURL("ui/drawer.js"));
-      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onConnectCalendar() {} });
+      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onOpenSetup() {} });
       controller.update(emptyState("Log in to WhenToWork first"));
       return;
     }
@@ -82,7 +82,7 @@
     const tag = document.querySelector("script[data-sid][data-w2w]");
     if (!tag || !tag.dataset.sid || !tag.dataset.w2w) {
       const { initDrawer } = await import(chrome.runtime.getURL("ui/drawer.js"));
-      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onConnectCalendar() {} });
+      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onOpenSetup() {} });
       controller.update(emptyState("Could not read page identity — reload the tradeboard"));
       return;
     }
@@ -394,9 +394,6 @@
           if (a) a.scrollIntoView({ behavior: "smooth", block: "center" });
         }
       },
-      onConnectCalendar: () => {
-        connectCalendar().catch((e) => console.error("[medic-tradeboard] connect calendar failed:", e));
-      },
       onOpenSetup: () => {
         // A content script can't open the options page itself; the worker owns
         // chrome.runtime.openOptionsPage(). Fire-and-forget: a failure is
@@ -422,21 +419,6 @@
       controller.update(buildState({ monthLabel: currentMonthLabel(), rows, rejects: rejRows }));
     }
 
-    async function connectCalendar() {
-      const resp = await askCalendar("interactive");
-      applyCalResponse(resp);
-      if (resp && resp.ok) {
-        await rescoreVisibleAndPaint();
-      } else {
-        // Keep whatever was already painted — calError in the state drives
-        // the status-line CONNECT chip; blanking rows here would throw away
-        // a perfectly good cached-data scoring.
-        controller.update(buildState({
-          monthLabel: currentMonthLabel(), rows: lastRows, rejects: lastRejRows,
-        }));
-      }
-    }
-
     // Returning from the options page must clear (or raise) the muted state
     // without a manual reload. When any of the three block-config keys change,
     // recompute anyCalendarBlocks and re-pull the calendar: the roles/titles
@@ -447,7 +429,11 @@
     // storage-event error is logged, never thrown out of the listener.
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
-      if (!("calRoles" in changes || "calBlockTitles" in changes || "ruleUsePattern" in changes)) return;
+      // `feeds` is watched too: adding or removing a feed changes what can block
+      // a shift just as much as changing a role does, and without it the board
+      // would keep scoring against a feed the user just deleted.
+      if (!("feeds" in changes || "calRoles" in changes
+        || "calBlockTitles" in changes || "ruleUsePattern" in changes)) return;
       (async () => {
         await refreshBlockingSignal();
         const resp = await askCalendar("refresh");
@@ -582,9 +568,12 @@
     if (cacheResp && cacheResp.ok) {
       await rescoreVisibleAndPaint();
     } else {
+      // "no_cache" on a cold start is expected, not a failure — the refresh
+      // below is already on its way. A real feed failure is NOT swallowed here:
+      // it reaches the drawer as calError and raises the loud banner.
       controller.update(buildState({
         monthLabel: currentMonthLabel(),
-        notice: calError === "auth_required" ? null : "Connecting to Google Calendar…",
+        notice: calError && calError !== "no_cache" ? null : "Reading your calendar feeds…",
         rows: [], rejects: [],
       }));
     }
