@@ -3,38 +3,47 @@
  *
  * Purpose: on request from the content script, produce two triplet lists for
  * the scoring engine in NY-local "YYYY-MM-DD HH:MM" string form:
- *   - commitments: hard conflicts — every event of a REJECT calendar, plus the
- *     events of a RULE calendar whose title matches the user's block list.
- *   - soft: annotations — every event of a FLAG calendar, plus the events of a
- *     RULE calendar whose title does NOT match.
+ *   - commitments: hard conflicts — every event of a REJECT feed, plus the
+ *     events of a RULE feed whose title matches the user's block list.
+ *   - soft: annotations — every event of a FLAG feed, plus the events of a
+ *     RULE feed whose title does NOT match.
  *
- * A RULE calendar's block list is the set of real event titles the user ticked
+ * A RULE feed's block list is the set of real event titles the user ticked
  * in the picker (`calBlockTitles`), matched by stem, anchored at the start of
  * the title. THAT IS THE WHOLE BLOCKING SET: a RULE calendar with nothing
  * ticked blocks NOTHING. The older ruleInclude/ruleExclude regex applies only
  * to a user who explicitly opted into the advanced pattern hatch (the stored
  * `ruleUsePattern` flag) — never as a fallback inferred from an empty tick list.
  *
- * Calendar identity is per-user config, never code. Every Google calendar the
- * signed-in account can see carries one of four roles — OFF | FLAG | REJECT |
- * RULE — chosen by the user and stored sparsely under `calRoles`. An id with no
- * stored entry falls back to defaultRole(), which is deliberately conservative:
- * it never invents a hard reject for a calendar the user has not spoken about.
+ * THE SOURCE IS SUBSCRIBED iCal FEEDS — there is no sign-in anywhere in this
+ * extension. A feed is either an .ics URL the user pasted (a read-only secret
+ * capability link: Google's "secret address", an iCloud/webcal link, a
+ * department feed) or an .ics file they uploaded. core/ics.js parses either into
+ * the same event shape, so everything below buildTriplet is unchanged.
  *
- * Events from non-primary calendars are labelled "<calendar summary> · <title>";
- * primary-calendar events stay unprefixed, so an unprefixed label means the
- * event came from the user's own calendar.
+ * Feed identity is per-user config, never code. Every feed carries one of four
+ * roles — OFF | FLAG | REJECT | RULE — chosen by the user and stored sparsely
+ * under `calRoles`, keyed by the feed's id. An id with no stored entry falls
+ * back to defaultRole(), which is deliberately conservative: it never invents a
+ * hard reject for a feed the user has not spoken about.
+ *
+ * Notes are labelled "<feed name> · <title>", so a note always says which feed
+ * it came from.
  *
  * PRIVACY/SAFETY:
- *   - Read-only Google Calendar (calendar.readonly). Never writes to any Google
- *     API; only ever GETs from https://www.googleapis.com/calendar/v3/*.
+ *   - Read-only in every direction. The worker only ever GETs a feed URL, with
+ *     credentials omitted; it never writes to any calendar and never posts.
+ *   - A feed URL is a CREDENTIAL. It lives in chrome.storage.local, is never
+ *     synced, and never reaches the options page — only redactFeedUrl's host
+ *     form does, so the token cannot leak into a screenshot or a support paste.
  *   - Never logs event titles or attendee data on production paths. A single
  *     DEBUG flag (default false) gates the only verbose logging, and even then
  *     we log counts/warnings/mode — never event summaries.
- *   - OFF calendars are never fetched: the refresh loop skips them before any
- *     events request, so their contents never reach this extension. EVERY
- *     calendar starts OFF — including the signed-in account's own primary.
- *     Nothing is read until the user explicitly turns it on.
+ *   - OFF feeds are never fetched: the refresh loop skips them before any
+ *     request, so their contents never reach this extension. EVERY feed starts
+ *     OFF; nothing is read until the user explicitly turns it on.
+ *   - A blocking-capable feed that fails to load FAILS the whole refresh rather
+ *     than scoring without it — see refreshCalendarData's failure policy.
  *
  * ALL chrome.* references live inside function/listener bodies (the sole
  * top-level touch is the typeof-guarded addListener at the bottom) so a bare
@@ -43,12 +52,27 @@
  */
 
 import { toEpoch, civilFromEpoch, addDays, parseCivil } from "./core/nytime.js";
+import { parseIcs } from "./core/ics.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const CAL_BASE = "https://www.googleapis.com/calendar/v3";
+// Every calendar feed the user has subscribed this extension to. A feed is
+// either an .ics URL (fetched live; webcal:// normalized to https://) or an
+// uploaded .ics file whose text is stored in `content`. There is no auth of any
+// kind: a URL feed is a read-only secret capability link, a file feed is a
+// static snapshot the user re-uploads to refresh.
+//
+//   feeds = [{ id, kind:"url"|"file", url?, content?, name, addedAt,
+//              calName?, tz?, syncedAt? }]
+//
+// A feed's ROLE and every per-feed picker map key on the feed's `id`, exactly as
+// they keyed on a Google calendar id before: the config layer below is RE-KEYED,
+// not rebuilt, so calRoles / calBlockTitles / calNoteTitles / calTitleLabels /
+// calBufferBefore / calBufferAfter / calEventBuffers all keep working unchanged
+// (and core/blocks.js's anyoneBlocks keeps reading calRoles as it always has).
+const FEEDS_KEY = "feeds";
 
 // Starting point for the RULE role's regex. Both values are placeholders the
 // user is expected to replace with the title convention their own employer's
@@ -370,104 +394,109 @@ export function titlesToMatcher(titles) {
 }
 
 /**
- * The role a calendar takes when the user has never picked one for it.
+ * The role a feed takes when the user has never picked one for it.
  *
- * EVERY calendar defaults to OFF — the primary included. There is no cascade
- * and no exception:
+ * EVERY feed defaults to OFF. There is no cascade and no exception:
  *
  *   - A default may never produce a hard REJECT. A wrong reject silently hides
  *     a shift the user was actually free to take, and we would be guessing.
- *   - A default may never produce a FLAG either, not even on the primary. The
- *     primary calendar is the MOST sensitive one the account holds — a family
- *     member's surgery, a therapy appointment, a lawyer's name in an event
- *     title. Reading it because we assumed consent is not ours to assume, and
- *     annotating with it means those titles get rendered onto a work page.
- *   - OFF means the refresh loop never issues an events request for it at all,
- *     so its contents never leave Google.
+ *   - A default may never produce a FLAG either. A personal calendar is the most
+ *     sensitive thing a user can subscribe this to — a family member's surgery,
+ *     a therapy appointment, a lawyer's name in an event title. Reading it
+ *     because we assumed consent is not ours to assume, and annotating with it
+ *     means those titles get rendered onto a work page.
+ *   - OFF means the refresh loop never fetches that feed at all, so its contents
+ *     are never even retrieved.
  *
- * Accepted cost: a freshly-installed user gets no scoring value until they open
- * the picker and turn a calendar on. That is the correct trade — the extension
- * has nothing to say about a user's availability until the user tells it which
- * calendars represent real commitments.
+ * Accepted cost: a feed contributes nothing until it has a role. That is the
+ * correct trade — the extension has nothing to say about a user's availability
+ * until the user tells it which feeds represent real commitments. (The add-feed
+ * flow asks for a role up front, so in practice this is the safety net rather
+ * than the common path.)
  *
- * @param {{id:string, summary?:string, primary?:boolean}} _item
+ * @param {{id:string, name?:string}} _feed
  * @returns {string} always "OFF"
  */
-export function defaultRole(_item) {
+export function defaultRole(_feed) {
   return "OFF";
 }
 
 /**
- * Attach the effective role and label prefix to each calendarList item. The
- * stored map is sparse and may have been hand-edited, so an entry that isn't a
- * known role falls back to defaultRole.
+ * Redact a feed URL down to something safe to render.
  *
- * DISPLAY NAME: `summaryOverride` is the name the USER gave the calendar in
- * Google Calendar; `summary` is the name its owner gave it. When both exist the
- * override wins everywhere — display, label prefix, and sort key — or the user
- * would be shown a calendar they renamed under a name they do not recognise.
+ * A subscription URL IS the credential — Google's "secret address" and an
+ * Aladtec sync link both carry a token that grants read access to the whole
+ * calendar forever. The options page therefore shows the host and nothing else;
+ * the full value stays in chrome.storage.local, never on screen, never in a
+ * screenshot, never in a support paste.
  *
- * ACCESS ROLE is carried through untouched. A "freeBusyReader" calendar returns
- * events with NO summary at all, so a title picker over it can only ever render
- * blank rows; the UI needs this field to say so instead of looking broken.
- *
- * Primary gets an empty prefix because Google returns the account email as its
- * summary — unusable as a label, and an address we should not be rendering.
- *
- * DELETED calendars are dropped: they are not things the user still has.
- *
- * HIDDEN calendars are NOT. "Hide from list" in Google Calendar is a display
- * preference — the user is still subscribed, and the calendar still holds the
- * tours that must knock a shift out. Dropping it here (combined with Google
- * omitting it entirely unless the request passes showHidden=true) meant a stored
- * REJECT role stopped being consulted the moment the user tidied their sidebar:
- * the calendar silently stopped blocking AND disappeared from the options page,
- * so the failure was both invisible and un-fixable.
- *
- * A hidden calendar is therefore kept whenever the user has given it a real
- * blocking-capable role (FLAG/REJECT/RULE), and flagged `hiddenInGoogle` so the
- * options page can label it rather than looking like it invented a calendar the
- * user cannot find. A hidden calendar with no stored role — or an explicit OFF —
- * is still dropped: it is nothing the user has spoken about, it is not blocking
- * anything, and accounts accumulate dozens of them.
- *
- * @param {object[]} items  calendarList items
- * @param {object} storedRoles  the calRoles map (may be undefined/sparse)
- * @returns {Array<{id:string, summary:string, primary:boolean, role:string,
- *                  prefix:string, accessRole:string, selected:boolean,
- *                  hiddenInGoogle:boolean}>}
- *          primary first, then case-insensitive alpha by display name
+ * @param {unknown} url
+ * @returns {string} e.g. "calendar.google.com/…", or "" when there is no URL
  */
-export function resolveRoles(items, storedRoles) {
-  const roles = storedRoles || {};
-  const out = (items || [])
-    .filter((it) => {
-      if (!it || it.deleted === true) return false;
-      if (it.hidden !== true) return true;
-      const stored = roles[it.id];
-      return ROLES.includes(stored) && stored !== "OFF";
-    })
-    .map((it) => {
-      const override = typeof it.summaryOverride === "string" ? it.summaryOverride.trim() : "";
-      const summary = override || it.summary || "";
-      const primary = it.primary === true;
-      const stored = roles[it.id];
+export function redactFeedUrl(url) {
+  const raw = typeof url === "string" ? url.trim() : "";
+  if (raw === "") return "";
+  try {
+    return new URL(raw.replace(/^webcal:\/\//i, "https://")).host + "/…";
+  } catch (_e) {
+    return "…";
+  }
+}
+
+/**
+ * Attach the effective role and label prefix to each stored feed. The roles map
+ * is sparse and may have been hand-edited, so an entry that is not a known role
+ * falls back to defaultRole.
+ *
+ * DISPLAY NAME: the user names a feed when they add it; an unnamed feed falls
+ * back to the calendar's own X-WR-CALNAME (captured at add time), then to a
+ * neutral placeholder. It is NEVER the raw URL — see redactFeedUrl.
+ *
+ * PREFIX is that same display name: it is what prefixes every note this feed
+ * produces. A per-feed short label (calLabelOverride) still wins over it
+ * downstream, exactly as it did for a Google calendar.
+ *
+ * Malformed entries (non-object, missing id) are dropped rather than repaired: a
+ * feed with no id cannot be keyed to a role or a block list anyway, so keeping it
+ * would render a row whose every control silently did nothing.
+ *
+ * @param {unknown} feeds  the stored feeds array (user data — any shape)
+ * @param {unknown} storedRoles  the calRoles map (may be undefined/sparse)
+ * @returns {Array<{id:string, name:string, kind:string, role:string,
+ *                  prefix:string, url:string, hasContent:boolean,
+ *                  calName:string, tz:string, syncedAt:number|null}>}
+ *          case-insensitive alpha by display name
+ */
+export function resolveFeedRoles(feeds, storedRoles) {
+  const roles = storedRoles && typeof storedRoles === "object" ? storedRoles : {};
+  const out = (Array.isArray(feeds) ? feeds : [])
+    .filter((f) => f && typeof f === "object" && typeof f.id === "string" && f.id !== "")
+    .map((f) => {
+      const calName = typeof f.calName === "string" ? f.calName.trim() : "";
+      const named = typeof f.name === "string" ? f.name.trim() : "";
+      const name = named || calName || "Untitled feed";
+      const stored = roles[f.id];
       return {
-        id: it.id,
-        summary,
-        primary,
-        role: ROLES.includes(stored) ? stored : defaultRole(it),
-        prefix: primary ? "" : summary,
-        accessRole: typeof it.accessRole === "string" ? it.accessRole : "",
-        selected: it.selected === true,
-        hiddenInGoogle: it.hidden === true,
+        id: f.id,
+        name,
+        kind: f.kind === "file" ? "file" : "url",
+        role: ROLES.includes(stored) ? stored : defaultRole(f),
+        prefix: name,
+        url: typeof f.url === "string" ? f.url : "",
+        // Carried so fetchFeedText can read a file feed's bytes. Both this and
+        // `url` are SECRETS: handleListFeeds maps them away before anything
+        // reaches the options page (see redactFeedUrl).
+        content: typeof f.content === "string" ? f.content : "",
+        hasContent: typeof f.content === "string" && f.content.trim() !== "",
+        calName,
+        tz: typeof f.tz === "string" ? f.tz : "",
+        syncedAt: typeof f.syncedAt === "number" ? f.syncedAt : null,
       };
     });
   out.sort((a, b) => {
-    if (a.primary !== b.primary) return a.primary ? -1 : 1;
-    const as = a.summary.toLowerCase();
-    const bs = b.summary.toLowerCase();
-    return as < bs ? -1 : as > bs ? 1 : 0;
+    const an = a.name.toLowerCase();
+    const bn = b.name.toLowerCase();
+    return an < bn ? -1 : an > bn ? 1 : 0;
   });
   return out;
 }
@@ -802,104 +831,11 @@ async function loadConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth (chrome.identity.getAuthToken)
+// ICS feeds — the calendar source. NO AUTH: a URL feed is a read-only secret
+// capability link the user pasted, a file feed is a snapshot they uploaded.
+// (This replaces the former chrome.identity OAuth + Google Calendar REST layer;
+// nothing below the seam changed, because both produce the same event shape.)
 // ---------------------------------------------------------------------------
-//
-// Primary flow: chrome.identity.getAuthToken. The manifest oauth2 block carries
-// the client_id (currently the placeholder "REPLACE_ME..." — a config error the
-// drawer surfaces as "oauth_config: <msg>") and the calendar.readonly scope.
-//
-// ALTERNATIVE FLOW (not implemented): for a Chrome profile that is not signed
-// into the Google account holding the user's calendars (see README.md's OAuth
-// runbook), the getAuthToken path is replaced by chrome.identity.launchWebAuthFlow
-// with a "Web application" OAuth client and redirect URI
-// https://<extension-id>.chromiumapp.org/, its client_id configured HERE in
-// sw.js. It would slot in as an alternate implementation of getToken() below.
-
-function getToken(interactive) {
-  return new Promise((resolve) => {
-    try {
-      chrome.identity.getAuthToken({ interactive }, (token) => {
-        const lastErr = chrome.runtime.lastError;
-        if (lastErr || !token) {
-          resolve({ token: null, error: lastErr ? lastErr.message : "no_token" });
-        } else {
-          resolve({ token, error: null });
-        }
-      });
-    } catch (e) {
-      resolve({ token: null, error: e && e.message ? e.message : String(e) });
-    }
-  });
-}
-
-function removeCachedToken(token) {
-  return new Promise((resolve) => {
-    try {
-      chrome.identity.removeCachedAuthToken({ token }, () => resolve());
-    } catch (_e) {
-      resolve();
-    }
-  });
-}
-
-// Chrome's lastError string is the only signal available, so distinguishing a
-// misconfigured OAuth client from a merely-not-yet-consented user is a
-// heuristic, not a contract: if the message names the client / credentials, we
-// treat it as a config error; otherwise interactive consent is what's needed.
-const CONFIG_HINTS = [
-  "client",
-  "invalid_client",
-  "bad client id",
-  "oauth2 not supported",
-  "custom uri scheme",
-  "unsupported",
-];
-function classifyAuthError(msg) {
-  const m = (msg || "").toLowerCase();
-  if (CONFIG_HINTS.some((h) => m.includes(h))) {
-    return { error: "oauth_config: " + msg };
-  }
-  return { error: "auth_required" };
-}
-
-// ---------------------------------------------------------------------------
-// Google Calendar REST (GET-only; 401 → refresh token once, then auth_expired)
-// ---------------------------------------------------------------------------
-
-/**
- * Fetch a Calendar API URL with the holder's bearer token. On 401, remove the
- * cached token and retry ONCE with a fresh non-interactive token (shared across
- * the whole refresh operation via holder.refreshed). A fresh token that still
- * 401s means the grant is genuinely expired → throws code "auth_expired".
- */
-async function authedFetch(url, holder) {
-  let resp = await fetch(url, { headers: { Authorization: "Bearer " + holder.token } });
-
-  if (resp.status === 401) {
-    if (holder.refreshed) {
-      throw taggedError("auth_expired", "auth_expired");
-    }
-    holder.refreshed = true;
-    await removeCachedToken(holder.token);
-    const fresh = await getToken(false);
-    if (!fresh.token) {
-      throw taggedError("auth_expired", "auth_expired");
-    }
-    holder.token = fresh.token;
-    resp = await fetch(url, { headers: { Authorization: "Bearer " + holder.token } });
-    if (resp.status === 401) {
-      throw taggedError("auth_expired", "auth_expired");
-    }
-  }
-
-  if (!resp.ok) {
-    const err = taggedError("http_error", "http_" + resp.status);
-    err.status = resp.status;
-    throw err;
-  }
-  return resp.json();
-}
 
 function taggedError(code, message) {
   const err = new Error(message);
@@ -907,55 +843,94 @@ function taggedError(code, message) {
   return err;
 }
 
-async function listCalendars(holder) {
-  const items = [];
-  let pageToken = "";
-  // accessRole: freeBusyReader calendars return titleless events — the picker
-  //   must be told, not left rendering blank rows.
-  // summaryOverride: the user's own rename of the calendar; preferred over
-  //   summary so they recognise it.
-  // selected: mirrors the checkbox in Google Calendar — an ordering signal.
-  // deleted/hidden: deleted calendars are dropped; hidden ones are KEPT when the
-  //   user has given them a blocking role (see resolveRoles).
-  const fields =
-    "items(id,summary,summaryOverride,primary,accessRole,selected,deleted,hidden),nextPageToken";
-  do {
-    // showHidden=true is REQUIRED, not an optimization. Without it Google omits
-    // every calendar the user has "Hide from list"-ed — which is a display
-    // preference, not an unsubscribe. A fire-department calendar set to REJECT
-    // and then hidden would vanish from this response, its stored role would
-    // never be consulted, and it would stop blocking without a word. It also
-    // disappeared from the options list, so the user could neither see the
-    // problem nor undo it. showDeleted stays OFF: a deleted calendar really is
-    // gone, and resolveRoles drops any that slip through anyway.
-    let url =
-      `${CAL_BASE}/users/me/calendarList?maxResults=250&showHidden=true` +
-      `&fields=${encodeURIComponent(fields)}`;
-    if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
-    const data = await authedFetch(url, holder);
-    if (Array.isArray(data.items)) items.push(...data.items);
-    pageToken = data.nextPageToken || "";
-  } while (pageToken);
-  return items;
+/**
+ * Normalize a user-supplied feed URL, or return "" when it is not a fetchable
+ * calendar URL.
+ *
+ * webcal:// is the scheme calendar apps hand out for subscriptions — it is
+ * ordinary https in transport, so it is rewritten rather than refused.
+ * Everything that is not http(s) AFTER that rewrite is refused: a feed URL is
+ * stored config that later reaches fetch(), and javascript:/data:/file: have no
+ * business there.
+ *
+ * @param {unknown} src
+ * @returns {string} a fetchable http(s) URL, or "" when unusable
+ */
+export function normalizeFeedUrl(src) {
+  const raw = typeof src === "string" ? src.trim() : "";
+  if (raw === "") return "";
+  const swapped = raw.replace(/^webcal:\/\//i, "https://");
+  let u;
+  try {
+    u = new URL(swapped);
+  } catch (_e) {
+    return "";
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "";
+  return u.href;
 }
 
-async function listEvents(holder, calId, timeMin, timeMax) {
-  const events = [];
-  let pageToken = "";
-  const base = `${CAL_BASE}/calendars/${encodeURIComponent(calId)}/events`;
-  const fields = "items(summary,start,end,status),nextPageToken";
-  do {
-    let url =
-      `${base}?singleEvents=true&maxResults=2500` +
-      `&timeMin=${encodeURIComponent(timeMin)}` +
-      `&timeMax=${encodeURIComponent(timeMax)}` +
-      `&fields=${encodeURIComponent(fields)}`;
-    if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
-    const data = await authedFetch(url, holder);
-    if (Array.isArray(data.items)) events.push(...data.items);
-    pageToken = data.nextPageToken || "";
-  } while (pageToken);
-  return events;
+/**
+ * A fresh per-feed config key. Every per-calendar map (calRoles, calBlockTitles,
+ * calNoteTitles, calTitleLabels, calBufferBefore/After, calEventBuffers) is keyed
+ * by this, so it is generated ONCE when the feed is added and then stored on the
+ * feed forever: deriving it from the URL instead would silently detach the whole
+ * configuration the moment a user re-pasted a rotated secret link.
+ */
+function newFeedId() {
+  return "feed_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
+}
+
+/**
+ * Read one feed's raw .ics text.
+ *
+ *   kind:"file" — the bytes the user uploaded, already in storage. No network
+ *     and no host permission, which also sidesteps CORS for providers that do
+ *     not expose a fetchable URL.
+ *   kind:"url"  — a plain GET with credentials omitted: the secret lives in the
+ *     URL itself, and that IS the entire auth model. Nothing is ever sent.
+ *
+ * Every failure throws a tagged error. Nothing here may answer "no events" for a
+ * feed that did not actually load: a blocking feed silently yielding zero events
+ * is precisely how a shift the user is already committed to would look free.
+ */
+async function fetchFeedText(feed) {
+  if (feed.kind === "file") {
+    if (typeof feed.content !== "string" || feed.content.trim() === "") {
+      throw taggedError("feed_empty", "no uploaded file content — re-upload the .ics");
+    }
+    return feed.content;
+  }
+  const url = normalizeFeedUrl(feed.url);
+  if (!url) throw taggedError("feed_bad_url", "not a usable https feed URL");
+  let resp;
+  try {
+    resp = await fetch(url, { credentials: "omit", redirect: "follow" });
+  } catch (e) {
+    throw taggedError("feed_unreachable", "unreachable: " + (e && e.message ? e.message : String(e)));
+  }
+  if (!resp.ok) throw taggedError("feed_http", "http_" + resp.status);
+  return resp.text();
+}
+
+/**
+ * One feed's events for [timeMin, timeMax) in the Google-shaped form
+ * buildTriplet consumes, plus the feed's own X-WR-CALNAME/X-WR-TIMEZONE and any
+ * per-event skip warnings the parser raised.
+ *
+ * parseIcs throws when the body is not iCalendar at all — an expired secret
+ * link or a captive portal answers with HTML, and that must read as a broken
+ * feed, never as a calendar with nothing on it.
+ *
+ * @returns {{events:object[], calName:string|null, tz:string|null, warnings:string[]}}
+ */
+async function getIcsEvents(feed, timeMin, timeMax) {
+  const text = await fetchFeedText(feed);
+  try {
+    return parseIcs(text, timeMin, timeMax);
+  } catch (e) {
+    throw taggedError("feed_unparseable", e && e.message ? e.message : String(e));
+  }
 }
 
 /**
@@ -1002,27 +977,36 @@ export function titleSampleWindow(start, end, nowMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh: token → calendarList → per-calendar events → triplet lists → cache
+// Refresh: stored feeds → per-feed .ics fetch + parse → triplet lists → cache
 // ---------------------------------------------------------------------------
 
-async function refreshCalendarData(windowStart, windowEnd, interactive) {
-  const tok = await getToken(interactive);
-  if (!tok.token) {
-    return { ok: false, ...classifyAuthError(tok.error) };
-  }
-  const holder = { token: tok.token, refreshed: false };
-
+/**
+ * Fetch every switched-on feed, bucket its events, and return the envelope the
+ * content script consumes: { ok, fetchedAt, commitments, soft, warnings }.
+ *
+ * FAILURE POLICY — the safety-critical decision in this file:
+ *
+ *   - A BLOCKING-CAPABLE feed (REJECT or RULE) that fails to load is FATAL: the
+ *     whole refresh returns ok:false and the drawer shows its error state, so no
+ *     scoring is presented at all. Deliberately blunt. If a feed that can hard-
+ *     reject shifts did not load, every shift on the board would otherwise
+ *     render as free — the single failure this extension exists to prevent. No
+ *     answer beats a confidently wrong one.
+ *   - A FLAG feed (notes only) that fails is NOT fatal. Notes are cosmetic;
+ *     losing them degrades annotation, never correctness. It records a loud
+ *     warning and scoring continues.
+ *   - An OFF feed is never fetched, so it can neither fail nor leak.
+ *
+ * Per-event parser warnings (an unsupported recurrence, an unresolvable
+ * timezone) are prefixed with the feed's name and passed through: those events
+ * were skipped, and the user has to be told which.
+ */
+async function refreshCalendarData(windowStart, windowEnd) {
   const cfg = await loadConfig();
   const warnings = [...cfg.warnings];
 
-  let calItems;
-  try {
-    calItems = await listCalendars(holder);
-  } catch (e) {
-    return errorResponse(e);
-  }
-
   const store = await chrome.storage.local.get([
+    FEEDS_KEY,
     ROLES_KEY,
     BLOCK_TITLES_KEY,
     NOTE_TITLES_KEY,
@@ -1032,7 +1016,7 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
     BUFFER_AFTER_KEY,
     EVENT_BUFFERS_KEY,
   ]);
-  const cals = resolveRoles(calItems, store[ROLES_KEY]);
+  const feeds = resolveFeedRoles(store[FEEDS_KEY], store[ROLES_KEY]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
   const noteTitles = store[NOTE_TITLES_KEY] || {};
   const titleLabels = store[TITLE_LABELS_KEY] || {};
@@ -1047,29 +1031,40 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
   const commitments = [];
   const soft = [];
   const regexRule = (title) => ruleMatches(title, cfg.includeRe, cfg.excludes);
+  const meta = {};
 
-  try {
-    for (const cal of cals) {
-      if (cal.role === "OFF") continue; // never fetched — no request is made at all
-      const evs = await listEvents(holder, cal.id, timeMin, timeMax);
-      // Ticked titles are per-calendar and are the whole blocking set. The
-      // legacy regex is consulted ONLY for a user who explicitly armed it.
-      const { rule, mode } = calendarRule(blockTitles[cal.id], regexRule, cfg.usePattern);
-      // A per-calendar short name, when set, replaces the calendar's display
-      // name as the prefix on every note from it.
-      const override = typeof labelOverride[cal.id] === "string" ? labelOverride[cal.id].trim() : "";
-      const prefix = override || cal.prefix;
-      const b = bucketEvents(evs, cal.role, rule, prefix, noteTitles[cal.id], titleLabels[cal.id], {
-        before: bufferBefore[cal.id],
-        after: bufferAfter[cal.id],
-        eventBuffers: eventBuffers[cal.id],
-      });
-      commitments.push(...b.commitments);
-      soft.push(...b.soft);
-      dlog("calendar events", cal.role, mode, evs.length);
+  for (const feed of feeds) {
+    if (feed.role === "OFF") continue; // never fetched — no request is made at all
+
+    let parsed;
+    try {
+      parsed = await getIcsEvents(feed, timeMin, timeMax);
+    } catch (e) {
+      const why = e && e.message ? e.message : String(e);
+      if (feed.role === "FLAG") {
+        warnings.push(`feed_unavailable: "${feed.name}" (${why}) — its notes are missing`);
+        continue;
+      }
+      return { ok: false, error: `feed_failed: "${feed.name}" — ${why}` };
     }
-  } catch (e) {
-    return errorResponse(e);
+
+    for (const w of parsed.warnings) warnings.push(`${feed.name}: ${w}`);
+    meta[feed.id] = { calName: parsed.calName || "", tz: parsed.tz || "", syncedAt: Date.now() };
+
+    // Ticked titles are per-feed and are the whole blocking set. The legacy
+    // regex is consulted ONLY for a user who explicitly armed it.
+    const { rule, mode } = calendarRule(blockTitles[feed.id], regexRule, cfg.usePattern);
+    // A per-feed short name, when set, replaces the feed's display name as the
+    // prefix on every note from it.
+    const override = typeof labelOverride[feed.id] === "string" ? labelOverride[feed.id].trim() : "";
+    const prefix = override || feed.prefix;
+    const b = bucketEvents(
+      parsed.events, feed.role, rule, prefix, noteTitles[feed.id], titleLabels[feed.id],
+      { before: bufferBefore[feed.id], after: bufferAfter[feed.id], eventBuffers: eventBuffers[feed.id] }
+    );
+    commitments.push(...b.commitments);
+    soft.push(...b.soft);
+    dlog("feed events", feed.role, mode, parsed.events.length);
   }
 
   // Sort each list by triplet start string (lexicographic == chronological here).
@@ -1081,14 +1076,38 @@ async function refreshCalendarData(windowStart, windowEnd, interactive) {
   await chrome.storage.local.set({
     [CACHE_KEY]: { fetchedAt, commitments, soft, windowStart, windowEnd },
   });
+  await recordFeedMeta(meta);
 
   dlog("refresh done", { commitments: commitments.length, soft: soft.length, warnings });
   return { ok: true, fromCache: false, fetchedAt, commitments, soft, warnings };
 }
 
+/**
+ * Persist what a successful fetch learned about each feed: the calendar's own
+ * name and timezone (UI defaults for a feed the user never named) and when it
+ * last synced (the "synced Nm ago" chip). Never touches a role or anything the
+ * user typed — a background refresh must not overwrite their own words.
+ */
+async function recordFeedMeta(meta) {
+  if (Object.keys(meta).length === 0) return;
+  const feeds = (await chrome.storage.local.get(FEEDS_KEY))[FEEDS_KEY];
+  if (!Array.isArray(feeds)) return;
+  let touched = false;
+  for (const f of feeds) {
+    const m = f && typeof f === "object" ? meta[f.id] : null;
+    if (!m) continue;
+    if (m.calName) f.calName = m.calName;
+    if (m.tz) f.tz = m.tz;
+    f.syncedAt = m.syncedAt;
+    touched = true;
+  }
+  if (touched) await chrome.storage.local.set({ [FEEDS_KEY]: feeds });
+}
+
+// A tagged feed error carries its own code; anything else is an unexpected
+// throw and is surfaced verbatim rather than smoothed over.
 function errorResponse(e) {
-  if (e && e.code === "auth_expired") return { ok: false, error: "auth_expired" };
-  if (e && e.code === "http_error") return { ok: false, error: e.message };
+  if (e && e.code) return { ok: false, error: e.code + ": " + (e.message || "") };
   return { ok: false, error: "fetch_failed: " + (e && e.message ? e.message : String(e)) };
 }
 
@@ -1124,33 +1143,29 @@ async function handleGetCalendarData(msg) {
     return { ok: false, error: "no_cache" };
   }
 
-  if (mode === "refresh") {
-    return refreshCalendarData(windowStart, windowEnd, false);
-  }
-  if (mode === "interactive") {
-    return refreshCalendarData(windowStart, windowEnd, true);
+  if (mode === "refresh" || mode === "interactive") {
+    // "interactive" was the OAuth consent path. With no auth there is nothing to
+    // prompt for, so it is simply a refresh — kept as an accepted mode so the
+    // content script's existing connect affordance keeps working unchanged.
+    return refreshCalendarData(windowStart, windowEnd);
   }
   return { ok: false, error: "bad_mode" };
 }
 
-// The panel shows the RAW stored regex strings, not loadConfig's compiled form:
-// when a stored regex is invalid, loadConfig silently falls back to the default
-// but the user still needs to see the broken value in order to fix it.
-async function handleListCalendars(msg) {
-  const tok = await getToken(msg.interactive);
-  if (!tok.token) {
-    return { ok: false, ...classifyAuthError(tok.error) };
-  }
-  const holder = { token: tok.token, refreshed: false };
-
-  let calItems;
-  try {
-    calItems = await listCalendars(holder);
-  } catch (e) {
-    return errorResponse(e);
-  }
-
+/**
+ * The options page's view of the configured feeds.
+ *
+ * The panel shows the RAW stored regex strings, not loadConfig's compiled form:
+ * when a stored regex is invalid loadConfig silently falls back to the default,
+ * but the user still needs to see the broken value in order to fix it.
+ *
+ * NO feed URL is returned — only redactFeedUrl's host form. A subscription URL
+ * is the credential, and the panel never needs the secret to render a row, only
+ * to have added it in the first place.
+ */
+async function handleListFeeds() {
   const store = await chrome.storage.local.get([
+    FEEDS_KEY,
     ROLES_KEY,
     BLOCK_TITLES_KEY,
     PATTERN_OPT_IN_KEY,
@@ -1162,28 +1177,31 @@ async function handleListCalendars(msg) {
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
   const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
   const bufferAfter = store[BUFFER_AFTER_KEY] || {};
-  const calendars = resolveRoles(calItems, store[ROLES_KEY]).map((c) => ({
-    id: c.id,
-    summary: c.summary,
-    primary: c.primary,
-    role: c.role,
-    // accessRole lets the panel warn instead of rendering a titleless picker;
-    // blockTitles lets it show what is already ticked without a second round trip.
-    accessRole: c.accessRole,
-    selected: c.selected,
-    // Hidden in Google Calendar but still configured here — the panel must say
-    // so, or it looks like it conjured up a calendar the user cannot find.
-    hiddenInGoogle: c.hiddenInGoogle,
-    blockTitles: Array.isArray(blockTitles[c.id]) ? blockTitles[c.id] : [],
-    // Default rest-buffer hours for this calendar's blocking events (0 when
+  const feeds = resolveFeedRoles(store[FEEDS_KEY], store[ROLES_KEY]).map((f) => ({
+    id: f.id,
+    name: f.name,
+    kind: f.kind,
+    role: f.role,
+    // The host only — never the secret capability URL.
+    source: f.kind === "file" ? "uploaded file" : redactFeedUrl(f.url),
+    // A file feed is a static snapshot; the panel says so rather than showing a
+    // "synced Nm ago" chip that would imply it refreshes itself.
+    syncedAt: f.syncedAt,
+    hasContent: f.hasContent,
+    calName: f.calName,
+    tz: f.tz,
+    // blockTitles lets the picker show what is already ticked without a second
+    // round trip.
+    blockTitles: Array.isArray(blockTitles[f.id]) ? blockTitles[f.id] : [],
+    // Default rest-buffer hours for this feed's blocking events (0 when
     // unconfigured) — see BUFFER_BEFORE_KEY/BUFFER_AFTER_KEY.
-    bufferBefore: typeof bufferBefore[c.id] === "number" ? bufferBefore[c.id] : 0,
-    bufferAfter: typeof bufferAfter[c.id] === "number" ? bufferAfter[c.id] : 0,
+    bufferBefore: typeof bufferBefore[f.id] === "number" ? bufferBefore[f.id] : 0,
+    bufferAfter: typeof bufferAfter[f.id] === "number" ? bufferAfter[f.id] : 0,
   }));
 
   return {
     ok: true,
-    calendars,
+    feeds,
     ruleFilter: {
       include: typeof store.ruleInclude === "string" ? store.ruleInclude : DEFAULTS.ruleInclude,
       exclude: typeof store.ruleExclude === "string" ? store.ruleExclude : DEFAULTS.ruleExclude,
@@ -1194,16 +1212,35 @@ async function handleListCalendars(msg) {
   };
 }
 
-// Both mutators REMOVE the cache rather than leaving it for the next refresh to
+/**
+ * The id of the feed a config message is about.
+ *
+ * `calendarId` is accepted as an alias for `feedId`: every per-calendar map in
+ * this worker is keyed by an opaque id string, and when the source moved from
+ * Google calendars to .ics feeds only the ORIGIN of that string changed, never
+ * its role. Accepting both keeps one vocabulary at the wire without forcing a
+ * flag-day rename on callers.
+ *
+ * @param {unknown} msg
+ * @returns {string} the id, or "" when absent/not a string
+ */
+function msgFeedId(msg) {
+  const m = msg && typeof msg === "object" ? msg : {};
+  const id = typeof m.feedId === "string" ? m.feedId : m.calendarId;
+  return typeof id === "string" ? id : "";
+}
+
+// Every mutator REMOVES the cache rather than leaving it for the next refresh to
 // overwrite: if that refresh fails, a stale cache bucketed under the old roles
 // would be served as authoritative on the next boot, silently applying rejects
 // the user just turned off. Removal surfaces the failure as no_cache instead.
-async function handleSetCalendarRole(msg) {
-  if (!msg.calendarId || !ROLES.includes(msg.role)) {
+async function handleSetFeedRole(msg) {
+  const feedId = msgFeedId(msg);
+  if (!feedId || !ROLES.includes(msg.role)) {
     return { ok: false, error: "bad_role" };
   }
   const roles = (await chrome.storage.local.get(ROLES_KEY))[ROLES_KEY] || {};
-  roles[msg.calendarId] = msg.role;
+  roles[feedId] = msg.role;
   await chrome.storage.local.set({ [ROLES_KEY]: roles });
   await chrome.storage.local.remove(CACHE_KEY);
   return { ok: true };
@@ -1229,11 +1266,11 @@ function coerceBufferHours(v) {
  * setEventRules.
  *
  * -> { type:"setCalendarBuffer", calendarId, before:number, after:number }
- * <- { ok:true } | { ok:false, error:"bad_calendar_id"|"bad_buffer" }
+ * <- { ok:true } | { ok:false, error:"bad_feed_id"|"bad_buffer" }
  */
 async function handleSetCalendarBuffer(msg) {
-  const calendarId = msg && msg.calendarId;
-  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  const calendarId = msgFeedId(msg);
+  if (!calendarId) return { ok: false, error: "bad_feed_id" };
 
   const before = coerceBufferHours(msg && msg.before);
   const after = coerceBufferHours(msg && msg.after);
@@ -1279,46 +1316,33 @@ async function handleSetRuleFilter(msg) {
 }
 
 /**
- * List ONE calendar's distinct event titles, so the user can tick the ones that
- * mean "I am unavailable" instead of writing a regex.
+ * List ONE feed's distinct event titles, so the user can tick the ones that mean
+ * "I am unavailable" instead of writing a regex.
  *
- * -> { type:"listCalendarTitles", calendarId[, windowStart, windowEnd] }
- * <- { ok:true, titles:[{title,count,typicalMinutes}], accessRole, blockTitles }
- * <- { ok:false, error }   error:"calendar_off" when the calendar is not
- *                          switched on — this handler reads events, so it is
- *                          gated on the same stored role everything else is.
+ * -> { type:"listFeedTitles", feedId[, windowStart, windowEnd] }
+ * <- { ok:true, titles:[{title,count,typicalMinutes}], warnings, blockTitles, … }
+ * <- { ok:false, error }   error:"feed_off" when the feed is not switched on —
+ *                          this handler reads events, so it is gated on the same
+ *                          stored role everything else is.
  *
  * windowStart/windowEnd are the same NY date strings getCalendarData takes. A
  * caller that has a scored window (the drawer) should pass it so the picker
  * samples exactly what will be scored; the options page has no window of its
  * own, so omitting them falls back to a sampling window around today. The
  * fallback is only ever used to POPULATE A LIST OF TITLES — it never decides
- * whether a shift is blocked, so a wider-than-scored sample costs nothing but
- * an extra row in the picker.
+ * whether a shift is blocked, so a wider-than-scored sample costs nothing but an
+ * extra row in the picker.
  *
- * blockTitles echoes back what is currently ticked for this calendar, so the
- * picker can render its checkboxes without a second round trip.
- *
- * A freeBusyReader calendar returns events with no summary at all, so there is
- * nothing to pick. We return an EMPTY list plus the accessRole and let the UI
- * explain that, rather than rendering rows of blanks that look like a bug.
+ * blockTitles — and the rest of the three-way state — echo back what is stored
+ * for this feed, so the picker renders without a second round trip.
  */
-async function handleListCalendarTitles(msg) {
-  const calendarId = msg && msg.calendarId;
-  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+async function handleListFeedTitles(msg) {
+  const feedId = msg && msg.feedId;
+  if (!feedId) return { ok: false, error: "bad_feed_id" };
   const win = titleSampleWindow(msg.windowStart, msg.windowEnd);
 
-  const tok = await getToken(false);
-  if (!tok.token) return { ok: false, ...classifyAuthError(tok.error) };
-  const holder = { token: tok.token, refreshed: false };
-
-  let calItems;
-  try {
-    calItems = await listCalendars(holder);
-  } catch (e) {
-    return errorResponse(e);
-  }
   const stored = await chrome.storage.local.get([
+    FEEDS_KEY,
     ROLES_KEY,
     BLOCK_TITLES_KEY,
     NOTE_TITLES_KEY,
@@ -1326,74 +1350,59 @@ async function handleListCalendarTitles(msg) {
     LABEL_OVERRIDE_KEY,
     EVENT_BUFFERS_KEY,
   ]);
-  const cal = resolveRoles(calItems, stored[ROLES_KEY]).find((c) => c.id === calendarId);
-  if (!cal) return { ok: false, error: "unknown_calendar" };
+  const feed = resolveFeedRoles(stored[FEEDS_KEY], stored[ROLES_KEY]).find((f) => f.id === feedId);
+  if (!feed) return { ok: false, error: "unknown_feed" };
 
-  // THE ROLE GATE. PRIVACY.md promises the extension reads only "the calendars
-  // you've configured it to read", and this worker has to enforce that itself
-  // rather than trusting whoever sent the message: it previously resolved roles
-  // against an EMPTY map and then fetched whatever calendarId it was handed, so
-  // one stray message would have read an OFF calendar's event titles.
+  // THE ROLE GATE. PRIVACY.md promises the extension reads only the feeds the
+  // user configured it to read, and this worker enforces that itself rather than
+  // trusting whoever sent the message — otherwise one stray message would read an
+  // OFF feed's event titles.
   //
-  // No deadlock for the legitimate caller: the options page awaits
-  // setCalendarRole (which persists FLAG) BEFORE it asks for titles, so by the
-  // time this runs the calendar the user just switched on is already non-OFF.
-  if (cal.role === "OFF") return { ok: false, error: "calendar_off" };
+  // No deadlock for the legitimate caller: the options page awaits setFeedRole
+  // (which persists a non-OFF role) BEFORE it asks for titles, so by the time
+  // this runs the feed the user just switched on is already non-OFF.
+  if (feed.role === "OFF") return { ok: false, error: "feed_off" };
 
-  // Echo back the FULL persisted three-way state for this calendar, so the
-  // picker restores every Block/Note/label — including titles whose events fall
-  // outside the sampling window and so never appear as rows. The picker seeds
-  // its authoritative sets from these and re-sends them whole, which is what
-  // keeps an off-sample block title from being silently dropped on the next
-  // save (that would weaken blocking — see options.js).
-  const blockTitles = Array.isArray((stored[BLOCK_TITLES_KEY] || {})[calendarId])
-    ? stored[BLOCK_TITLES_KEY][calendarId]
+  // Echo back the FULL persisted three-way state for this feed, so the picker
+  // restores every Block/Note/label — including titles whose events fall outside
+  // the sampling window and so never appear as rows. The picker seeds its
+  // authoritative sets from these and re-sends them whole, which is what keeps an
+  // off-sample block title from being silently dropped on the next save (that
+  // would weaken blocking — see options.js).
+  const blockTitles = Array.isArray((stored[BLOCK_TITLES_KEY] || {})[feedId])
+    ? stored[BLOCK_TITLES_KEY][feedId]
     : [];
-  const noteTitles = Array.isArray((stored[NOTE_TITLES_KEY] || {})[calendarId])
-    ? stored[NOTE_TITLES_KEY][calendarId]
+  const noteTitles = Array.isArray((stored[NOTE_TITLES_KEY] || {})[feedId])
+    ? stored[NOTE_TITLES_KEY][feedId]
     : [];
-  const rawLabels = (stored[TITLE_LABELS_KEY] || {})[calendarId];
+  const rawLabels = (stored[TITLE_LABELS_KEY] || {})[feedId];
   const titleLabels = rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)
     ? rawLabels
     : {};
-  const calLabel = typeof (stored[LABEL_OVERRIDE_KEY] || {})[calendarId] === "string"
-    ? stored[LABEL_OVERRIDE_KEY][calendarId]
+  const calLabel = typeof (stored[LABEL_OVERRIDE_KEY] || {})[feedId] === "string"
+    ? stored[LABEL_OVERRIDE_KEY][feedId]
     : "";
-  const rawEventBuffers = (stored[EVENT_BUFFERS_KEY] || {})[calendarId];
+  const rawEventBuffers = (stored[EVENT_BUFFERS_KEY] || {})[feedId];
   const eventBuffers =
     rawEventBuffers && typeof rawEventBuffers === "object" && !Array.isArray(rawEventBuffers)
       ? rawEventBuffers
       : {};
 
-  // A freeBusyReader grant returns events with no summary at all. Return the
-  // empty list and the accessRole so the UI can say why, instead of drawing
-  // rows of blanks that read as a broken picker.
-  if (cal.accessRole === "freeBusyReader") {
-    return {
-      ok: true,
-      titles: [],
-      accessRole: cal.accessRole,
-      blockTitles,
-      noteTitles,
-      titleLabels,
-      calLabel,
-      eventBuffers,
-    };
-  }
-
   try {
-    const evs = await listEvents(
-      holder,
-      calendarId,
+    const parsed = await getIcsEvents(
+      feed,
       nyMidnightRfc3339(win.start, 0),
       nyMidnightRfc3339(win.end, 1) // +1 day: exclusive upper bound
     );
-    const titles = summarizeTitles(evs);
-    dlog("listCalendarTitles", evs.length, titles.length);
+    const titles = summarizeTitles(parsed.events);
+    dlog("listFeedTitles", parsed.events.length, titles.length);
     return {
       ok: true,
       titles,
-      accessRole: cal.accessRole,
+      // Per-event skips surface HERE too: a title the parser could not expand is
+      // a title the user cannot tick, and they must be told rather than left
+      // wondering why a known commitment never appears in the picker.
+      warnings: parsed.warnings,
       blockTitles,
       noteTitles,
       titleLabels,
@@ -1417,8 +1426,8 @@ async function handleListCalendarTitles(msg) {
  * under the old titles would keep applying blocks the user just removed.
  */
 async function handleSetBlockTitles(msg) {
-  const calendarId = msg && msg.calendarId;
-  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  const calendarId = msgFeedId(msg);
+  if (!calendarId) return { ok: false, error: "bad_feed_id" };
   if (!Array.isArray(msg.titles)) return { ok: false, error: "bad_titles" };
 
   const titles = [];
@@ -1479,8 +1488,8 @@ function cleanTitleArray(arr) {
  * changed.
  */
 async function handleSetEventRules(msg) {
-  const calendarId = msg && msg.calendarId;
-  if (!calendarId) return { ok: false, error: "bad_calendar_id" };
+  const calendarId = msgFeedId(msg);
+  if (!calendarId) return { ok: false, error: "bad_feed_id" };
   if (!Array.isArray(msg.block)) return { ok: false, error: "bad_block" };
   if (!Array.isArray(msg.note)) return { ok: false, error: "bad_note" };
   if (!msg.labels || typeof msg.labels !== "object" || Array.isArray(msg.labels)) {
@@ -1550,6 +1559,162 @@ async function handleSetEventRules(msg) {
   return { ok: true };
 }
 
+// ---------------------------------------------------------------------------
+// Feed management (add / remove / re-upload)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a candidate feed by ACTUALLY READING IT, over a sampling window
+ * around today, and report back what the calendar calls itself.
+ *
+ * Adding is the one moment the user is looking straight at the field they just
+ * filled in, so it is the right place to fail: a link that 404s, that needs a
+ * host permission they declined, or that answers with a login page is refused
+ * HERE. The alternative — storing it and discovering the problem at the next
+ * refresh — surfaces as a board that simply looks empty.
+ */
+async function probeFeed(feed) {
+  const win = titleSampleWindow();
+  try {
+    const parsed = await getIcsEvents(
+      feed,
+      nyMidnightRfc3339(win.start, 0),
+      nyMidnightRfc3339(win.end, 1) // +1 day: exclusive upper bound
+    );
+    return { ok: true, calName: parsed.calName || "", tz: parsed.tz || "" };
+  } catch (e) {
+    return errorResponse(e);
+  }
+}
+
+// The user's own name for a feed wins; an unnamed feed falls back to what the
+// calendar calls itself (X-WR-CALNAME), then to a neutral placeholder. Never the
+// URL — that is the credential.
+function cleanFeedName(name, calName) {
+  const n = typeof name === "string" ? name.trim() : "";
+  if (n) return n;
+  const c = typeof calName === "string" ? calName.trim() : "";
+  return c || "Untitled feed";
+}
+
+async function storeNewFeed(feed, role) {
+  const store = await chrome.storage.local.get([FEEDS_KEY, ROLES_KEY]);
+  const feeds = Array.isArray(store[FEEDS_KEY]) ? store[FEEDS_KEY] : [];
+  const roles = store[ROLES_KEY] || {};
+  const id = newFeedId();
+  feeds.push({ id, addedAt: Date.now(), syncedAt: Date.now(), ...feed });
+  roles[id] = role;
+  await chrome.storage.local.set({ [FEEDS_KEY]: feeds, [ROLES_KEY]: roles });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true, feedId: id };
+}
+
+/**
+ * Add a subscription-URL feed.
+ *
+ * The host permission for the URL's origin must already have been granted —
+ * chrome.permissions.request() only works from a user gesture in the options
+ * page, so the panel asks first and then sends this. A declined permission shows
+ * up here as an ordinary unreachable-feed error, which is exactly right: either
+ * way we cannot read it, and either way the user must be told.
+ *
+ * -> { type:"addFeedUrl", url, name, role }
+ * <- { ok:true, feedId } | { ok:false, error }
+ */
+async function handleAddFeedUrl(msg) {
+  const url = normalizeFeedUrl(msg && msg.url);
+  if (!url) return { ok: false, error: "bad_url" };
+  const role = ROLES.includes(msg && msg.role) ? msg.role : defaultRole(null);
+  const probe = await probeFeed({ kind: "url", url });
+  if (!probe.ok) return probe;
+  return storeNewFeed(
+    { kind: "url", url, name: cleanFeedName(msg && msg.name, probe.calName), calName: probe.calName, tz: probe.tz },
+    role
+  );
+}
+
+/**
+ * Add a feed from .ics text the options page read off the user's disk. No
+ * network and no host permission at all: the bytes are already in hand, which is
+ * also how a provider that refuses cross-origin reads can still be used.
+ *
+ * -> { type:"addFeedFile", content, name, role }
+ * <- { ok:true, feedId } | { ok:false, error }
+ */
+async function handleAddFeedFile(msg) {
+  const content = typeof (msg && msg.content) === "string" ? msg.content : "";
+  if (content.trim() === "") return { ok: false, error: "empty_file" };
+  const role = ROLES.includes(msg && msg.role) ? msg.role : defaultRole(null);
+  const probe = await probeFeed({ kind: "file", content });
+  if (!probe.ok) return probe;
+  return storeNewFeed(
+    { kind: "file", content, name: cleanFeedName(msg && msg.name, probe.calName), calName: probe.calName, tz: probe.tz },
+    role
+  );
+}
+
+// Every per-feed map, so removal can clear all of them in one pass.
+const PER_FEED_KEYS = [
+  ROLES_KEY, BLOCK_TITLES_KEY, NOTE_TITLES_KEY, TITLE_LABELS_KEY,
+  LABEL_OVERRIDE_KEY, BUFFER_BEFORE_KEY, BUFFER_AFTER_KEY, EVENT_BUFFERS_KEY,
+];
+
+/**
+ * Remove a feed and EVERY per-feed key that referenced it. Leaving the config
+ * behind would accumulate orphaned block lists, labels and buffers that no UI
+ * can reach and no user can audit — and a stored REJECT role for a feed that no
+ * longer exists is exactly the kind of invisible state this codebase avoids.
+ *
+ * -> { type:"removeFeed", feedId }
+ */
+async function handleRemoveFeed(msg) {
+  const feedId = msgFeedId(msg);
+  if (!feedId) return { ok: false, error: "bad_feed_id" };
+  const store = await chrome.storage.local.get([FEEDS_KEY, ...PER_FEED_KEYS]);
+  const write = {
+    [FEEDS_KEY]: (Array.isArray(store[FEEDS_KEY]) ? store[FEEDS_KEY] : []).filter(
+      (f) => !(f && f.id === feedId)
+    ),
+  };
+  for (const key of PER_FEED_KEYS) {
+    const map = store[key];
+    if (map && typeof map === "object" && !Array.isArray(map) && feedId in map) {
+      delete map[feedId];
+      write[key] = map;
+    }
+  }
+  await chrome.storage.local.set(write);
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
+/**
+ * Replace a file feed's stored snapshot with freshly uploaded text. A file feed
+ * is static by definition, so this is the only way it ever changes — the panel
+ * labels it that way rather than showing a sync age that would imply otherwise.
+ *
+ * -> { type:"reuploadFile", feedId, content }
+ */
+async function handleReuploadFile(msg) {
+  const feedId = msgFeedId(msg);
+  const content = typeof (msg && msg.content) === "string" ? msg.content : "";
+  if (!feedId) return { ok: false, error: "bad_feed_id" };
+  if (content.trim() === "") return { ok: false, error: "empty_file" };
+  const probe = await probeFeed({ kind: "file", content });
+  if (!probe.ok) return probe;
+
+  const feeds = (await chrome.storage.local.get(FEEDS_KEY))[FEEDS_KEY];
+  const feed = Array.isArray(feeds) ? feeds.find((f) => f && f.id === feedId) : null;
+  if (!feed) return { ok: false, error: "unknown_feed" };
+  feed.content = content;
+  if (probe.calName) feed.calName = probe.calName;
+  if (probe.tz) feed.tz = probe.tz;
+  feed.syncedAt = Date.now();
+  await chrome.storage.local.set({ [FEEDS_KEY]: feeds });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
 /**
  * Open the extension's own options page.
  *
@@ -1568,15 +1733,23 @@ async function handleOpenOptions() {
 }
 
 const HANDLERS = {
+  // The content script's contract — unchanged by the source swap.
   getCalendarData: handleGetCalendarData,
-  listCalendars: handleListCalendars,
-  listCalendarTitles: handleListCalendarTitles,
-  setCalendarRole: handleSetCalendarRole,
+  openOptions: handleOpenOptions,
+  // Feed management (options page).
+  listFeeds: handleListFeeds,
+  listFeedTitles: handleListFeedTitles,
+  addFeedUrl: handleAddFeedUrl,
+  addFeedFile: handleAddFeedFile,
+  removeFeed: handleRemoveFeed,
+  reuploadFile: handleReuploadFile,
+  // Per-feed configuration (keyed by feed id; see msgFeedId).
+  setFeedRole: handleSetFeedRole,
+  setCalendarRole: handleSetFeedRole, // compatibility alias — same handler
   setCalendarBuffer: handleSetCalendarBuffer,
   setBlockTitles: handleSetBlockTitles,
   setEventRules: handleSetEventRules,
   setRuleFilter: handleSetRuleFilter,
-  openOptions: handleOpenOptions,
 };
 
 function onMessage(msg, _sender, sendResponse) {

@@ -2,17 +2,11 @@
   "manifest_version": 3,
   "name": "Medic Tradeboard",
   "version": "0.1.0",
-  "description": "Read-only overlay for a WhenToWork tradeboard that scores each open shift against your own Google Calendar.",
+  "description": "Read-only overlay for a WhenToWork tradeboard that scores each open shift against calendar feeds you subscribe.",
   "minimum_chrome_version": "116",
-  "permissions": ["identity", "storage"],
-  "host_permissions": [
-    "https://*.whentowork.com/*",
-    "https://www.googleapis.com/*"
-  ],
-  "oauth2": {
-    "client_id": "704758498783-462u6and9ru92qr7r9jdbmb0gtgnmmmm.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/calendar.readonly"]
-  },
+  "permissions": ["storage"],
+  "host_permissions": ["https://*.whentowork.com/*"],
+  "optional_host_permissions": ["https://*/*"],
   "background": { "service_worker": "sw.js", "type": "module" },
   "content_scripts": [
     {
