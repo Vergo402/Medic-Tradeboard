@@ -1161,7 +1161,7 @@ test("titlesToMatcher: junk entries inside a real ticked set are discarded, not 
 // ---------------------------------------------------------------------------
 // normalizeTitleWhitespace + non-ASCII whitespace in titles
 //
-// iCal/Outlook feed exports routinely write the separator with a NO-BREAK SPACE.
+// Real-world feed exports routinely write the separator with a NO-BREAK SPACE.
 // Before this, such a title never stemmed — titleStem handed back the whole
 // string — so the ticked title stopped matching its own siblings and the shift
 // was offered as free while the user was on a tour. The failure was asymmetric

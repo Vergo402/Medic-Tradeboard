@@ -17,9 +17,9 @@
  *
  * THE SOURCE IS SUBSCRIBED iCal FEEDS — there is no sign-in anywhere in this
  * extension. A feed is either an .ics URL the user pasted (a read-only secret
- * capability link: Google's "secret address", an iCloud/webcal link, a
- * department feed) or an .ics file they uploaded. core/ics.js parses either into
- * the same event shape, so everything below buildTriplet is unchanged.
+ * capability link: a provider's secret/subscription URL) or an .ics file they
+ * uploaded. core/ics.js parses either into the same event shape, so everything
+ * below buildTriplet is unchanged.
  *
  * Feed identity is per-user config, never code. Every feed carries one of four
  * roles — OFF | FLAG | REJECT | RULE — chosen by the user and stored sparsely
@@ -67,11 +67,11 @@ import { parseIcs } from "./core/ics.js";
 //   feeds = [{ id, kind:"url"|"file", url?, content?, name, addedAt,
 //              calName?, tz?, syncedAt? }]
 //
-// A feed's ROLE and every per-feed picker map key on the feed's `id`, exactly as
-// they keyed on a Google calendar id before: the config layer below is RE-KEYED,
-// not rebuilt, so calRoles / calBlockTitles / calNoteTitles / calTitleLabels /
-// calBufferBefore / calBufferAfter / calEventBuffers all keep working unchanged
-// (and core/blocks.js's anyoneBlocks keeps reading calRoles as it always has).
+// A feed's ROLE and every per-feed picker map key on the feed's `id`, keyed the
+// same way they used to be: the config layer below is RE-KEYED, not rebuilt, so
+// calRoles / calBlockTitles / calNoteTitles / calTitleLabels / calBufferBefore /
+// calBufferAfter / calEventBuffers all keep working unchanged (and core/blocks.js's
+// anyoneBlocks keeps reading calRoles as it always has).
 const FEEDS_KEY = "feeds";
 
 // Starting point for the RULE role's regex. Both values are placeholders the
@@ -214,16 +214,16 @@ function fmtCivil(c) {
 }
 
 /**
- * Convert a Google Calendar event to a [start, end] triplet pair in NY-local
+ * Convert a normalized event to a [start, end] triplet pair in NY-local
  * "YYYY-MM-DD HH:MM" form, or null if it carries no usable start.
  *
  * Timed events (start.dateTime): the instant is normalized to NY civil time via
  * nytime civilFromEpoch(ms/1000), so any foreign-timezone event lands on NY
  * wall time — the scorer's expected frame.
  *
- * All-day events (start.date / end.date): Google's all-day end.date is ALREADY
+ * All-day events (start.date / end.date): the all-day end.date is ALREADY
  * the exclusive next day, so we DO NOT add a day — the pair already reads as
- * "00:00 → next-day 00:00", the same all-day convention the scorer expects.
+ * "00:00 → next-day 00:00", the all-day convention the scorer expects.
  *
  * @param {object} event
  * @returns {[string,string]|null}
@@ -285,8 +285,8 @@ const SPACE_LIKE_RE = /[\t\n\v\f\r\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g
 /**
  * Fold a title's exotic whitespace to plain ASCII spaces.
  *
- * WHY THIS EXISTS. iCal and Outlook feed exports routinely emit a NO-BREAK
- * SPACE around the dash in a title, so what the user reads as "ACME - Desk" is
+ * WHY THIS EXISTS. Real-world feed exports routinely emit a NO-BREAK SPACE
+ * around the dash in a title, so what the user reads as "ACME - Desk" is
  * really "ACME\u00A0-\u00A0Desk". Matched literally, that title never stems:
  * titleStem hands back the whole string, so the ticked title stops matching its
  * own siblings ("ACME - Night Tour") and the shift is offered as free while the
@@ -441,14 +441,14 @@ export function defaultRole(_feed) {
 /**
  * Redact a feed URL down to something safe to render.
  *
- * A subscription URL IS the credential — Google's "secret address" and an
- * Aladtec sync link both carry a token that grants read access to the whole
- * calendar forever. The options page therefore shows the host and nothing else;
- * the full value stays in chrome.storage.local, never on screen, never in a
- * screenshot, never in a support paste.
+ * A subscription URL IS the credential — a provider's secret/subscription URL
+ * carries a token that grants read access to the whole calendar forever. The
+ * options page therefore shows the host and nothing else; the full value stays
+ * in chrome.storage.local, never on screen, never in a screenshot, never in a
+ * support paste.
  *
  * @param {unknown} url
- * @returns {string} e.g. "calendar.google.com/…", or "" when there is no URL
+ * @returns {string} e.g. "calendar.example.com/…", or "" when there is no URL
  */
 export function redactFeedUrl(url) {
   const raw = typeof url === "string" ? url.trim() : "";
@@ -471,7 +471,7 @@ export function redactFeedUrl(url) {
  *
  * PREFIX is that same display name: it is what prefixes every note this feed
  * produces. A per-feed short label (calLabelOverride) still wins over it
- * downstream, exactly as it did for a Google calendar.
+ * downstream, as it has always done.
  *
  * Malformed entries (non-object, missing id) are dropped rather than repaired: a
  * feed with no id cannot be keyed to a role or a block list anyway, so keeping it
@@ -857,8 +857,8 @@ async function loadConfig() {
 // ---------------------------------------------------------------------------
 // ICS feeds — the calendar source. NO AUTH: a URL feed is a read-only secret
 // capability link the user pasted, a file feed is a snapshot they uploaded.
-// (This replaces the former chrome.identity OAuth + Google Calendar REST layer;
-// nothing below the seam changed, because both produce the same event shape.)
+// (This consumes .ics feeds directly; nothing below the seam changed, because
+// both sources produce the same normalized event shape.)
 // ---------------------------------------------------------------------------
 
 function taggedError(code, message) {
@@ -938,7 +938,7 @@ async function fetchFeedText(feed) {
 }
 
 /**
- * One feed's events for [timeMin, timeMax) in the Google-shaped form
+ * One feed's events for [timeMin, timeMax) in the normalized form
  * buildTriplet consumes, plus the feed's own X-WR-CALNAME/X-WR-TIMEZONE and any
  * per-event skip warnings the parser raised.
  *
@@ -1301,10 +1301,9 @@ async function handleListFeeds() {
  * The id of the feed a config message is about.
  *
  * `calendarId` is accepted as an alias for `feedId`: every per-calendar map in
- * this worker is keyed by an opaque id string, and when the source moved from
- * Google calendars to .ics feeds only the ORIGIN of that string changed, never
- * its role. Accepting both keeps one vocabulary at the wire without forcing a
- * flag-day rename on callers.
+ * this worker is keyed by an opaque id string, and when the source changed
+ * to .ics feeds only the ID's ORIGIN changed, never its role. Accepting both
+ * keeps one vocabulary at the wire without forcing a flag-day rename on callers.
  *
  * @param {unknown} msg
  * @returns {string} the id, or "" when absent/not a string

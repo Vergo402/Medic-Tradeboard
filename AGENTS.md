@@ -45,9 +45,9 @@ rules before adding any file.
     sw.js       service worker: owns feed fetching, config, and the message API
     test/       node:test suites + the offline drawer harness
 
-`core/ics.js` is the RFC 5545 parser — the safety-critical piece: it emits the same event
-shape the old Google REST path did, so everything below `buildTriplet` is untouched. Only
-`sw.js` fetches. The drawer receives everything through `state` and must never read
+`core/ics.js` is the RFC 5545 parser — the safety-critical piece: it emits the
+normalized event shape, so everything below `buildTriplet` is untouched. Only `sw.js`
+fetches. The drawer receives everything through `state` and must never read
 `chrome.storage` directly.
 
 ## Commands

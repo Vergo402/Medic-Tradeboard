@@ -41,7 +41,7 @@
  *       feeds:[{ id, name, kind:"url"|"file", role, source, syncedAt,
  *                blockTitles, blockLabel, bufferBefore, bufferAfter }],
  *       ruleFilter:{ include, exclude, usePattern } }
- *     source: the feed's HOST only ("calendar.google.com/…") or "uploaded file".
+ *     source: the feed's HOST only ("calendar.example.com/…") or "uploaded file".
  *     syncedAt: last successful read (ms), or null. A file feed is static, so
  *       the row says so instead of implying it refreshes itself.
  *     usePattern: whether the advanced regex hatch is actually armed.

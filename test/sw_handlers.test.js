@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 // ---------------------------------------------------------------------------
 
 let STORE = {}; // chrome.storage.local contents
-let EVENTS = {}; // feedId -> events[] (declared Google-shaped, served as .ics)
+let EVENTS = {}; // feedId -> events[] (declared normalized, served as .ics)
 let FEED_BODIES = {}; // feedId -> raw .ics text, when a test wants to control it
 let URL_TO_ID = {}; // feed URL -> feedId, for the fake fetch
 let FETCH_LOG = []; // every URL the worker requested, in order
@@ -84,7 +84,7 @@ function icsStamp(isoish) {
 }
 
 /**
- * Serialize the Google-shaped fixtures these tests already declare into a real
+ * Serialize the normalized fixtures these tests already declare into a real
  * .ics body. The worker then parses them back through core/ics.js, so every
  * handler test exercises the actual feed path end to end rather than a stub.
  */
@@ -163,11 +163,10 @@ const WINDOW = { windowStart: "2026-08-01", windowEnd: "2026-08-31" };
 // ---------------------------------------------------------------------------
 // #2 — a feed that cannot be read must never look like a feed with no events
 //
-// The Google era had a matching hazard: a "hidden" calendar silently losing its
-// blocking role. The feed era's version is a URL that 404s, expires, or answers
-// with a login page. If that degraded to "no events", every shift on the board
-// would render as free — so a blocking-capable feed fails the whole refresh,
-// loudly, and only notes-only feeds are allowed to degrade.
+// A feed URL that 404s, expires, or answers with a login page must not degrade
+// to "no events" — if that happened every shift on the board would render as
+// free. A blocking-capable feed fails the whole refresh loudly; only notes-only
+// feeds are allowed to degrade gracefully.
 // ---------------------------------------------------------------------------
 
 test("listFeeds: returns the configured feeds with their stored roles", async () => {
@@ -191,7 +190,7 @@ test("listFeeds: never returns the feed URL, only its host", async () => {
   assert.equal(
     JSON.stringify(resp.feeds).includes("feed-a.ics"),
     false,
-    "the capability URL must never reach the panel"
+    "the feed URL must never reach the panel"
   );
 });
 
@@ -270,7 +269,7 @@ test("getCalendarData: an uploaded file feed blocks without touching the network
 test("getCalendarData: a recurring commitment expands and blocks every occurrence", async () => {
   reset();
   setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
-  // Raw RRULE, exactly as Google's secret-address feed ships it.
+  // Raw RRULE, as published by calendar feeds.
   FEED_BODIES["feed-fd"] =
     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
     "BEGIN:VEVENT\r\nUID:r1\r\nSUMMARY:Night Tour\r\n" +
@@ -532,7 +531,7 @@ test("listFeedTitles: an OFF calendar is refused and never read", async () => {
   assert.equal(
     eventsFetchedFor("cal-private").length,
     0,
-    "an OFF calendar's events must never leave Google"
+    "an OFF feed's events must never be fetched"
   );
   assert.equal(resp.titles, undefined);
 });
@@ -764,7 +763,7 @@ test("bucketEvents: a per-event buffer override beats the calendar default", () 
 // feed title silently drops the override and falls back to the calendar default
 // — the exact failure a reviewer caught.
 test("bucketEvents: a per-event buffer override still applies when the title has a non-break space", () => {
-  const NBSP = "Crew - Tour"; // no-break spaces around the dash, as iCal/Outlook feeds emit
+  const NBSP = "Crew - Tour"; // no-break spaces around the dash, as real-world feeds emit
   const events = [timed(NBSP, "10")];
   const { commitments } = sw.bucketEvents(
     events,
