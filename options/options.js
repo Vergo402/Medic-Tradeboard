@@ -39,12 +39,14 @@
  *   → { type: "listFeeds" }
  *   ← { ok:true,
  *       feeds:[{ id, name, kind:"url"|"file", role, source, syncedAt,
- *                blockTitles, bufferBefore, bufferAfter }],
+ *                blockTitles, blockLabel, bufferBefore, bufferAfter }],
  *       ruleFilter:{ include, exclude, usePattern } }
  *     source: the feed's HOST only ("calendar.google.com/…") or "uploaded file".
  *     syncedAt: last successful read (ms), or null. A file feed is static, so
  *       the row says so instead of implying it refreshes itself.
  *     usePattern: whether the advanced regex hatch is actually armed.
+ *     blockLabel: the word THIS feed's rejected shifts wear ("" = the neutral
+ *       default). Per feed, never global — see setFeedBlockLabel below.
  *
  *   → { type: "listFeedTitles", feedId }
  *     NOTE: no time window is sent. The options page has no board month, so the
@@ -88,6 +90,12 @@
  *     page sends the entire current sets on every change (snapshot at send time),
  *     so there are no per-control races.
  *   → { type: "setCalendarBuffer", feedId, before, after }
+ *   → { type: "setFeedBlockLabel", feedId, label }
+ *     The word on this feed's reject chips. Its own tiny handler rather than a
+ *     field on setEventRules: that one writes a snapshot of the whole picker,
+ *     and a REJECT feed never loads a picker, so routing this through it would
+ *     send empty block/note arrays and wipe config. A blank label REMOVES the
+ *     stored entry, so "unset" has exactly one representation.
  *   → { type: "setRuleFilter", include, exclude }   (advanced escape hatch only)
  *
  * Tolerated aliases (defensive only — the names above are the contract):
@@ -96,21 +104,19 @@
  *   a bare string instead of an object (title with unknown count/duration).
  */
 
-// The per-calendar block predicate, shared with content/boot.js's
+// The per-feed block predicate, shared with content/boot.js's
 // anyCalendarBlocks signal so the drawer's muted state and this page's "nothing
 // blocks" banner can never disagree. This is why options.html loads options.js
 // as type="module".
 import { calendarBlocks } from '../core/blocks.js';
 
-// `commitmentLabel` must match core/rowshape.js's DEFAULT_COMMITMENT_LABEL,
-// which is what content/boot.js falls back to. `ruleInclude` must match sw.js's
-// DEFAULTS.ruleInclude and must stay a real, non-empty, anchored pattern:
-// new RegExp("") matches EVERY string, so an empty include would make a RULE
-// calendar hard-reject all of its events and silently hide every shift.
+// `ruleInclude` must match sw.js's DEFAULTS.ruleInclude and must stay a real,
+// non-empty, anchored pattern: new RegExp("") matches EVERY string, so an empty
+// include would make a RULE feed hard-reject all of its events and silently hide
+// every shift.
 const DEFAULTS = {
   ruleInclude: '^Work\\b',
-  ruleExclude: '',
-  commitmentLabel: 'Commitment'
+  ruleExclude: ''
 };
 
 // Plain-language labels. The STORED values are unchanged — only the words move.
@@ -120,7 +126,7 @@ const ROLE_CHOICES = [
   { role: 'FLAG', label: 'Notes only' }
 ];
 
-// The role a calendar takes the moment its toggle is ticked. FLAG, never
+// The role a feed takes the moment its toggle is ticked. FLAG, never
 // REJECT: turning a switch on must not silently start hiding shifts. Blocking
 // is always a second, deliberate choice.
 const ROLE_ON_ENABLE = 'FLAG';
@@ -564,8 +570,73 @@ function buildBufferField(cal, key, label) {
   return wrap;
 }
 
-// Calendar-level "Rest buffer" block — shown on any calendar that can block:
-// a REJECT card's body, and the header of a RULE calendar's picker.
+// One in-flight save per feed, chained — same reasoning as the buffer and
+// event-rule chains above: typing fires a save per keystroke, and two
+// concurrent read-modify-writes can land out of order so an older snapshot wins.
+const blockLabelChains = new Map();
+const blockLabelTimers = new Map();
+
+function persistBlockLabel(calId) {
+  const prev = blockLabelChains.get(calId) || Promise.resolve();
+  const next = prev.then(() => sendBlockLabel(calId)).catch(() => {});
+  blockLabelChains.set(calId, next);
+  return next;
+}
+
+function persistBlockLabelDebounced(calId, ms = 400) {
+  clearTimeout(blockLabelTimers.get(calId));
+  blockLabelTimers.set(calId, setTimeout(() => persistBlockLabel(calId), ms));
+}
+
+// Snapshot at SEND time, not queue time, so the last write always carries what
+// is on screen.
+async function sendBlockLabel(calId) {
+  const cal = state.calendars.find((c) => c.id === calId);
+  if (!cal) return;
+  const hadError = Boolean(cal.blockLabelSaveError);
+  try {
+    const resp = await send({ type: 'setFeedBlockLabel', feedId: calId, label: cal.blockLabel || '' });
+    cal.blockLabelSaveError = resp.ok ? null : resp.error;
+  } catch (e) {
+    cal.blockLabelSaveError = e && e.message ? e.message : String(e);
+  }
+  if (cal.blockLabelSaveError || hadError) render();
+}
+
+/**
+ * The word this feed's rejected shifts wear ("✕ Fire Dept").
+ *
+ * Lives beside the rest buffer because both belong to the same question — what
+ * this feed does when it blocks — and both therefore render on exactly the roles
+ * that CAN block. A "Notes only" feed never rejects anything, so it never shows
+ * this field.
+ *
+ * No render() on input: rebuilding the list mid-keystroke would steal focus. The
+ * chip preview is updated in place instead.
+ */
+function buildBlockLabelRow(cal) {
+  const row = el('div', 'cal-label-row');
+  row.appendChild(el('label', null, 'Rejected shifts say →'));
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'Commitment';
+  input.value = cal.blockLabel || '';
+
+  const chip = el('span', 'chip', '✕ ' + (cal.blockLabel || 'Commitment'));
+  input.addEventListener('input', () => {
+    cal.blockLabel = input.value;
+    chip.textContent = '✕ ' + (input.value.trim() || 'Commitment');
+    persistBlockLabelDebounced(cal.id);
+  });
+
+  row.appendChild(input);
+  row.appendChild(chip);
+  return row;
+}
+
+// Feed-level "Rest buffer" block — shown on any feed that can block: a REJECT
+// card's body, and the header of a RULE feed's picker.
 function buildBufferBlock(cal) {
   const box = el('div', 'buffer-block');
   box.appendChild(el('div', 'buffer-title', 'Rest buffer'));
@@ -577,6 +648,12 @@ function buildBufferBlock(cal) {
     'Shifts within this window of a blocking event are rejected. 0 = block only direct overlaps.'));
   if (cal.bufferSaveError) {
     box.appendChild(el('div', 'cal-status error', 'Not saved (' + cal.bufferSaveError + ').'));
+  }
+  box.appendChild(buildBlockLabelRow(cal));
+  box.appendChild(el('p', 'buffer-hint',
+    'The word shown on shifts this feed knocks out. Leave blank for “Commitment”.'));
+  if (cal.blockLabelSaveError) {
+    box.appendChild(el('div', 'cal-status error', 'Label not saved (' + cal.blockLabelSaveError + ').'));
   }
   return box;
 }
@@ -993,6 +1070,8 @@ async function loadCalendars(interactive) {
     syncedAt: typeof c.syncedAt === 'number' ? c.syncedAt : null,
     role: c.role || 'OFF',
     roleError: null,
+    blockLabel: typeof c.blockLabel === 'string' ? c.blockLabel : '',
+    blockLabelSaveError: null,
     bufferBefore: toHours(c.bufferBefore),
     bufferAfter: toHours(c.bufferAfter),
     bufferSaveError: null
@@ -1008,7 +1087,7 @@ async function loadCalendars(interactive) {
 }
 
 // ---------------------------------------------------------------------------
-// commitmentLabel + the advanced pattern escape hatch
+// The advanced pattern escape hatch
 // ---------------------------------------------------------------------------
 
 function setStatus(id, text, isError) {
@@ -1023,22 +1102,6 @@ function setStatus(id, text, isError) {
       }
     }, 2000);
   }
-}
-
-function paintChip() {
-  const raw = document.getElementById('commitmentLabel').value.trim();
-  document.getElementById('chipPreview').textContent =
-    '✕ ' + (raw || DEFAULTS.commitmentLabel);
-}
-
-function saveCommitmentLabel() {
-  const field = document.getElementById('commitmentLabel');
-  const label = field.value.trim() === '' ? DEFAULTS.commitmentLabel : field.value.trim();
-  chrome.storage.local.set({ commitmentLabel: label }, () => {
-    field.value = label;
-    paintChip();
-    setStatus('status', 'Saved');
-  });
 }
 
 function savePattern() {
@@ -1070,10 +1133,6 @@ function savePattern() {
 
 function loadLocalFields() {
   chrome.storage.local.get(DEFAULTS, (items) => {
-    const label = (typeof items.commitmentLabel === 'string' && items.commitmentLabel.trim())
-      ? items.commitmentLabel
-      : DEFAULTS.commitmentLabel;
-    document.getElementById('commitmentLabel').value = label;
     // The RAW stored pattern is shown, not the compiled fallback: when a stored
     // regex is broken sw.js silently uses the default, but the user still needs
     // to see the broken value in order to fix it.
@@ -1083,7 +1142,6 @@ function loadLocalFields() {
         : DEFAULTS.ruleInclude;
     document.getElementById('ruleExclude').value =
       typeof items.ruleExclude === 'string' ? items.ruleExclude : DEFAULTS.ruleExclude;
-    paintChip();
   });
 }
 
@@ -1227,8 +1285,6 @@ function wireAddFeed() {
 }
 
 function init() {
-  document.getElementById('commitmentLabel').addEventListener('input', paintChip);
-  document.getElementById('commitmentLabel').addEventListener('change', saveCommitmentLabel);
   document.getElementById('savePattern').addEventListener('click', savePattern);
   document.getElementById('loadRetry').addEventListener('click', () => loadCalendars(true));
   wireAddFeed();

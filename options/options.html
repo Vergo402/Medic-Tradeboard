@@ -338,22 +338,9 @@
   <div id="calList"></div>
 
   <div class="section">
-    <label class="field" for="commitmentLabel">Commitment label (shown on rejected shifts)</label>
-    <input type="text" id="commitmentLabel" value="Commitment" placeholder="e.g. Fire Dept">
-    <p class="field-hint">
-      The word for &ldquo;I am already committed&rdquo; &mdash; your department,
-      second job, whatever.
-    </p>
-
-    <div class="preview">
-      <div class="preview-cap">Preview</div>
-      <div class="shift-line">
-        <span class="when">Sat 15 &middot; 07:00&ndash;19:00</span>
-        <span class="who">Medic &middot; Unit 2</span>
-        <span class="chip" id="chipPreview">&#10005; Commitment</span>
-      </div>
-    </div>
-
+    <!-- The word shown on a rejected shift is set PER FEED, on the feed's own
+         card, so two feeds can say two different things. There is deliberately
+         no global one here any more. -->
     <div id="status" role="status" aria-live="polite"></div>
 
     <details class="advanced" id="advanced">
