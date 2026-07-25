@@ -2,10 +2,16 @@ import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import { displayFields, runDiff } from "../core/diff.js";
 
-// Fixed "today" and window-end used throughout this suite.
+// Fixed "today" and window-end used throughout this suite. scan_start/scan_end
+// are the range the scan actually covered; the shared WINDOW deliberately spans
+// the whole suite's dates (including 2026-07-10, before TODAY) so the expiry
+// prune, not window scoping, is what suppresses past-dated gone entries below.
 const TODAY = "2026-07-20";
 const WINDOW_END = "2026-10-31";
-const WINDOW = { today: TODAY, window_end: WINDOW_END };
+const WINDOW = { today: TODAY, window_end: WINDOW_END, scan_start: "2026-07-01", scan_end: WINDOW_END };
+
+// A deliberately NARROW scan window (August only) for the window-scoping cases.
+const AUG = { window_end: WINDOW_END, scan_start: "2026-08-01", scan_end: "2026-08-31" };
 
 // Builds a minimal scored record for a given verdict, filling in realistic
 // defaults for the fields runDiff/displayFields care about.
@@ -49,7 +55,7 @@ test("first run: empty diff, first_run true, snapshot + history populated", () =
   assert.deepEqual(diff.changed, []);
 
   assert.equal(newSnapshot.eligible.length, 1);
-  assert.deepEqual(newSnapshot.reject_ids, ["200"]);
+  assert.deepEqual(newSnapshot.rejects, [{ w2w_id: "200", date: "2026-07-26" }]);
   assert.equal(historyLine.n_eligible, 1);
   assert.equal(historyLine.n_rejects, 1);
 });
@@ -97,10 +103,13 @@ test("new eligible shift appears in new with the full display shape", () => {
   // every case below.
   assert.deepEqual(
     Object.keys(historyLine).sort(),
-    ["changed_ids", "gone_ids", "n_eligible", "n_rejects", "new_ids", "scanned", "top_score", "window_end"].sort()
+    ["changed_ids", "gone_ids", "n_eligible", "n_rejects", "new_ids", "scan_end", "scan_start",
+      "scanned", "top_score", "window_end"].sort()
   );
   assert.equal(historyLine.scanned, TODAY);
   assert.equal(historyLine.window_end, WINDOW_END);
+  assert.equal(historyLine.scan_start, WINDOW.scan_start);
+  assert.equal(historyLine.scan_end, WINDOW.scan_end);
   assert.equal(historyLine.n_eligible, 1);
   assert.equal(historyLine.n_rejects, 0);
   assert.equal(historyLine.top_score, 15.0);
@@ -242,6 +251,126 @@ test("historyLine.top_score is null (not -Infinity) when there are no eligible s
   const { historyLine } = runDiff(scored, WINDOW, null, TODAY);
 
   assert.equal(historyLine.top_score, null);
+});
+
+// --- window scoping: gone -------------------------------------------------
+// The extension scans ONE month while the snapshot spans months of prior
+// scans. Only the scanned range may be called gone.
+
+test("gone is scoped to the scanned window: out-of-window snapshot entries are not gone", () => {
+  const inAug = displayOf(makeRec("810", "2026-08-14", "pass", { score: 11.0 }));
+  const inSep = displayOf(makeRec("910", "2026-09-14", "pass", { score: 12.0 }));
+  const snapshot = {
+    scanned: "2026-07-15", window_end: WINDOW_END,
+    eligible: [inAug, inSep], rejects: [],
+  };
+  const scored = { eligible: [], rejects: [] }; // August board is empty this scan
+
+  const { diff, historyLine } = runDiff(scored, AUG, snapshot, TODAY);
+
+  assert.deepEqual(diff.gone.map((d) => d.w2w_id), ["810"]);
+  assert.deepEqual(historyLine.gone_ids, ["810"]);
+  assert.deepEqual(diff.new, []);
+  assert.deepEqual(diff.changed, []);
+});
+
+test("out-of-window snapshot entry still reports its pass -> reject flip if it is on this board", () => {
+  // 920 was dated September in the snapshot but appears (re-dated) on the
+  // August board as a reject: present on the board means in-window, so the
+  // flip is reported rather than swallowed by the date scoping.
+  const snapSep = displayOf(makeRec("920", "2026-09-14", "pass", { score: 12.0 }));
+  const snapshot = {
+    scanned: "2026-07-15", window_end: WINDOW_END, eligible: [snapSep], rejects: [],
+  };
+  const nowReject = makeRec("920", "2026-08-14", "reject", { reason: "overlaps Northgate (moved)" });
+  const scored = { eligible: [], rejects: [nowReject] };
+
+  const { diff } = runDiff(scored, AUG, snapshot, TODAY);
+
+  assert.deepEqual(diff.gone, []);
+  assert.deepEqual(diff.changed.map((d) => [d.w2w_id, d.from, d.to]), [["920", "pass", "reject"]]);
+});
+
+// --- window scoping: snapshot merge ---------------------------------------
+
+test("snapshot merges: out-of-window entries preserved verbatim, in-window ones replaced", () => {
+  const inAugOld = displayOf(makeRec("810", "2026-08-14", "pass", { score: 11.0 }));
+  const inSep = displayOf(makeRec("910", "2026-09-14", "pass", { score: 12.0 }));
+  const expired = displayOf(makeRec("710", "2026-07-10", "pass", { score: 4.0 }));
+  const snapshot = {
+    scanned: "2026-07-15", window_end: WINDOW_END,
+    eligible: [inSep, expired, inAugOld], rejects: [],
+  };
+  // This scan sees only August, and 810 is no longer on it; 820 is.
+  const scored = { eligible: [makeRec("820", "2026-08-20", "pass", { score: 13.0 })], rejects: [] };
+
+  const { newSnapshot } = runDiff(scored, AUG, snapshot, TODAY);
+
+  // 910 carried over verbatim (out of window, still future); 710 dropped
+  // (out of window but expired); 810 dropped (in window, gone this scan);
+  // 820 added. Carried-over entries keep snapshot order and come first.
+  assert.deepEqual(newSnapshot.eligible.map((e) => e.w2w_id), ["910", "820"]);
+  assert.deepEqual(newSnapshot.eligible[0], inSep);
+  assert.equal(newSnapshot.scan_start, AUG.scan_start);
+  assert.equal(newSnapshot.scan_end, AUG.scan_end);
+});
+
+test("rejects merge the same way, out-of-window reject ids preserved with their dates", () => {
+  const snapshot = {
+    scanned: "2026-07-15", window_end: WINDOW_END, eligible: [],
+    rejects: [
+      { w2w_id: "930", date: "2026-09-14" }, // out of window -> preserved
+      { w2w_id: "830", date: "2026-08-14" }, // in window, not on this board -> dropped
+      { w2w_id: "730", date: "2026-07-10" }, // out of window but expired -> dropped
+    ],
+  };
+  const scored = { eligible: [], rejects: [makeRec("840", "2026-08-21", "reject")] };
+
+  const { newSnapshot } = runDiff(scored, AUG, snapshot, TODAY);
+
+  assert.deepEqual(newSnapshot.rejects, [
+    { w2w_id: "930", date: "2026-09-14" },
+    { w2w_id: "840", date: "2026-08-21" },
+  ]);
+});
+
+test("legacy dateless reject_ids still suppress new, and drop out of the merged snapshot", () => {
+  // Pre-window-scoping snapshots carry a bare id list. Without dates those ids
+  // cannot be window-scoped, so they are replaced by this scan (self-healing,
+  // one-time) rather than preserved forever — but they are still "known", so
+  // an id that reappears is not reported new.
+  const snapshot = { scanned: "2026-07-15", window_end: WINDOW_END, eligible: [], reject_ids: ["850", "860"] };
+  const scored = { eligible: [makeRec("850", "2026-08-14", "pass", { score: 14.0 })], rejects: [] };
+
+  const { diff, newSnapshot } = runDiff(scored, AUG, snapshot, TODAY);
+
+  assert.deepEqual(diff.new, []); // known from reject_ids
+  assert.deepEqual(diff.changed.map((d) => [d.w2w_id, d.from, d.to]), [["850", "reject", "pass"]]);
+  assert.deepEqual(newSnapshot.rejects, []); // 860 not carried over: no date to scope it by
+  assert.ok(!("reject_ids" in newSnapshot), "the merged snapshot writes the dated `rejects` shape only");
+});
+
+test("first run is unaffected by window scoping: no gone/new, snapshot is just this scan", () => {
+  const scored = {
+    eligible: [makeRec("870", "2026-08-14", "pass")],
+    rejects: [makeRec("880", "2026-08-15", "reject")],
+  };
+
+  const { diff, newSnapshot } = runDiff(scored, AUG, null, TODAY);
+
+  assert.equal(diff.first_run, true);
+  assert.deepEqual(diff.gone, []);
+  assert.deepEqual(diff.new, []);
+  assert.deepEqual(newSnapshot.eligible.map((e) => e.w2w_id), ["870"]);
+  assert.deepEqual(newSnapshot.rejects, [{ w2w_id: "880", date: "2026-08-15" }]);
+});
+
+test("a window without scan_start/scan_end throws rather than wiping the snapshot", () => {
+  const scored = { eligible: [], rejects: [] };
+  assert.throws(
+    () => runDiff(scored, { window_end: WINDOW_END }, { eligible: [], rejects: [] }, TODAY),
+    /scan_start/
+  );
 });
 
 // --- extra: displayFields excludes score for reject-shaped records --------

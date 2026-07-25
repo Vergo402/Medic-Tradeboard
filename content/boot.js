@@ -58,7 +58,6 @@
       stats: { elig: 0, rej: 0, best: null, topCount: 0 },
       rows: [],
       rejects: [],
-      scanning: null,
       notice: notice || null,
       // Whether ANY calendar is configured to block a shift. false here is the
       // honest default for the early-exit guards (logged out / no page
@@ -73,7 +72,7 @@
     const docHtml = document.documentElement.outerHTML;
     if (isLoggedOut(docHtml)) {
       const { initDrawer } = await import(chrome.runtime.getURL("ui/drawer.js"));
-      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onOpenSetup() {} });
+      const controller = initDrawer({ onRowClick() {}, onOpenSetup() {} });
       controller.update(emptyState("Log in to WhenToWork first"));
       return;
     }
@@ -82,7 +81,7 @@
     const tag = document.querySelector("script[data-sid][data-w2w]");
     if (!tag || !tag.dataset.sid || !tag.dataset.w2w) {
       const { initDrawer } = await import(chrome.runtime.getURL("ui/drawer.js"));
-      const controller = initDrawer({ onScanAll() {}, onRowClick() {}, onOpenSetup() {} });
+      const controller = initDrawer({ onRowClick() {}, onOpenSetup() {} });
       controller.update(emptyState("Could not read page identity — reload the tradeboard"));
       return;
     }
@@ -101,7 +100,7 @@
       import(chrome.runtime.getURL("core/blocks.js")),
       import(chrome.runtime.getURL("ui/drawer.js")),
     ]);
-    const { parseMonth, mergeMonths, driftCheck } = parseMod;
+    const { driftCheck } = parseMod;
     const { parseCivil, toEpoch, addDays, civilFromEpoch } = nytime;
     const { loadCommitments, evaluate, rankEligible } = scoreMod;
     const { runDiff } = diffMod;
@@ -202,11 +201,6 @@
     const calWindowStart = civilDateStr(addDays(todayCivil, -4));
     const calWindowEnd = civilDateStr(addDays(windowEndCivil, 7));
 
-    // --- Prior view state, for the full-sweep restore step ----------------
-    const mtbSelect = document.querySelector('select[name="MTBView"]');
-    const selectedOpt = mtbSelect ? mtbSelect.querySelector("option[selected]") : null;
-    const priorView = (selectedOpt && selectedOpt.value) || "All";
-
     // --- Mutable session state --------------------------------------------
     let commitments = [];
     let softEvents = [];
@@ -214,8 +208,11 @@
     let myschedStatus = "none";
     let calAgeMs = null;
     let calError = null;
-    let lastVisible = null; // domscan's {records, year, month, monthName, source}
-    let scanning = null;
+    let lastVisible = null; // domscan's {records, anchors, year, month, monthName, source}
+    let calendarLoaded = false; // a calendar read has SUCCEEDED at least once this load
+    // Ids known BEFORE this page load's snapshot write, frozen by
+    // runDiffForVisibleMonth. Null until the diff runs.
+    let baseline = null;
     // Does ANY calendar block a shift? Read from config (calRoles /
     // calBlockTitles / ruleUsePattern), never inferred from an empty
     // commitments array — empty is ambiguous (nothing configured vs configured
@@ -256,10 +253,15 @@
       return snapshot || null;
     }
 
+    /** Both reject shapes are read: current snapshots carry
+     * `rejects: [{w2w_id, date}]` (the date is what makes core/diff.js's
+     * window-scoped merge possible), legacy ones a bare `reject_ids` id list.
+     * Reading only one shape would show NEW pills on already-seen rejects. */
     function snapshotKnownIds(snapshot) {
       if (!snapshot) return { exists: false, known: new Set() };
       const known = new Set([
         ...((snapshot.eligible) || []).map((e) => e.w2w_id),
+        ...((snapshot.rejects) || []).map((r) => r.w2w_id),
         ...((snapshot.reject_ids) || []),
       ]);
       return { exists: true, known };
@@ -271,6 +273,7 @@
         softEvents = parseTriplets(resp.soft);
         calAgeMs = Date.now() - resp.fetchedAt;
         calError = null;
+        calendarLoaded = true;
       } else {
         calError = (resp && resp.error) || "unknown_error";
       }
@@ -359,24 +362,12 @@
         },
         rows,
         rejects,
-        scanning,
         notice: notice || null,
         anyCalendarBlocks,
       };
     }
 
     const controller = initDrawer({
-      onScanAll: () => {
-        runFullSweep().catch((e) => {
-          console.error("[medic-tradeboard] full sweep failed:", e);
-          scanning = null;
-          controller.update(buildState({
-            monthLabel: currentMonthLabel(),
-            notice: "Full scan failed — see console",
-            rows: [], rejects: [],
-          }));
-        });
-      },
       onRowClick: (w2wId) => {
         // badges.js owns the scroll+flash treatment; fall back to a bare
         // scroll if its namespace is somehow absent.
@@ -402,7 +393,11 @@
     let lastRejRows = [];
 
     async function rescoreVisibleAndPaint() {
-      const { known, exists } = snapshotKnownIds(await getStoredSnapshot());
+      // Once the diff has run, NEW pills come from `baseline` (the ids known
+      // before this load's snapshot write). Re-reading storage here would hand
+      // back the snapshot we just wrote and blank every pill on the next
+      // repaint (e.g. the storage.onChanged refresh below).
+      const { known, exists } = baseline || snapshotKnownIds(await getStoredSnapshot());
       const { eligible, rejects } = scoreRecords(lastVisible.records);
       const rows = eligible.map((rec, i) => buildRow(rec, i + 1, known, exists));
       const rejRows = rejects.map(buildReject);
@@ -441,103 +436,6 @@
       })().catch((e) => console.error("[medic-tradeboard] block-config change refresh failed:", e));
     });
 
-    async function runFullSweep() {
-      if (scanning && scanning.active) return; // never run two sweeps at once — server view state is shared
-      scanning = { active: true, done: 0, total: months.length };
-      controller.update(buildState({ monthLabel: currentMonthLabel(), rows: lastRows, rejects: lastRejRows }));
-
-      const sweep = await window.MedicBoard.fullSweep({
-        host, dll, sid, months, expectView: "All", priorView,
-        restoreMonth: lastVisible ? { y: lastVisible.year, mo: lastVisible.month } : null,
-        onProgress: (done, total) => {
-          scanning = { active: true, done, total };
-          controller.update(buildState({ monthLabel: currentMonthLabel(), rows: lastRows, rejects: lastRejRows }));
-        },
-      });
-      scanning = null;
-
-      if (sweep.error === "logged_out") {
-        controller.update(buildState({
-          monthLabel: currentMonthLabel(), notice: "Log in to WhenToWork first", rows: [], rejects: [],
-        }));
-        return;
-      }
-
-      // A month that never validated in 8 attempts means the board is
-      // incomplete — running the diff anyway would mark that month's prior
-      // shifts GONE and poison the snapshot. A failed month is treated as
-      // fatal for this scan: abort with NO storage writes.
-      const failed = sweep.monthHtmls.filter((m) => m.html === null);
-      if (failed.length) {
-        const names = failed.map((m) => `${m.mo}/${m.y}`).join(", ");
-        controller.update(buildState({
-          monthLabel: currentMonthLabel(),
-          notice: `W2W never returned ${names} — scan aborted, nothing saved`,
-          rows: lastRows, rejects: lastRejRows,
-        }));
-        return;
-      }
-
-      // Drift handling: abort the sweep, no storage writes, on the first
-      // month whose parse looks like schema drift.
-      const perMonth = [];
-      let drifted = false;
-      for (const { y, mo, html } of sweep.monthHtmls) {
-        const parsed = parseMonth(html, y, mo);
-        if (driftCheck(parsed)) { drifted = true; break; }
-        perMonth.push(parsed.records);
-      }
-      if (drifted) {
-        controller.update(buildState({
-          monthLabel: currentMonthLabel(), notice: "W2W markup changed — scanner needs an update",
-          rows: lastRows, rejects: lastRejRows,
-        }));
-        return;
-      }
-
-      const merged = mergeMonths(perMonth);
-      // Reuses the CURRENT commitments/myShifts/softEvents session state
-      // (established by the instant-scan flow) rather than re-fetching --
-      // fullSweep only re-fetches board HTML from W2W, not calendar or
-      // my-schedule data.
-      const { eligible, rejects } = scoreRecords(merged);
-
-      const oldSnapshot = await getStoredSnapshot();
-      const { known: oldKnown, exists: snapshotExisted } = snapshotKnownIds(oldSnapshot);
-
-      const { diff, historyLine, newSnapshot } = runDiff(
-        { eligible, rejects }, { window_end: windowEnd }, oldSnapshot, todayStr
-      );
-
-      const { scanHistory } = await chrome.storage.local.get("scanHistory");
-      const nextHistory = [...(scanHistory || []), historyLine].slice(-200);
-      await chrome.storage.local.set({ snapshot: newSnapshot, scanHistory: nextHistory, lastDiff: diff });
-
-      bannerOnLoad = (diff.new.length || diff.gone.length || diff.changed.length) ? {
-        newCount: diff.new.length,
-        goneLabels: diff.gone.map(goneLabel),
-        changedCount: diff.changed.length,
-      } : null;
-
-      const rows = eligible.map((rec, i) => buildRow(rec, i + 1, oldKnown, snapshotExisted));
-      const rejRows = rejects.map(buildReject);
-
-      // Badges only target anchors present in the DOM (the currently
-      // visible month); the drawer shows the full-window ranking with rank
-      // numbers locked to that full-window sort. The sweep scores all four
-      // months, so rejects need the same visibleIds filter as eligible rows
-      // -- painting a reject whose anchor isn't in the DOM would be a no-op
-      // in badges.js anyway (findAnchor returns null), but filtering here
-      // keeps the two arrays handled identically and avoids wasted work.
-      const visibleIds = new Set((lastVisible ? lastVisible.records : []).map((r) => r.w2w_id));
-      paintBadgesSafe(
-        rows.filter((r) => visibleIds.has(r.w2w_id)),
-        rejRows.filter((r) => visibleIds.has(r.w2w_id))
-      );
-
-      controller.update(buildState({ monthLabel: currentMonthLabel(), rows, rejects: rejRows }));
-    }
-
     // --- Instant scan (runs once at boot) ---------------------------------
     const { scanStrategy } = await chrome.storage.local.get("scanStrategy");
     // "dom" (zero-network) is the default scan strategy. Must match
@@ -554,6 +452,72 @@
       return;
     }
     lastVisible = visible;
+
+    // --- Scan window: the visible month, clipped to the scoring window -----
+    // Must mirror scoreRecords' own filter (todayStr <= date <= windowEnd)
+    // intersected with the month actually on screen — this pair is what
+    // core/diff.js is allowed to call GONE and to replace in the snapshot, so
+    // it has to be exactly the range this scan can speak for. An empty range
+    // (the user paged to a month entirely behind today) means this load
+    // scanned nothing diffable: no storage writes at all.
+    const monthStart = `${visible.year}-${pad2(visible.month)}-01`;
+    const monthEnd = civilDateStr({
+      y: visible.year, mo: visible.month,
+      d: new Date(Date.UTC(visible.year, visible.month, 0)).getUTCDate(),
+    });
+    const scanStart = monthStart > todayStr ? monthStart : todayStr;
+    const scanEnd = monthEnd < windowEnd ? monthEnd : windowEnd;
+
+    // Schema drift on the scanned HTML: anchors present but nothing parsed.
+    // Both fields come from domscan's single parse of the HTML it actually
+    // scanned, so this never pairs one source's records with another's anchors.
+    const drifted = driftCheck({ records: visible.records, anchors: visible.anchors });
+    if (drifted) {
+      controller.update(buildState({
+        monthLabel: currentMonthLabel(), notice: "W2W markup changed — scanner needs an update",
+        rows: [], rejects: [],
+      }));
+      return; // NO storage writes on a drifted parse — a poisoned snapshot outlives the page
+    }
+
+    /**
+     * The snapshot/diff write for this load's visible month. Runs ONCE, after
+     * both async pulls settle (see the call site) so the scoring it freezes
+     * into the snapshot is the same scoring the user is looking at.
+     */
+    async function runDiffForVisibleMonth() {
+      const oldSnapshot = await getStoredSnapshot();
+      const { known: oldKnown, exists: snapshotExisted } = snapshotKnownIds(oldSnapshot);
+      baseline = { known: oldKnown, exists: snapshotExisted }; // freeze before the write
+
+      const { eligible, rejects } = scoreRecords(lastVisible.records);
+      const { diff, historyLine, newSnapshot } = runDiff(
+        { eligible, rejects },
+        { window_end: windowEnd, scan_start: scanStart, scan_end: scanEnd },
+        oldSnapshot, todayStr
+      );
+
+      const { scanHistory } = await chrome.storage.local.get("scanHistory");
+      const nextHistory = [...(scanHistory || []), historyLine].slice(-200);
+      await chrome.storage.local.set({ snapshot: newSnapshot, scanHistory: nextHistory, lastDiff: diff });
+
+      // Banner shows THIS scan's fresh diff, replacing the prior lastDiff one
+      // loaded at boot — lastDiff was just overwritten, so the pre-scan banner
+      // would describe changes no longer in storage (same choice the deleted
+      // full sweep made).
+      bannerOnLoad = (diff.new.length || diff.gone.length || diff.changed.length) ? {
+        newCount: diff.new.length,
+        goneLabels: diff.gone.map(goneLabel),
+        changedCount: diff.changed.length,
+      } : null;
+
+      const rows = eligible.map((rec, i) => buildRow(rec, i + 1, oldKnown, snapshotExisted));
+      const rejRows = rejects.map(buildReject);
+      lastRows = rows;
+      lastRejRows = rejRows;
+      paintBadgesSafe(rows, rejRows);
+      controller.update(buildState({ monthLabel: currentMonthLabel(), rows, rejects: rejRows }));
+    }
 
     // Step 2: fast "cache" path.
     const cacheResp = await askCalendar("cache");
@@ -574,12 +538,12 @@
     // Step 3: in parallel, a fresh (non-cached) calendar pull and the user's
     // own W2W schedule — each repaints independently as soon as IT resolves,
     // rather than waiting on both.
-    askCalendar("refresh").then(async (resp) => {
+    const calRefreshDone = askCalendar("refresh").then(async (resp) => {
       applyCalResponse(resp);
       if (resp && resp.ok) await rescoreVisibleAndPaint();
     }).catch((e) => console.error("[medic-tradeboard] calendar refresh failed:", e));
 
-    window.MedicBoard.fetchMysched({ host, dll, sid }).then(async (html) => {
+    const myschedDone = window.MedicBoard.fetchMysched({ host, dll, sid }).then(async (html) => {
       const parsed = parseMysched(html);
       if (parsed.status === "ok") {
         myShifts = parseTriplets(parsed.schedule);
@@ -593,5 +557,25 @@
       }
       await rescoreVisibleAndPaint();
     }).catch((e) => console.error("[medic-tradeboard] mysched fetch failed:", e));
+
+    // Step 4: ONE diff/snapshot write per page load, after BOTH pulls settle.
+    // Running it earlier (on the cache path) would freeze a snapshot scored
+    // with myShifts still empty, so every shift overlapping the user's own W2W
+    // schedule would land as `pass` and flip to `reject` on the next load —
+    // phantom changes in the banner on every visit. allSettled, not all: a
+    // rejected pull must not skip the write silently, the guards below decide.
+    await Promise.allSettled([calRefreshDone, myschedDone]);
+    // Empty range: the visible month lies entirely behind the scoring window,
+    // so this load scanned nothing the snapshot could speak for.
+    const diffable = scanStart <= scanEnd;
+    // Without real calendar data every shift scores `pass`; writing that would
+    // poison the snapshot exactly as a failed month did in the deleted full
+    // sweep. Same rule as drift above: on a failed scan, write nothing.
+    const scoringTrusted = calendarLoaded && !calError;
+    if (diffable && scoringTrusted) {
+      await runDiffForVisibleMonth();
+    } else if (diffable) {
+      console.warn("[medic-tradeboard] calendar unavailable — diff/snapshot write skipped");
+    }
   })().catch((err) => console.error("[medic-tradeboard] boot failed:", err));
 })();

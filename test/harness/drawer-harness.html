@@ -8,7 +8,6 @@
 </style>
 <h1>Drawer harness</h1>
 <p>Offline fidelity harness for the compose-text drawer. No W2W, no network, no extension APIs beyond a getURL shim.</p>
-<button id="tick">simulate scan tick x5</button>
 <button id="swap">swap board (drop Jul 27)</button>
 <button id="blocks">toggle calendar-blocks (de-confidence state)</button>
 <h2>Expected message for Jul 23 + Jul 27</h2>
@@ -64,13 +63,11 @@
       stats: { elig: rows.length, rej: rejects.length, best: 52, topCount: 1 },
       rows,
       rejects,
-      scanning: null,
       anyCalendarBlocks,
     }, extra || {});
   }
 
   const controller = initDrawer({
-    onScanAll: () => console.log("[harness] onScanAll"),
     onRowClick: (id) => console.log("[harness] onRowClick", id),
     onConnectCalendar: () => console.log("[harness] onConnectCalendar"),
     onOpenSetup: () => console.log("[harness] onOpenSetup"),
@@ -83,14 +80,6 @@
     { date: "2026-07-23", start: "07:00", end: "19:00" },
     { date: "2026-07-27", start: "23:00", end: "06:00" },
   ]);
-
-  document.getElementById("tick").onclick = () => {
-    for (let i = 1; i <= 5; i++) {
-      controller.update(state({ scanning: { active: true, done: i, total: 4 } }));
-    }
-    controller.update(state());
-    console.log("[harness] 5 scan ticks + final repaint done");
-  };
 
   document.getElementById("swap").onclick = () => {
     controller.update(state({ rows: rows.filter((r) => r.w2w_id !== "id-jul27") }));

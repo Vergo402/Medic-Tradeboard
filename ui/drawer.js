@@ -2,7 +2,7 @@
  * ESM module -- dynamic-imported via chrome.runtime.getURL('ui/drawer.js').
  *
  * export function initDrawer(callbacks) -> controller
- *   callbacks = { onScanAll(), onRowClick(w2w_id), onOpenSetup() }
+ *   callbacks = { onRowClick(w2w_id), onOpenSetup() }
  *   controller.update(state) fully rerenders the drawer from `state`.
  *
  * Mounting: a single fixed-position host <div> is appended to
@@ -310,13 +310,8 @@ function composeViewHtml(shifts, copyFlash) {
   </div>`;
 }
 
-function footerHtml(scanning) {
-  const active = !!(scanning && scanning.active);
-  const label = active
-    ? `SCANNING ${escapeHtml(scanning.done)}/${escapeHtml(scanning.total)}…`
-    : "↻ SCAN ALL 4 MONTHS";
+function footerHtml() {
   return `<div class="footer">
-    <button type="button" class="scan-btn" data-action="scan-all"${active ? " disabled" : ""}>${label}</button>
     <div class="footer-note">Read-only — you pull the trigger in W2W.</div>
   </div>`;
 }
@@ -335,7 +330,7 @@ function collapsedTabHtml() {
 }
 
 /**
- * @param {{onScanAll?:Function, onRowClick?:Function, onOpenSetup?:Function}} callbacks
+ * @param {{onRowClick?:Function, onOpenSetup?:Function}} callbacks
  */
 export function initDrawer(callbacks) {
   const cb = callbacks || {};
@@ -449,7 +444,7 @@ export function initDrawer(callbacks) {
     if (composeOpen) {
       // STATE 2: header + preview view + footer ONLY -- status line, stats,
       // filter row, rows, rejected section, and compose bar are all hidden.
-      root.innerHTML = `${headerHtml()}${composeViewHtml(selectedShifts(), copyFlash)}${footerHtml(state.scanning)}`;
+      root.innerHTML = `${headerHtml()}${composeViewHtml(selectedShifts(), copyFlash)}${footerHtml()}`;
       return;
     }
 
@@ -513,7 +508,7 @@ export function initDrawer(callbacks) {
     const selCount = selectedShifts().length;
     if (selCount > 0) html += composeBarHtml(selCount);
 
-    html += footerHtml(state.scanning);
+    html += footerHtml();
 
     root.innerHTML = html;
   }
@@ -537,9 +532,6 @@ export function initDrawer(callbacks) {
     } else if (action === "toggle-rejected") {
       rejectedExpanded = !rejectedExpanded;
       render();
-    } else if (action === "scan-all") {
-      if (target.hasAttribute("disabled")) return;
-      cb.onScanAll && cb.onScanAll();
     } else if (action === "row-click") {
       cb.onRowClick && cb.onRowClick(target.dataset.id);
     } else if (action === "toggle-select") {

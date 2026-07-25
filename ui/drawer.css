@@ -9,10 +9,10 @@
  * color palette used consistently across the project, plus the FAM purple
  * (#b48cff).
  *
- * No external network references anywhere in this file (MV3 CSP: no Google
- * Fonts CDN, no CDN of any kind) -- font stacks below are local-fallback
- * only, and the @font-face block that would load packaged woff2 files is
- * commented out until assets/fonts/*.woff2 actually exist.
+ * No external network references anywhere in this file (MV3 CSP: no external
+ * fonts or CDN of any kind) -- font stacks below are local-fallback only, and
+ * the @font-face block that would load packaged woff2 files is commented out
+ * until assets/fonts/*.woff2 actually exist.
  */
 
 :host {
@@ -456,37 +456,10 @@
   border-top: 1px solid var(--line);
 }
 
-.scan-btn {
-  width: 100%;
-  font-family: var(--font-head);
-  font-weight: 700;
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  background: transparent;
-  color: var(--amber);
-  border: 1px solid var(--amber);
-  padding: 8px 0;
-  cursor: pointer;
-  border-radius: 2px;
-}
-
-.scan-btn:hover:not(:disabled) {
-  background: var(--amber);
-  color: #1a1204;
-}
-
-.scan-btn:disabled {
-  color: var(--dim);
-  border-color: var(--line);
-  cursor: default;
-}
-
 .footer-note {
   text-align: center;
   color: var(--dim);
   font-size: 11px;
-  margin-top: 8px;
 }
 
 /* ---------- 9. Compose-text (row checkboxes, compose bar, preview) ---------- */
