@@ -788,3 +788,134 @@ test("bucketEvents: with no bufferOpts at all, the commitment triplet defaults b
   assert.equal(commitments[0][3], 0);
   assert.equal(commitments[0][4], 0);
 });
+
+// ---------------------------------------------------------------------------
+// Per-feed commitment label, and the migration off the old single global one
+// ---------------------------------------------------------------------------
+
+test("setFeedBlockLabel: stores the trimmed word and drops the cache", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calCache = { fetchedAt: 1, commitments: [], soft: [] };
+
+  const resp = await send({ type: "setFeedBlockLabel", feedId: "f1", label: "  Fire Dept  " });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Fire Dept" });
+  assert.equal("calCache" in STORE, false, "a stale cache would keep serving the old chip word");
+});
+
+test("setFeedBlockLabel: a blank value REMOVES the entry rather than storing an empty string", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  await send({ type: "setFeedBlockLabel", feedId: "f1", label: "   " });
+  assert.deepEqual(STORE.calBlockLabel, {}, "unset must have exactly one representation");
+});
+
+test("setFeedBlockLabel: a missing feed id is refused", async () => {
+  reset();
+  const resp = await send({ type: "setFeedBlockLabel", label: "Fire Dept" });
+  assert.equal(resp.ok, false);
+  assert.equal(resp.error, "bad_feed_id");
+});
+
+test("getCalendarData: a feed's label rides on its commitment triplets", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.commitments[0][2], "Fire Dept");
+});
+
+// The whole point of the change: one word per feed, not one for the board.
+test("getCalendarData: two feeds keep their own separate words", async () => {
+  reset();
+  setFeeds([
+    { id: "f1", name: "Crew Schedule", role: "REJECT" },
+    { id: "f2", name: "Family", role: "REJECT" },
+  ]);
+  STORE.calBlockLabel = { f1: "Fire Dept", f2: "Family" };
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+  EVENTS["f2"] = [timed("Recital", "16")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.deepEqual(resp.commitments.map((c) => c[2]).sort(), ["Family", "Fire Dept"]);
+});
+
+test("listFeeds: echoes each feed's label back to the panel", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }, { id: "f2", name: "Family" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  const resp = await send({ type: "listFeeds" });
+  assert.equal(resp.feeds.find((f) => f.id === "f1").blockLabel, "Fire Dept");
+  assert.equal(resp.feeds.find((f) => f.id === "f2").blockLabel, "");
+});
+
+test("removeFeed: deletes the feed's label along with the rest of its config", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  await send({ type: "removeFeed", feedId: "f1" });
+  assert.deepEqual(STORE.calBlockLabel, {});
+});
+
+// MIGRATION. The label used to be ONE global word. Deleting that setting without
+// moving its value would silently turn a deliberate "✕ Fire Dept" into
+// "✕ Commitment" — config disarmed with no signal, which is the exact class of
+// bug this codebase has shipped before and now refuses to.
+test("migration: a stored global label is copied onto every feed, then deleted", async () => {
+  reset();
+  setFeeds([
+    { id: "f1", name: "Crew Schedule", role: "REJECT" },
+    { id: "f2", name: "Family", role: "FLAG" },
+  ]);
+  STORE.commitmentLabel = "Fire Dept";
+
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Fire Dept", f2: "Fire Dept" });
+  assert.equal("commitmentLabel" in STORE, false, "the legacy key must be gone once moved");
+});
+
+test("migration: never overwrites a per-feed label the user already set", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }, { id: "f2", name: "B", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+  STORE.calBlockLabel = { f1: "Station 3" };
+
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Station 3", f2: "Fire Dept" });
+});
+
+test("migration: is idempotent — a later re-run cannot resurrect the old word", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+
+  await send({ type: "listFeeds" });
+  await send({ type: "setFeedBlockLabel", feedId: "f1", label: "Changed" });
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Changed" });
+});
+
+test("migration: a blank global label is simply dropped, seeding nothing", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }]);
+  STORE.commitmentLabel = "   ";
+
+  await send({ type: "listFeeds" });
+  assert.equal("commitmentLabel" in STORE, false);
+  assert.deepEqual(STORE.calBlockLabel || {}, {});
+});
+
+test("migration: the migrated word is what rejects actually say", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.commitments[0][2], "Fire Dept",
+    "a pre-upgrade word must survive the upgrade end to end");
+});

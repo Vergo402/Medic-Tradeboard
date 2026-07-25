@@ -107,23 +107,16 @@
     const { runDiff } = diffMod;
     const { parseMysched, fallbackFromTradeboard } = myschedMod;
     const {
-      loc, posShort, tierClass, goneLabel, posterNote, tourOf,
-      rejectChipLabel, DEFAULT_COMMITMENT_LABEL,
+      loc, posShort, tierClass, goneLabel, posterNote, tourOf, rejectChipLabel,
     } = rowshape;
     const { anyoneBlocks } = blocksMod;
     const { initDrawer } = uiMod;
 
-    // --- User-configured commitment label --------------------------------
-    // The word this user uses for "I am already committed" (their department,
-    // second job, whatever). core/score.js never sees it: it emits a neutral
-    // reason plus a structured rejectKind, and the label is applied HERE, in
-    // the display layer. Falls back to the neutral default when unset.
-    // Storage key: `commitmentLabel` (chrome.storage.local), shared with the
-    // options page.
-    const storedLabel = (await chrome.storage.local.get("commitmentLabel")).commitmentLabel;
-    const commitmentLabel = (typeof storedLabel === "string" && storedLabel.trim())
-      ? storedLabel.trim()
-      : DEFAULT_COMMITMENT_LABEL;
+    // The word for "I am already committed" is now PER FEED, resolved in sw.js
+    // when the commitment triplet is built and carried here as rec.rejectLabel
+    // (see rejectChipLabel). Nothing to read from storage: core/score.js still
+    // never sees it — it emits a neutral reason plus a structured rejectKind,
+    // and the label is applied HERE, in the display layer.
 
     /**
      * Non-merging companion to score.js's loadCommitments(): myShifts and
@@ -347,7 +340,7 @@
         // badges.js's paintBadges paints this verbatim, it never re-derives it.
         // Keyed off rec.rejectKind/rejectGapHours/rejectLabel (structured), plus
         // this user's own commitment label; no prose is string-matched.
-        chipLabel: rejectChipLabel(rec, commitmentLabel),
+        chipLabel: rejectChipLabel(rec),
       };
     }
 

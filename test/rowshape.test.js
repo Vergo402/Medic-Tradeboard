@@ -96,127 +96,105 @@ test("sortkey: '<date> <start>' formula", () => {
 //
 // score.js's evaluate() returns `rejectKind` ("commitment" | "my_shift" |
 // "buffer" | null) plus `rejectGapHours`; the chip is derived from those and
-// never from the reason prose. Only the "commitment" kind wears the user's
-// configured label -- and it must wear whatever that label is, including a
-// label that reads like another category ("My Shifts"), which is exactly what
-// string matching used to get wrong.
+// never from the reason prose. Only the "commitment" kind wears a user-set word
+// -- and it must wear whatever that word is, including one that reads like
+// another category ("My Shifts"), which is exactly what string matching used to
+// get wrong.
+//
+// That word arrives ALREADY RESOLVED as `rejectLabel`: sw.js's bucketEvents
+// picks the per-event "show as" if there is one, else the feed's own commitment
+// label, and writes it into the commitment triplet. There is no longer a global
+// label argument -- an absent/blank rejectLabel means the user configured
+// nothing for that feed and yields the neutral default.
 
 const REJECT_CHIP_LABEL_CASES = [
   {
-    id: "commitment_uses_configured_label",
-    reject: { rejectKind: "commitment", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Fire Dept",
+    id: "commitment_uses_the_resolved_label",
+    reject: { rejectKind: "commitment", rejectLabel: "Fire Dept", rejectGapHours: null },
+    expected: "✕ Fire Dept",
+  },
+  {
+    // Two feeds, two words: this is the whole point of the label being per-feed.
+    id: "commitment_label_is_whatever_that_feed_set",
+    reject: { rejectKind: "commitment", rejectLabel: "Family", rejectGapHours: null },
+    expected: "✕ Family",
   },
   {
     id: "commitment_label_colliding_with_my_shift_wording",
-    reject: { rejectKind: "commitment", rejectGapHours: null },
-    label: "My Shifts",
-    expected: "\u2715 My Shifts",
+    reject: { rejectKind: "commitment", rejectLabel: "My Shifts", rejectGapHours: null },
+    expected: "✕ My Shifts",
   },
   {
     id: "commitment_label_is_trimmed",
-    reject: { rejectKind: "commitment", rejectGapHours: null },
-    label: "  Station 3  ",
-    expected: "\u2715 Station 3",
+    reject: { rejectKind: "commitment", rejectLabel: "  Station 3  ", rejectGapHours: null },
+    expected: "✕ Station 3",
   },
   {
+    // The feed had no label configured, so the triplet carried nothing.
     id: "commitment_missing_label_falls_back_to_default",
     reject: { rejectKind: "commitment", rejectGapHours: null },
-    label: undefined,
-    expected: `\u2715 ${DEFAULT_COMMITMENT_LABEL}`,
+    expected: `✕ ${DEFAULT_COMMITMENT_LABEL}`,
   },
   {
+    id: "commitment_empty_label_falls_back_to_default",
+    reject: { rejectKind: "commitment", rejectLabel: "", rejectGapHours: null },
+    expected: `✕ ${DEFAULT_COMMITMENT_LABEL}`,
+  },
+  {
+    // A whitespace-only label is not a real one -- it must never render "✕ ".
     id: "commitment_blank_label_falls_back_to_default",
-    reject: { rejectKind: "commitment", rejectGapHours: null },
-    label: "   ",
-    expected: `\u2715 ${DEFAULT_COMMITMENT_LABEL}`,
-  },
-  {
-    // A per-event "show as" override wins over the global commitment label.
-    id: "commitment_reject_label_overrides_global",
-    reject: { rejectKind: "commitment", rejectLabel: "Drill", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Drill",
-  },
-  {
-    // An empty override falls back to the global commitment label.
-    id: "commitment_empty_reject_label_falls_back_to_global",
-    reject: { rejectKind: "commitment", rejectLabel: "", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Fire Dept",
-  },
-  {
-    // Empty override AND unset global \u21d2 the neutral default.
-    id: "commitment_empty_reject_label_and_no_global_uses_default",
-    reject: { rejectKind: "commitment", rejectLabel: "", rejectGapHours: null },
-    label: undefined,
-    expected: `\u2715 ${DEFAULT_COMMITMENT_LABEL}`,
-  },
-  {
-    // A whitespace-only override is not a real label \u2014 fall back.
-    id: "commitment_blank_reject_label_falls_back_to_global",
     reject: { rejectKind: "commitment", rejectLabel: "   ", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Fire Dept",
+    expected: `✕ ${DEFAULT_COMMITMENT_LABEL}`,
   },
   {
-    // The override is trimmed like the global label.
-    id: "commitment_reject_label_is_trimmed",
-    reject: { rejectKind: "commitment", rejectLabel: "  Drill  ", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Drill",
+    id: "commitment_non_string_label_falls_back_to_default",
+    reject: { rejectKind: "commitment", rejectLabel: 42, rejectGapHours: null },
+    expected: `✕ ${DEFAULT_COMMITMENT_LABEL}`,
   },
   {
-    id: "my_shift_ignores_the_configured_label",
-    reject: { rejectKind: "my_shift", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 Medic Shift",
+    // A label must never leak into a different reject kind.
+    id: "my_shift_ignores_the_label",
+    reject: { rejectKind: "my_shift", rejectLabel: "Fire Dept", rejectGapHours: null },
+    expected: "✕ Medic Shift",
   },
   {
-    id: "buffer_rounds_down",
-    reject: { rejectKind: "buffer", rejectGapHours: 12.4 },
-    label: "Fire Dept",
-    expected: "\u2715 BUFFER 12h",
+    id: "buffer_ignores_the_label",
+    reject: { rejectKind: "buffer", rejectLabel: "Fire Dept", rejectGapHours: 12.4 },
+    expected: "✕ BUFFER 12h",
   },
   {
     id: "buffer_rounds_half_up",
     reject: { rejectKind: "buffer", rejectGapHours: 9.5 },
-    label: "Fire Dept",
-    expected: "\u2715 BUFFER 10h",
+    expected: "✕ BUFFER 10h",
   },
   {
     id: "buffer_missing_gap",
     reject: { rejectKind: "buffer", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 BUFFER",
+    expected: "✕ BUFFER",
   },
   {
     id: "buffer_non_finite_gap",
     reject: { rejectKind: "buffer", rejectGapHours: NaN },
-    label: "Fire Dept",
-    expected: "\u2715 BUFFER",
+    expected: "✕ BUFFER",
   },
   {
     id: "pass_shaped_result_has_no_kind",
     reject: { rejectKind: null, rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 REJECTED",
+    expected: "✕ REJECTED",
   },
   {
     id: "unknown_kind",
-    reject: { rejectKind: "something_new", rejectGapHours: null },
-    label: "Fire Dept",
-    expected: "\u2715 REJECTED",
+    reject: { rejectKind: "something_new", rejectLabel: "Fire Dept", rejectGapHours: null },
+    expected: "✕ REJECTED",
   },
-  { id: "null_input", reject: null, label: "Fire Dept", expected: "\u2715 REJECTED" },
-  { id: "undefined_input", reject: undefined, label: "Fire Dept", expected: "\u2715 REJECTED" },
-  { id: "empty_object", reject: {}, label: "Fire Dept", expected: "\u2715 REJECTED" },
+  { id: "null_input", reject: null, expected: "✕ REJECTED" },
+  { id: "undefined_input", reject: undefined, expected: "✕ REJECTED" },
+  { id: "empty_object", reject: {}, expected: "✕ REJECTED" },
 ];
 
 for (const c of REJECT_CHIP_LABEL_CASES) {
   test(`rejectChipLabel: ${c.id}`, () => {
-    assert.equal(rejectChipLabel(c.reject, c.label), c.expected);
+    assert.equal(rejectChipLabel(c.reject), c.expected);
   });
 }
 
@@ -229,14 +207,14 @@ test("rejectChipLabel: the reason string does not influence the chip", () => {
     rejectGapHours: 12.0,
     reason: "no full open tour after the previous commitment (12.0h gap)",
   };
-  assert.equal(rejectChipLabel(buffer, "Fire Dept"), "\u2715 BUFFER 12h");
+  assert.equal(rejectChipLabel(buffer), "\u2715 BUFFER 12h");
 
   const misleading = {
     rejectKind: "my_shift",
     rejectGapHours: null,
     reason: "overlaps a commitment (Mon 09/14 08:00-18:00)",
   };
-  assert.equal(rejectChipLabel(misleading, "Fire Dept"), "\u2715 Medic Shift");
+  assert.equal(rejectChipLabel(misleading), "\u2715 Medic Shift");
 });
 
 // The default must never name an employer -- this repo is public.

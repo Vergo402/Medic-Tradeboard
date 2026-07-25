@@ -19,6 +19,7 @@ import {
   normalizeTitleWhitespace,
   resolvePatternOptIn,
 } from "../sw.js";
+import { rejectChipLabel } from "../core/rowshape.js";
 
 // Every fixture in this file is synthetic. This repo is public and its git
 // history is permanent: no real calendar id, calendar name, event title, or
@@ -1297,4 +1298,83 @@ test("defaultRole: no input of any shape yields REJECT, FLAG or RULE", () => {
       assert.notEqual(role, bad, `input ${JSON.stringify(it)} must not be ${bad}`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-feed commitment label (feedOpts.blockLabel) — what a reject chip says
+//
+// This is the seam that makes the label PER FEED. It has to be resolved here,
+// when the commitment triplet is built, because core/score.js merges overlapping
+// commitments and keeps only the first label — after that, which feed a rejection
+// came from is no longer knowable.
+// ---------------------------------------------------------------------------
+
+test("bucketEvents: a REJECT feed's own label lands on every commitment", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+test("bucketEvents: a RULE feed's label lands on a stem-matched block", () => {
+  const out = bucketEvents([timed("Work day")], "RULE", RULE, "Crew", [], {}, { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+test("bucketEvents: a per-event 'show as' still beats the feed's label", () => {
+  const out = bucketEvents([timed("Work day")], "RULE", RULE, "Crew", [], { "Work day": "Drill" },
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Drill", "the more specific override must win");
+});
+
+test("bucketEvents: no feed label leaves the triplet blank so the chip defaults", () => {
+  for (const opts of [undefined, {}, { blockLabel: "" }, { blockLabel: "   " }, { blockLabel: 42 }]) {
+    const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined, opts);
+    assert.equal(out.commitments[0][2], "", JSON.stringify(opts));
+  }
+});
+
+test("bucketEvents: the feed label is trimmed", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "  Fire Dept  " });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+// The note prefix and the chip word are different things. Mixing them would put
+// a middot into a chip that is only ever meant to hold one short word.
+test("bucketEvents: the feed label is NEVER prefixed like a note", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew Schedule", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+  assert.equal(out.commitments[0][2].includes("·"), false);
+});
+
+test("bucketEvents: the feed label never reaches a note row", () => {
+  const ruled = bucketEvents([timed("Dentist")], "RULE", RULE, "Family", ["Dentist"], {},
+    { blockLabel: "Fire Dept" });
+  assert.equal(ruled.soft[0][2], "Family · Dentist");
+  const flagged = bucketEvents([timed("Dentist")], "FLAG", RULE, "Family", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(flagged.soft[0][2], "Family · Dentist");
+});
+
+test("bucketEvents: a feed label coexists with rest buffers on the same triplet", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { before: 10, after: 2, blockLabel: "Fire Dept" });
+  assert.deepEqual(out.commitments[0].slice(2), ["Fire Dept", 10, 2]);
+});
+
+// End to end across the seam: triplet[2] is what score.js hands the display layer
+// as rejectLabel, and rejectChipLabel turns it into the chip.
+test("bucketEvents + rejectChipLabel: a feed's label becomes its reject chip", () => {
+  const labelled = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(
+    rejectChipLabel({ rejectKind: "commitment", rejectLabel: labelled.commitments[0][2] }),
+    "✕ Fire Dept"
+  );
+  const bare = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew");
+  assert.equal(
+    rejectChipLabel({ rejectKind: "commitment", rejectLabel: bare.commitments[0][2] }),
+    "✕ Commitment"
+  );
 });

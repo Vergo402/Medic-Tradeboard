@@ -117,6 +117,23 @@ const TITLE_LABELS_KEY = "calTitleLabels";
 // note from that calendar in place of the calendar's full display name.
 const LABEL_OVERRIDE_KEY = "calLabelOverride";
 
+// Per-feed word for "I am already committed", shown on the reject chip of every
+// shift this feed knocks out: { [feedId]: string }. This is what makes a feed's
+// rejects say "✕ Fire Dept" while another feed's say "✕ Family".
+//
+// It is NOT calLabelOverride. That one prefixes this feed's NOTES and has never
+// touched the chip; the two are separate on purpose, because the word for "why
+// I am unavailable" is not the same thing as the name of the calendar a note
+// came from. Precedence on the chip, most specific first:
+//
+//   per-event "show as" (calTitleLabels) → this → DEFAULT_COMMITMENT_LABEL
+//
+// Resolution happens in bucketEvents, at the moment the commitment triplet is
+// built, because that is the last point at which the feed is still known:
+// core/score.js merges overlapping commitments and keeps only the FIRST label,
+// and the cached triplets carry no feed id at all.
+const BLOCK_LABEL_KEY = "calBlockLabel";
+
 // Per-calendar default "rest" hours required around a blocking (commitment)
 // event before a shift may be considered clear of it: { [calendarId]: number }.
 // restBefore = clear hours required BEFORE the commitment starts (checked
@@ -557,13 +574,17 @@ function noteLabel(prefix, shown) {
  * @param {string} prefix  short override or calendar summary ("" for primary)
  * @param {unknown} [noteTitles]  the note set for this calendar (want string[])
  * @param {unknown} [labels]  per-event "show as" map { [title]: shortLabel }
- * @param {{before?:number, after?:number, eventBuffers?:object}} [bufferOpts]
+ * @param {{before?:number, after?:number, eventBuffers?:object, blockLabel?:string}} [feedOpts]
  *   this calendar's default restBefore/restAfter and its per-event override
  *   map ({ [title]: {before,after} }, keyed like `labels`/`noteTitles`).
  * @returns {{commitments: string[][], soft: string[][]}}
  */
-export function bucketEvents(events, role, rule, prefix, noteTitles, labels, bufferOpts) {
-  const bufOpts = bufferOpts && typeof bufferOpts === "object" ? bufferOpts : {};
+export function bucketEvents(events, role, rule, prefix, noteTitles, labels, feedOpts) {
+  const bufOpts = feedOpts && typeof feedOpts === "object" ? feedOpts : {};
+  // This feed's own commitment word. Trimmed here so a whitespace-only stored
+  // value behaves as "unset" and falls through to the display-layer default,
+  // rather than rendering a chip that reads "✕".
+  const blockLabel = typeof bufOpts.blockLabel === "string" ? bufOpts.blockLabel.trim() : "";
   const eventBuffers = bufOpts.eventBuffers;
   const commitments = [];
   const soft = [];
@@ -610,11 +631,14 @@ export function bucketEvents(events, role, rule, prefix, noteTitles, labels, buf
     let label;
     if (role === "REJECT") {
       bucket = "commitment";
-      label = perEventLabel; // "" ⇒ reject chip falls back to the global label
+      // Per-event "show as" beats the feed's own word; "" ⇒ the reject chip
+      // falls back to DEFAULT_COMMITMENT_LABEL in the display layer. The note
+      // prefix is deliberately NOT applied — a chip must never read "Feed · X".
+      label = perEventLabel || blockLabel;
     } else if (role === "RULE") {
       if (rule(rawTitle)) {
         bucket = "commitment"; // Block — stem match
-        label = perEventLabel;
+        label = perEventLabel || blockLabel;
       } else if (noteSet.has(normTitle)) {
         bucket = "soft"; // Note — exact match
         label = noteLabel(prefix, perEventLabel || rawTitle);
@@ -1002,6 +1026,7 @@ export function titleSampleWindow(start, end, nowMs) {
  * were skipped, and the user has to be told which.
  */
 async function refreshCalendarData(windowStart, windowEnd) {
+  await migrateCommitmentLabel();
   const cfg = await loadConfig();
   const warnings = [...cfg.warnings];
 
@@ -1012,6 +1037,7 @@ async function refreshCalendarData(windowStart, windowEnd) {
     NOTE_TITLES_KEY,
     TITLE_LABELS_KEY,
     LABEL_OVERRIDE_KEY,
+    BLOCK_LABEL_KEY,
     BUFFER_BEFORE_KEY,
     BUFFER_AFTER_KEY,
     EVENT_BUFFERS_KEY,
@@ -1021,6 +1047,7 @@ async function refreshCalendarData(windowStart, windowEnd) {
   const noteTitles = store[NOTE_TITLES_KEY] || {};
   const titleLabels = store[TITLE_LABELS_KEY] || {};
   const labelOverride = store[LABEL_OVERRIDE_KEY] || {};
+  const blockLabels = store[BLOCK_LABEL_KEY] || {};
   const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
   const bufferAfter = store[BUFFER_AFTER_KEY] || {};
   const eventBuffers = store[EVENT_BUFFERS_KEY] || {};
@@ -1060,7 +1087,12 @@ async function refreshCalendarData(windowStart, windowEnd) {
     const prefix = override || feed.prefix;
     const b = bucketEvents(
       parsed.events, feed.role, rule, prefix, noteTitles[feed.id], titleLabels[feed.id],
-      { before: bufferBefore[feed.id], after: bufferAfter[feed.id], eventBuffers: eventBuffers[feed.id] }
+      {
+        before: bufferBefore[feed.id],
+        after: bufferAfter[feed.id],
+        eventBuffers: eventBuffers[feed.id],
+        blockLabel: blockLabels[feed.id],
+      }
     );
     commitments.push(...b.commitments);
     soft.push(...b.soft);
@@ -1080,6 +1112,50 @@ async function refreshCalendarData(windowStart, windowEnd) {
 
   dlog("refresh done", { commitments: commitments.length, soft: soft.length, warnings });
   return { ok: true, fromCache: false, fetchedAt, commitments, soft, warnings };
+}
+
+// The single global commitment word this extension used before every feed got
+// its own. Read only by the migration below, then deleted.
+const LEGACY_COMMITMENT_LABEL_KEY = "commitmentLabel";
+
+/**
+ * Carry a pre-per-feed global commitment label onto every feed, once.
+ *
+ * WHY THIS EXISTS. The reject chip used to read one global word for every feed.
+ * Deleting that setting without moving its value would silently turn a user's
+ * "✕ Fire Dept" into "✕ Commitment" — config they deliberately set, disarmed
+ * without a word. This codebase has shipped that class of bug twice (an empty
+ * include regex, a hidden calendar losing its role) and both times the damage
+ * was that it was INVISIBLE. So the value is copied first and the old key is
+ * removed only after.
+ *
+ * Applied to EVERY feed, not just the ones that currently block: the old label
+ * would have applied to any feed the moment it was switched to a blocking role,
+ * so seeding all of them is what actually reproduces the prior behaviour.
+ *
+ * Idempotent and self-deleting — once the legacy key is gone this is a single
+ * storage read that does nothing, so it is safe to call on every refresh. It
+ * never overwrites a per-feed label the user has already set.
+ */
+async function migrateCommitmentLabel() {
+  const store = await chrome.storage.local.get([LEGACY_COMMITMENT_LABEL_KEY, FEEDS_KEY, BLOCK_LABEL_KEY]);
+  const legacy = store[LEGACY_COMMITMENT_LABEL_KEY];
+  if (typeof legacy !== "string") return;
+  const word = legacy.trim();
+
+  if (word) {
+    const labels = store[BLOCK_LABEL_KEY] || {};
+    let touched = false;
+    for (const f of Array.isArray(store[FEEDS_KEY]) ? store[FEEDS_KEY] : []) {
+      if (!f || typeof f.id !== "string" || !f.id) continue;
+      if (typeof labels[f.id] === "string" && labels[f.id].trim()) continue; // user already set one
+      labels[f.id] = word;
+      touched = true;
+    }
+    if (touched) await chrome.storage.local.set({ [BLOCK_LABEL_KEY]: labels });
+  }
+  await chrome.storage.local.remove(LEGACY_COMMITMENT_LABEL_KEY);
+  dlog("migrated commitmentLabel", word ? "seeded" : "blank — dropped");
 }
 
 /**
@@ -1164,6 +1240,10 @@ async function handleGetCalendarData(msg) {
  * to have added it in the first place.
  */
 async function handleListFeeds() {
+  // The options page is the other way a user reaches this worker, so the
+  // migration runs here too — otherwise a legacy label would sit unmoved until
+  // the next board refresh and the panel would render the wrong thing meanwhile.
+  await migrateCommitmentLabel();
   const store = await chrome.storage.local.get([
     FEEDS_KEY,
     ROLES_KEY,
@@ -1171,10 +1251,12 @@ async function handleListFeeds() {
     PATTERN_OPT_IN_KEY,
     "ruleInclude",
     "ruleExclude",
+    BLOCK_LABEL_KEY,
     BUFFER_BEFORE_KEY,
     BUFFER_AFTER_KEY,
   ]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
+  const blockLabels = store[BLOCK_LABEL_KEY] || {};
   const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
   const bufferAfter = store[BUFFER_AFTER_KEY] || {};
   const feeds = resolveFeedRoles(store[FEEDS_KEY], store[ROLES_KEY]).map((f) => ({
@@ -1193,6 +1275,9 @@ async function handleListFeeds() {
     // blockTitles lets the picker show what is already ticked without a second
     // round trip.
     blockTitles: Array.isArray(blockTitles[f.id]) ? blockTitles[f.id] : [],
+    // This feed's word on the reject chip ("" = fall back to the neutral
+    // default). Only meaningful for a feed that can block.
+    blockLabel: typeof blockLabels[f.id] === "string" ? blockLabels[f.id] : "",
     // Default rest-buffer hours for this feed's blocking events (0 when
     // unconfigured) — see BUFFER_BEFORE_KEY/BUFFER_AFTER_KEY.
     bufferBefore: typeof bufferBefore[f.id] === "number" ? bufferBefore[f.id] : 0,
@@ -1242,6 +1327,34 @@ async function handleSetFeedRole(msg) {
   const roles = (await chrome.storage.local.get(ROLES_KEY))[ROLES_KEY] || {};
   roles[feedId] = msg.role;
   await chrome.storage.local.set({ [ROLES_KEY]: roles });
+  await chrome.storage.local.remove(CACHE_KEY);
+  return { ok: true };
+}
+
+/**
+ * Persist one feed's reject-chip word (calBlockLabel).
+ *
+ * Deliberately its own tiny handler rather than a field on setEventRules: that
+ * one writes a SNAPSHOT of the whole three-way picker, and a REJECT feed never
+ * loads a picker — routing this through it would send empty block/note arrays
+ * and wipe config the user still has.
+ *
+ * An empty or whitespace-only value REMOVES the entry rather than storing "",
+ * so "unset" has exactly one representation and the chip falls back to the
+ * neutral default.
+ *
+ * -> { type:"setFeedBlockLabel", feedId, label }
+ * <- { ok:true } | { ok:false, error:"bad_feed_id" }
+ */
+async function handleSetFeedBlockLabel(msg) {
+  const feedId = msgFeedId(msg);
+  if (!feedId) return { ok: false, error: "bad_feed_id" };
+  const label = typeof (msg && msg.label) === "string" ? msg.label.trim() : "";
+
+  const map = (await chrome.storage.local.get(BLOCK_LABEL_KEY))[BLOCK_LABEL_KEY] || {};
+  if (label) map[feedId] = label;
+  else delete map[feedId];
+  await chrome.storage.local.set({ [BLOCK_LABEL_KEY]: map });
   await chrome.storage.local.remove(CACHE_KEY);
   return { ok: true };
 }
@@ -1656,7 +1769,8 @@ async function handleAddFeedFile(msg) {
 // Every per-feed map, so removal can clear all of them in one pass.
 const PER_FEED_KEYS = [
   ROLES_KEY, BLOCK_TITLES_KEY, NOTE_TITLES_KEY, TITLE_LABELS_KEY,
-  LABEL_OVERRIDE_KEY, BUFFER_BEFORE_KEY, BUFFER_AFTER_KEY, EVENT_BUFFERS_KEY,
+  LABEL_OVERRIDE_KEY, BLOCK_LABEL_KEY, BUFFER_BEFORE_KEY, BUFFER_AFTER_KEY,
+  EVENT_BUFFERS_KEY,
 ];
 
 /**
@@ -1746,6 +1860,7 @@ const HANDLERS = {
   // Per-feed configuration (keyed by feed id; see msgFeedId).
   setFeedRole: handleSetFeedRole,
   setCalendarRole: handleSetFeedRole, // compatibility alias — same handler
+  setFeedBlockLabel: handleSetFeedBlockLabel,
   setCalendarBuffer: handleSetCalendarBuffer,
   setBlockTitles: handleSetBlockTitles,
   setEventRules: handleSetEventRules,
