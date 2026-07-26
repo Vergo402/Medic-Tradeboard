@@ -247,11 +247,13 @@ function parseDateOnly(v) {
   return { y: +m[1], mo: +m[2], d: +m[3] };
 }
 function parseDateTime(v) {
-  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/.exec(v);
+  // [Tt]/[Zz]: RFC 5234 ABNF string literals are case-INsensitive, so a
+  // lowercase separator or UTC suffix is a legal DATE-TIME, not a skip.
+  const m = /^(\d{4})(\d{2})(\d{2})[Tt](\d{2})(\d{2})(\d{2})([Zz])?$/.exec(v);
   if (!m || !validYMD(+m[1], +m[2], +m[3])) return null;
   const [h, mi, s] = [+m[4], +m[5], +m[6]];
   if (h > 23 || mi > 59 || s > 59) return null;
-  return { y: +m[1], mo: +m[2], d: +m[3], h, mi, s, utc: m[7] === "Z" };
+  return { y: +m[1], mo: +m[2], d: +m[3], h, mi, s, utc: !!m[7] };
 }
 
 /**
@@ -557,7 +559,13 @@ function* genYearly(start, rule, ceil) {
   // year-scoped expander instead. BYMONTH present keeps the month-scoped path,
   // where ordinals are month-relative per the RFC.
   if (rule.byday && !rule.bymonth && !rule.bymonthday) return yield* genYearlyByday(start, rule, ceil);
-  const months = [...(rule.bymonth || [start.mo])].sort((a, b) => a - b);
+  // Same year-scoping for BYMONTHDAY (± BYDAY as a limit) with no BYMONTH: the
+  // RFC's expand table covers every month of the year, not DTSTART's. monthDays
+  // already intersects byday∩bymonthday per month. DTSTART's month is only the
+  // anchor when NO expanding by-part is present at all.
+  const months = rule.bymonth ? [...rule.bymonth].sort((a, b) => a - b)
+    : rule.bymonthday ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      : [start.mo];
   let y = start.y;
   for (let i = 0; y <= ceil.y; i++) {
     if (i > MAX_STEPS) return yield OVERFLOW;
@@ -641,8 +649,15 @@ function computeEndShape(start, props) {
     if (!e || e.allDay) return { err: "unusable DTEND: " + props.DTEND.value };
     if (e.zone !== "UTC" && !isValidZone(e.zone)) return { err: "unresolvable DTEND timezone: " + e.zone };
     const startMs = civilToMs(start.civil, start.zone);
-    const gap = e.zone === start.zone ? gapShift(start.civil, start.zone, startMs) : 0;
-    const ms = civilToMs(gap ? shiftWall(e.civil, gap) : e.civil, e.zone) - startMs;
+    // Honor DTEND exactly as stated first. Only when that would invert the event
+    // AND the start was pushed out of a spring-forward gap is the DTEND read as
+    // authored against the same pre-gap clock and pushed by the same shift — a
+    // valid later wall time (05:00 after a gapped 02:30 start) stays as stated.
+    let ms = civilToMs(e.civil, e.zone) - startMs;
+    if (ms <= 0 && e.zone === start.zone) {
+      const gap = gapShift(start.civil, start.zone, startMs);
+      if (gap) ms = civilToMs(shiftWall(e.civil, gap), e.zone) - startMs;
+    }
     return ms > 0 ? { kind: "exact", ms } : { err: "DTEND at or before DTSTART" };
   }
   if (props.DURATION) {
@@ -904,8 +919,12 @@ function collectComponents(lines) {
   const st = { cur: null, depth: 0, inAlarm: 0 };
   for (const line of lines) {
     const uline = line.toUpperCase(); // BEGIN:/END: are property names -> case-insensitive (§3.1)
-    if (uline.startsWith("BEGIN:")) beginComponent(st, uline.slice(6));
-    else if (uline.startsWith("END:")) endComponent(st, uline.slice(4), vevents);
+    // trim(): stray whitespace around a component name (a real producer quirk)
+    // must not turn BEGIN:VEVENT into an unrecognized component — the event's
+    // props would be misread as calendar-level lines and the whole event would
+    // vanish without a warning OR a throw (depth still balances).
+    if (uline.startsWith("BEGIN:")) beginComponent(st, uline.slice(6).trim());
+    else if (uline.startsWith("END:")) endComponent(st, uline.slice(4).trim(), vevents);
     else if (st.cur && !st.inAlarm) {
       const p = splitProp(line);
       if (p) addProp(st.cur, p);

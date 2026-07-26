@@ -1048,3 +1048,58 @@ test("YEARLY BYMONTH+ordinal BYDAY stays MONTH-scoped (the year-scoped path must
     "2027-11-04T13:00:00.000Z",
   ]);
 });
+
+// --- Round-3 adversarial findings -------------------------------------------
+
+test("trailing whitespace on BEGIN:VEVENT/END:VEVENT never silently drops the event", () => {
+  const r = parseIcs("BEGIN:VCALENDAR\nBEGIN:VEVENT \nSUMMARY:Spacey\nDTSTART:20260801T090000Z\nDTEND:20260801T170000Z\nEND:VEVENT \nEND:VCALENDAR\n",
+    "2026-07-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0].summary, "Spacey");
+  assert.deepEqual(r.warnings, []);
+});
+
+test("a fully-lowercase begin:vcalendar wrapper is accepted (component names are case-insensitive)", () => {
+  const r = parseIcs("begin:vcalendar\nbegin:vevent\nSUMMARY:LC\ndtstart:20260801T090000Z\ndtend:20260801T100000Z\nend:vevent\nend:vcalendar\n",
+    "2026-07-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.deepEqual([r.events.length, r.warnings.length], [1, 0]);
+});
+
+test("lowercase t/z in a DATE-TIME value is ABNF-legal and parses, not a skip", () => {
+  const r = parse(ev("SUMMARY:lz\nDTSTART:20260801t090000z\nDTEND:20260801T100000Z"));
+  assert.deepEqual(tripsOf(r), [["2026-08-01 05:00", "2026-08-01 06:00"]]);
+  assert.deepEqual(r.warnings, []);
+});
+
+test("YEARLY BYMONTHDAY with no BYMONTH expands every month of the year, COUNT bounding it", () => {
+  const r = parse(ev("SUMMARY:y15\nDTSTART;TZID=America/New_York:20260115T080000\nDTEND;TZID=America/New_York:20260115T090000\nRRULE:FREQ=YEARLY;BYMONTHDAY=15;COUNT=5"),
+    "2026-01-01T00:00:00Z", "2031-01-01T00:00:00Z");
+  assert.deepEqual(r.events.map((e) => e.start.dateTime), [
+    "2026-01-15T13:00:00.000Z", "2026-02-15T13:00:00.000Z", "2026-03-15T12:00:00.000Z",
+    "2026-04-15T12:00:00.000Z", "2026-05-15T12:00:00.000Z",
+  ]);
+  assert.deepEqual(r.warnings, []);
+});
+
+test("YEARLY BYDAY=FR;BYMONTHDAY=13 with no BYMONTH is every Friday the 13th", () => {
+  const r = parse(ev("SUMMARY:fri13\nDTSTART;TZID=America/New_York:20260213T080000\nDTEND;TZID=America/New_York:20260213T090000\nRRULE:FREQ=YEARLY;BYDAY=FR;BYMONTHDAY=13;COUNT=4"),
+    "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z");
+  assert.deepEqual(r.events.map((e) => e.start.dateTime), [
+    "2026-02-13T13:00:00.000Z", "2026-03-13T12:00:00.000Z",
+    "2026-11-13T13:00:00.000Z", "2027-08-13T12:00:00.000Z",
+  ]);
+  assert.deepEqual(r.warnings, []);
+});
+
+test("a gapped DTSTART only drags a same-zone DTEND with it when honoring it as stated would invert", () => {
+  // DTEND 05:00 is a real wall time after the gap: honored exactly as stated.
+  const a = parse(ev("SUMMARY:GapValidEnd\nDTSTART;TZID=America/New_York:20260308T023000\nDTEND;TZID=America/New_York:20260308T050000"));
+  assert.deepEqual(a.events.map((e) => [e.start.dateTime, e.end.dateTime]),
+    [["2026-03-08T07:30:00.000Z", "2026-03-08T09:00:00.000Z"]]);
+  // DTEND 03:00 was authored against the pre-gap clock (unshifted it precedes
+  // the pushed start): pushed by the same gap, preserving the 30-min wall span.
+  const b = parse(ev("SUMMARY:GapPreEnd\nDTSTART;TZID=America/New_York:20260308T023000\nDTEND;TZID=America/New_York:20260308T030000"));
+  assert.deepEqual(b.events.map((e) => [e.start.dateTime, e.end.dateTime]),
+    [["2026-03-08T07:30:00.000Z", "2026-03-08T08:00:00.000Z"]]);
+  assert.deepEqual([a.warnings, b.warnings], [[], []]);
+});
