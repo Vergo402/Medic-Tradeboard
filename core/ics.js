@@ -336,7 +336,11 @@ function parseByday(rule, v) {
   for (const tok of v.split(",")) {
     const m = /^([+-]?\d+)?(SU|MO|TU|WE|TH|FR|SA)$/i.exec(tok.trim());
     if (!m) return "BYDAY=" + tok;
-    out.push({ ord: m[1] ? parseInt(m[1], 10) : null, day: WD[m[2].toUpperCase()] });
+    const ord = m[1] ? parseInt(m[1], 10) : null;
+    // §3.3.10 ordwk is 1–53 (optionally signed); 0 or out-of-range would select
+    // nothing, ever — a clean-looking empty expansion instead of a named skip.
+    if (ord !== null && (ord === 0 || ord > 53 || ord < -53)) return "BYDAY=" + tok;
+    out.push({ ord, day: WD[m[2].toUpperCase()] });
   }
   rule.byday = out;
   return null;
@@ -399,6 +403,9 @@ function parseRRule(value, zone) {
   if ((rule.freq === "WEEKLY" || rule.freq === "DAILY") && rule.byday && rule.byday.some((b) => b.ord !== null)) {
     return { unsupported: "ordinal_byday_with_" + rule.freq.toLowerCase() };
   }
+  // §3.3.10: BYMONTHDAY MUST NOT be used with FREQ=WEEKLY. Running the rule as a
+  // bare weekly would fabricate occurrences the producer never meant.
+  if (rule.freq === "WEEKLY" && rule.bymonthday) return { unsupported: "bymonthday_with_weekly" };
   return rule;
 }
 
@@ -412,19 +419,22 @@ function parseRRule(value, zone) {
 // yields it draws by COUNT/UNTIL/window.
 // ---------------------------------------------------------------------------
 
-// BYDAY (day-of-week only; ordinals are meaningless for DAILY) and BYMONTH are
-// LIMITS for FREQ=DAILY (RFC 5545 §3.3.10 Note): a candidate whose weekday/month
-// isn't selected is filtered out. Filtering here never changes the iteration
-// count — `i` still advances one calendar day per step regardless of match, so
-// the MAX_STEPS/ceil termination is untouched by the filter.
-function* genDaily(start, interval, byday, bymonth, ceil) {
+// BYDAY (day-of-week only; ordinals are meaningless for DAILY), BYMONTH and
+// BYMONTHDAY (negative = from month end) are LIMITS for FREQ=DAILY (RFC 5545
+// §3.3.10 expansion table): a candidate whose weekday/month/month-day isn't
+// selected is filtered out. Filtering here never changes the iteration count —
+// `i` still advances one calendar day per step regardless of match, so the
+// MAX_STEPS/ceil termination is untouched by the filter.
+function* genDaily(start, rule, ceil) {
+  const { interval, byday, bymonth, bymonthday } = rule;
   let c = { ...start };
   for (let i = 0; cmpYMD(c, ceil) <= 0; i++) {
     if (i > MAX_STEPS) return yield OVERFLOW;
     const wd = weekdayOf(c.y, c.mo, c.d);
     const dayOk = !byday || !byday.length || byday.some((b) => b.day === wd);
     const monOk = !bymonth || bymonth.includes(c.mo);
-    if (dayOk && monOk) yield c;
+    const mdayOk = !bymonthday || bymonthday.some((n) => c.d === (n < 0 ? daysInMonth(c.y, c.mo) + 1 + n : n));
+    if (dayOk && monOk && mdayOk) yield c;
     c = addDaysYMD(c, interval);
   }
 }
@@ -575,7 +585,7 @@ function* genYearly(start, rule, ceil) {
 }
 
 function candidateGen(start, rule, ceil) {
-  if (rule.freq === "DAILY") return genDaily(start, rule.interval, rule.byday, rule.bymonth, ceil);
+  if (rule.freq === "DAILY") return genDaily(start, rule, ceil);
   if (rule.freq === "WEEKLY") return genWeekly(start, rule.interval, rule.byday, rule.wkst, rule.bymonth, ceil);
   if (rule.freq === "MONTHLY") return genMonthly(start, rule, ceil);
   return genYearly(start, rule, ceil);

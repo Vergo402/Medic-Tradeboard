@@ -1131,3 +1131,34 @@ test("duplicate overrides for one recurrence instance: highest SEQUENCE wins, st
   ]);
   assert.deepEqual(r.warnings, ['duplicate_override: OvrOld (stale revision discarded)']);
 });
+
+// --- Round-5 adversarial findings -------------------------------------------
+
+test("FREQ=DAILY honors BYMONTHDAY as a LIMIT — only matching month days emit, COUNT counts survivors", () => {
+  const r = parse(ev("SUMMARY:D13\nDTSTART:20260701T090000\nDTEND:20260701T100000\nRRULE:FREQ=DAILY;BYMONTHDAY=13;COUNT=2"),
+    "2026-06-01T00:00:00Z", "2026-10-01T00:00:00Z");
+  assert.deepEqual(r.events.map((e) => e.start.dateTime),
+    ["2026-07-13T13:00:00.000Z", "2026-08-13T13:00:00.000Z"]);
+  assert.deepEqual(r.warnings, []);
+  // Negative form: last day of each month.
+  const n = parse(ev("SUMMARY:DLast\nDTSTART:20260701T090000\nDTEND:20260701T100000\nRRULE:FREQ=DAILY;BYMONTHDAY=-1;COUNT=2"),
+    "2026-06-01T00:00:00Z", "2026-10-01T00:00:00Z");
+  assert.deepEqual(n.events.map((e) => e.start.dateTime),
+    ["2026-07-31T13:00:00.000Z", "2026-08-31T13:00:00.000Z"]);
+});
+
+test("BYMONTHDAY with FREQ=WEEKLY (RFC-forbidden) skips loudly, never runs as bare weekly", () => {
+  const r = parse(ev("SUMMARY:WMD\nDTSTART:20260701T090000\nDTEND:20260701T100000\nRRULE:FREQ=WEEKLY;BYMONTHDAY=13;COUNT=3"),
+    "2026-06-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.equal(r.events.length, 0);
+  assert.match(r.warnings[0], /unsupported recurrence: bymonthday_with_weekly/);
+});
+
+test("BYDAY ordinal 0 (or beyond ±53) is malformed and skips loudly, never a clean empty series", () => {
+  for (const rr of ["FREQ=MONTHLY;BYDAY=0FR;COUNT=3", "FREQ=YEARLY;BYDAY=0FR;COUNT=3", "FREQ=MONTHLY;BYDAY=54MO"]) {
+    const r = parse(ev(`SUMMARY:ORD0\nDTSTART:20260701T090000\nDTEND:20260701T100000\nRRULE:${rr}`),
+      "2026-06-01T00:00:00Z", "2026-12-01T00:00:00Z");
+    assert.equal(r.events.length, 0, rr);
+    assert.match(r.warnings[0], /unsupported recurrence: BYDAY=/, rr);
+  }
+});
