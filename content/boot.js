@@ -64,6 +64,9 @@
       // identity): no config has been read yet, so we do not claim to be
       // checking anything.
       anyCalendarBlocks: false,
+      // Same honest-default reasoning as anyCalendarBlocks: nothing has been
+      // read yet at these early-exit guards, so there is nothing to review.
+      newCalendarTitles: null,
     };
   }
 
@@ -208,6 +211,7 @@
     let myschedStatus = "none";
     let calAgeMs = null;
     let calError = null;
+    let calStale = false; // last response was a served-from-cache fallback after a blocking-feed failure
     let lastVisible = null; // domscan's {records, anchors, year, month, monthName, source}
     let calendarLoaded = false; // a calendar read has SUCCEEDED at least once this load
     // Ids known BEFORE this page load's snapshot write, frozen by
@@ -219,6 +223,11 @@
     // but no events this window). Only the config read disambiguates.
     let anyCalendarBlocks = false;
     let bannerOnLoad = await loadBannerFromLastDiff();
+    // sw.js's refreshCalendarData (and handleListFeedTitles, on mark-reviewed)
+    // own the `newTitlesByFeed` storage key — this is just the read side, a
+    // single-line summary for the drawer's "review new titles" nudge. null
+    // means nothing to review anywhere.
+    let newCalendarTitles = await loadNewCalendarTitles();
 
     /**
      * Re-read the three block-config keys and recompute anyCalendarBlocks. No
@@ -248,6 +257,31 @@
       };
     }
 
+    /**
+     * The drawer's single-line "review new titles" summary, or null when
+     * there is nothing to review. `newTitlesByFeed` is { [feedId]:
+     * {feedName, titles:string[]} }, rebuilt wholesale by sw.js on every
+     * successful refresh and pruned per-feed the moment that feed's picker is
+     * opened (handleListFeedTitles). Reads as {} when nothing has ever
+     * qualified — not an error, just "nothing to report".
+     *
+     * MOST NEW WINS. The banner is one line, so with more than one qualifying
+     * feed only the feed with the most new titles is named — a list would not
+     * fit, and the count alone still tells the user something changed.
+     */
+    async function loadNewCalendarTitles() {
+      const { newTitlesByFeed } = await chrome.storage.local.get("newTitlesByFeed");
+      if (!newTitlesByFeed || typeof newTitlesByFeed !== "object") return null;
+      let best = null;
+      for (const entry of Object.values(newTitlesByFeed)) {
+        if (!entry || !Array.isArray(entry.titles) || entry.titles.length === 0) continue;
+        if (!best || entry.titles.length > best.count) {
+          best = { feedName: typeof entry.feedName === "string" ? entry.feedName : "", count: entry.titles.length };
+        }
+      }
+      return best;
+    }
+
     async function getStoredSnapshot() {
       const { snapshot } = await chrome.storage.local.get("snapshot");
       return snapshot || null;
@@ -272,10 +306,23 @@
         commitments = loadCommitments(resp.commitments);
         softEvents = parseTriplets(resp.soft);
         calAgeMs = Date.now() - resp.fetchedAt;
-        calError = null;
+        calStale = Boolean(resp.stale);
+        // A stale response keeps its error string: it names the feed that failed,
+        // which is what the amber banner offers the user to go fix. The drawer
+        // branches on calStale FIRST, so this does not raise the red alarm.
+        calError = resp.stale ? (resp.error || "stale") : null;
         calendarLoaded = true;
       } else {
+        calStale = false;
         calError = (resp && resp.error) || "unknown_error";
+        // Deliberate reset, not an oversight: boot's cache path (see below) may
+        // already have set calendarLoaded true from an earlier successful read
+        // this load. If THIS response is genuine no-data (no usable cache to
+        // fall back on), that earlier success no longer speaks for the current
+        // state, and scoringTrusted must go false so nothing gets snapshotted
+        // against a scoring run that has since gone dark. This is what the old
+        // `&& !calError` gate on scoringTrusted used to accomplish.
+        calendarLoaded = false;
       }
     }
 
@@ -352,6 +399,11 @@
         monthLabel,
         calAgeMs,
         calError,
+        calStale,
+        // "cached data, refresh failed" vs "nothing at all" — calError alone
+        // can't express that distinction, so the drawer gets calendarLoaded
+        // itself under a name that reads at the call site.
+        hasCalData: calendarLoaded,
         myschedStatus,
         banner: bannerOnLoad,
         stats: {
@@ -364,6 +416,7 @@
         rejects,
         notice: notice || null,
         anyCalendarBlocks,
+        newCalendarTitles,
       };
     }
 
@@ -384,6 +437,24 @@
         // logged, never thrown out of the click handler.
         sendToSW({ type: "openOptions" })
           .catch((e) => console.error("[medic-tradeboard] open options failed:", e));
+      },
+      onResync: () => {
+        // `controller` is assigned from this very initDrawer call, so this
+        // closure must reference it lazily — it only runs later, on click, by
+        // which point the assignment below has completed. Same fire-and-forget
+        // contract as onOpenSetup: a failure is logged, never thrown out of the
+        // click handler.
+        (async () => {
+          const resp = await askCalendar("refresh");
+          applyCalResponse(resp);
+          // Re-read regardless of resp.ok: a failed refresh never touches
+          // `newTitlesByFeed` (see refreshCalendarData's persist-placement
+          // comment), so this is a harmless no-op on failure and a real
+          // update on success — no need to branch on resp.ok twice.
+          newCalendarTitles = await loadNewCalendarTitles();
+          if (resp && resp.ok && lastVisible) await rescoreVisibleAndPaint();
+          else controller.update(buildState({ monthLabel: currentMonthLabel(), rows: lastRows, rejects: lastRejRows }));
+        })().catch((e) => console.error("[medic-tradeboard] resync failed:", e));
       },
     });
 
@@ -420,13 +491,23 @@
       // `feeds` is watched too: adding or removing a feed changes what can block
       // a shift just as much as changing a role does, and without it the board
       // would keep scoring against a feed the user just deleted.
-      if (!("feeds" in changes || "calRoles" in changes
-        || "calBlockTitles" in changes || "ruleUsePattern" in changes)) return;
+      const configChanged = "feeds" in changes || "calRoles" in changes
+        || "calBlockTitles" in changes || "ruleUsePattern" in changes;
+      // `newTitlesByFeed` alone (e.g. the options page picker was just opened
+      // and marked a feed reviewed, in another tab/execution context) needs no
+      // rescoring — nothing that decides commitments changed — just a repaint
+      // so the drawer's nudge disappears without waiting for the next boot.
+      const reviewChanged = "newTitlesByFeed" in changes;
+      if (!configChanged && !reviewChanged) return;
       (async () => {
-        await refreshBlockingSignal();
-        const resp = await askCalendar("refresh");
-        applyCalResponse(resp);
-        if (resp && resp.ok && lastVisible) {
+        if (configChanged) await refreshBlockingSignal();
+        let resp = null;
+        if (configChanged) {
+          resp = await askCalendar("refresh");
+          applyCalResponse(resp);
+        }
+        newCalendarTitles = await loadNewCalendarTitles();
+        if (configChanged && resp && resp.ok && lastVisible) {
           await rescoreVisibleAndPaint();
         } else {
           controller.update(buildState({
@@ -540,6 +621,7 @@
     // rather than waiting on both.
     const calRefreshDone = askCalendar("refresh").then(async (resp) => {
       applyCalResponse(resp);
+      newCalendarTitles = await loadNewCalendarTitles();
       if (resp && resp.ok) await rescoreVisibleAndPaint();
     }).catch((e) => console.error("[medic-tradeboard] calendar refresh failed:", e));
 
@@ -570,8 +652,12 @@
     const diffable = scanStart <= scanEnd;
     // Without real calendar data every shift scores `pass`; writing that would
     // poison the snapshot exactly as a failed month did in the deleted full
-    // sweep. Same rule as drift above: on a failed scan, write nothing.
-    const scoringTrusted = calendarLoaded && !calError;
+    // sweep. Same rule as drift above: on a failed scan, write nothing. A
+    // stale-but-covering cache (calStale true, calendarLoaded true) is REAL
+    // scoring — commitments/softEvents are populated from real events — so it
+    // is safe to snapshot; only genuine no-data leaves calendarLoaded false
+    // (applyCalResponse's reset above), and that's what still gates this off.
+    const scoringTrusted = calendarLoaded;
     if (diffable && scoringTrusted) {
       await runDiffForVisibleMonth();
     } else if (diffable) {

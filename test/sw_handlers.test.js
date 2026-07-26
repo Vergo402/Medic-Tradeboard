@@ -918,3 +918,151 @@ test("migration: the migrated word is what rejects actually say", async () => {
   assert.equal(resp.commitments[0][2], "Fire Dept",
     "a pre-upgrade word must survive the upgrade end to end");
 });
+
+// ---------------------------------------------------------------------------
+// New-title review nudge — the picker's data layer (declutter + recurring +
+// "you have not reviewed this title yet")
+//
+// The gate is exact: only a RULE feed actually deciding its blocking set from
+// ticked titles (calendarRule(...).mode === "titles") is tracked here. A feed
+// qualifies the moment it has at least one usable ticked title.
+// ---------------------------------------------------------------------------
+
+test("getCalendarData: first sync for a RULE/titles feed seeds calSeenTitles and flags nothing", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "a user's very first sync must not flag every title they already own"
+  );
+  assert.deepEqual(
+    (STORE.calSeenTitles["cal-r"] || []).slice().sort(),
+    ["Brand New Training", "Crew - Desk"],
+    "the baseline is seeded to the current today-or-later title set"
+  );
+});
+
+test("getCalendarData: a title new since the last review IS flagged in newTitlesByFeed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] }; // already reviewed once
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.newTitlesByFeed["cal-r"], {
+    feedName: "Crew Schedule",
+    titles: ["Brand New Training"],
+  });
+});
+
+test("getCalendarData: a new title already covered by a ticked BLOCK title (by stem) is NOT flagged", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk", "Crew - Night Tour"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Crew - Night Tour", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "a title that already blocks shifts must not also nag"
+  );
+});
+
+test("getCalendarData: a new title already in the NOTE list is NOT flagged", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calNoteTitles = { "cal-r": ["Music Class"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Music Class", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(STORE.newTitlesByFeed["cal-r"], undefined);
+});
+
+test("getCalendarData: a REJECT feed (no picker) never populates newTitlesByFeed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["cal-r"] = [timed("Anything", "10")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.newTitlesByFeed, {}, "REJECT has no picker and must never be tracked");
+});
+
+test("listFeedTitles: isNew reflects the PRE-review state, then marks the feed reviewed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.newTitlesByFeed = { "cal-r": { feedName: "Crew Schedule", titles: ["Brand New Training"] } };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  const byTitle = Object.fromEntries(resp.titles.map((t) => [t.title, t.isNew]));
+  assert.equal(byTitle["Brand New Training"], true);
+  assert.equal(byTitle["Crew - Desk"], false);
+
+  // Opening the picker IS the review: the baseline advances and the nudge
+  // clears, so the drawer's banner is gone on the next paint.
+  assert.deepEqual(
+    STORE.calSeenTitles["cal-r"].slice().sort(),
+    ["Brand New Training", "Crew - Desk"]
+  );
+  assert.equal(STORE.newTitlesByFeed["cal-r"], undefined);
+});
+
+test("listFeedTitles: the very first time a feed's picker is opened, nothing is flagged isNew", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    resp.titles.every((t) => t.isNew === false),
+    true,
+    "no prior baseline to compare against — nothing can honestly be called new yet"
+  );
+  assert.deepEqual(STORE.calSeenTitles["cal-r"], ["Crew - Desk"]);
+});
+
+test("listFeedTitles: recurring is true for a series title, false for a standalone one", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  FEED_BODIES["cal-r"] =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+    "BEGIN:VEVENT\r\nUID:r1\r\nSUMMARY:Standing Tour\r\n" +
+    "DTSTART;TZID=America/New_York:20260804T080000\r\n" +
+    "DTEND;TZID=America/New_York:20260804T180000\r\n" +
+    "RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n" +
+    "BEGIN:VEVENT\r\nUID:s1\r\nSUMMARY:One-off Drill\r\n" +
+    "DTSTART;TZID=America/New_York:20260805T080000\r\n" +
+    "DTEND;TZID=America/New_York:20260805T180000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  const byTitle = Object.fromEntries(resp.titles.map((t) => [t.title, t.recurring]));
+  assert.equal(byTitle["Standing Tour"], true);
+  assert.equal(byTitle["One-off Drill"], false);
+});

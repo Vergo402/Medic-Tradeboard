@@ -14,6 +14,7 @@ import {
   titleStem,
   titlesToMatcher,
   summarizeTitles,
+  newTitlesForFeed,
   calendarRule,
   titleSampleWindow,
   normalizeTitleWhitespace,
@@ -983,6 +984,91 @@ test("summarizeTitles: titles are grouped verbatim, never pre-stemmed", () => {
 test("summarizeTitles: null/undefined event list is safe", () => {
   assert.deepEqual(summarizeTitles(null), []);
   assert.deepEqual(summarizeTitles(undefined), []);
+});
+
+// ---------------------------------------------------------------------------
+// summarizeTitles — today-or-later declutter + recurring surfacing
+// ---------------------------------------------------------------------------
+
+// noon NY on 2026-08-15 — same clock convention as titleSampleWindow's tests.
+const TODAY_NOON = Date.parse("2026-08-15T16:00:00Z");
+
+test("summarizeTitles: a stale one-off (only past instances) is dropped entirely", () => {
+  const out = summarizeTitles(
+    [ev("Old Training", "2026-08-01T08:00:00-04:00", "2026-08-01T12:00:00-04:00")],
+    TODAY_NOON
+  );
+  assert.deepEqual(out, []);
+});
+
+test("summarizeTitles: a title with today-or-later AND past instances survives, count includes both", () => {
+  const out = summarizeTitles(
+    [
+      ev("Desk", "2026-08-01T08:00:00-04:00", "2026-08-01T20:00:00-04:00"), // past
+      ev("Desk", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00"), // future
+    ],
+    TODAY_NOON
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0].count, 2, "count reflects every instance once the title qualifies, not just future ones");
+});
+
+test("summarizeTitles: an instance dated exactly today keeps the title", () => {
+  const out = summarizeTitles(
+    [ev("Desk", "2026-08-15T08:00:00-04:00", "2026-08-15T20:00:00-04:00")],
+    TODAY_NOON
+  );
+  assert.equal(out.length, 1);
+});
+
+test("summarizeTitles: recurring is true when ANY instance of the title is stamped recurring", () => {
+  const recurringEv = ev("Standing Tour", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  recurringEv.recurring = true;
+  const oneOff = ev("One-off Drill", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  oneOff.recurring = false;
+  const out = summarizeTitles([recurringEv, oneOff], TODAY_NOON);
+  assert.equal(out.find((t) => t.title === "Standing Tour").recurring, true);
+  assert.equal(out.find((t) => t.title === "One-off Drill").recurring, false);
+});
+
+test("summarizeTitles: a mix of recurring and standalone instances under the same title reads recurring", () => {
+  const a = ev("Desk", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  a.recurring = false;
+  const b = ev("Desk", "2026-08-27T08:00:00-04:00", "2026-08-27T20:00:00-04:00");
+  b.recurring = true;
+  const out = summarizeTitles([a, b], TODAY_NOON);
+  assert.equal(out[0].recurring, true);
+});
+
+// ---------------------------------------------------------------------------
+// newTitlesForFeed — the "review new titles" nudge's core filter
+// ---------------------------------------------------------------------------
+
+test("newTitlesForFeed: a genuinely new title (not seen, not blocked, not noted) is flagged", () => {
+  const fresh = newTitlesForFeed(["ACME - Desk", "New Title"], ["ACME - Desk"], [], []);
+  assert.deepEqual(fresh, ["New Title"]);
+});
+
+test("newTitlesForFeed: a title already in seenTitles is not flagged", () => {
+  const fresh = newTitlesForFeed(["Old Title"], ["Old Title"], [], []);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: a title already covered by a ticked BLOCK title (by stem) is not flagged", () => {
+  // "ACME" is ticked; "ACME - Night Tour" is a new-looking title this run, but
+  // it already blocks — the same stem logic titlesToMatcher uses for scoring.
+  const fresh = newTitlesForFeed(["ACME - Night Tour"], [], ["ACME"], []);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: a title already in the NOTE list is not flagged", () => {
+  const fresh = newTitlesForFeed(["Music Class"], [], [], ["Music Class"]);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: whitespace-normalized comparison — an NBSP variant of a seen title is not re-flagged", () => {
+  const fresh = newTitlesForFeed(["ACME - Desk"], ["ACME - Desk"], [], []);
+  assert.deepEqual(fresh, []);
 });
 
 // ---------------------------------------------------------------------------

@@ -107,6 +107,24 @@ const BLOCK_TITLES_KEY = "calBlockTitles";
 // Ignore). Additive to BLOCK_TITLES_KEY, which is unchanged.
 const NOTE_TITLES_KEY = "calNoteTitles";
 
+// Per-feed baseline of the title set the user has already reviewed in the
+// picker: { [feedId]: string[] }. ABSENCE of a feed's entry means "never
+// reviewed" (first sync) and is handled differently from a stored EMPTY
+// array ("reviewed, saw nothing new that time") — see the first-sync guard
+// in refreshCalendarData and handleListFeedTitles. Never default this map's
+// per-feed entry with `|| []` before checking for that distinction; it
+// erases exactly the thing this key exists to represent.
+const SEEN_TITLES_KEY = "calSeenTitles";
+
+// Top-level (not per-feed-prefixed, unlike the maps above) snapshot of which
+// RULE/titles-mode feeds currently have unreviewed new titles: { [feedId]:
+// {feedName, titles: string[]} }. Rebuilt WHOLESALE on every successful
+// refreshCalendarData run (never merged with the prior value) so a feed that
+// stops qualifying — role changed, or its ticked list now covers everything —
+// doesn't leave a stale nag behind. handleListFeedTitles clears one feed's
+// entry the moment its picker is opened (that IS "reviewed").
+const NEW_TITLES_KEY = "newTitlesByFeed";
+
 // Per-calendar per-event "show as" overrides: { [calendarId]: { [title]:
 // shortLabel } }. For a Block title the label replaces the reject chip text;
 // for a Note title it replaces the note body. Keyed by the same exact title the
@@ -192,6 +210,13 @@ export function effectiveBuffer(title, calBefore, calAfter, eventBuffers) {
 const PATTERN_OPT_IN_KEY = "ruleUsePattern";
 
 const CACHE_KEY = "calCache";
+
+// How old a cached calendar may be and still be scored against. There is NO
+// background sync in this extension — the calendar only refreshes when the
+// tradeboard is loaded — so a cache goes stale by the user being away, not by
+// a timer lapsing. Past this bound "last sync" stops being a reasonable proxy
+// for the user's actual commitments and we would rather show nothing.
+const STALE_MAX_MS = 24 * 60 * 60 * 1000;
 
 // Verbose logging is OFF in production. When flipped on for local debugging it
 // still must not log event titles or attendee data — only counts/ids/warnings.
@@ -678,13 +703,38 @@ export function bucketEvents(events, role, rule, prefix, noteTitles, labels, fee
  * Cancelled, untriplet-able, and blank-titled events are dropped — a blank row
  * is not something a user can meaningfully tick.
  *
+ * TODAY-OR-LATER FILTER (declutter). A title survives only if at least ONE of
+ * its instances falls on today or later (by its start date, NY civil). A
+ * recurring commitment always has an upcoming instance in the 30-back/60-fwd
+ * sample window and keeps surfacing; a one-off that already happened has only
+ * past instances and drops out of the list entirely — that stale clutter was
+ * the whole complaint. The filter is per-TITLE (on the max date across all its
+ * instances), never per-instance: a title's count/typicalMinutes still reflect
+ * every instance in the sample, past and future, once the title itself
+ * qualifies. "Today" is derived as an NY civil date via civilFromEpoch — never
+ * hand-rolled or read from local browser time — with an injectable clock
+ * (nowMs) so this is testable, mirroring titleSampleWindow's convention.
+ *
+ * RECURRING FLAG (picker declutter, phase 2). Each output row carries
+ * `recurring`: true the moment ANY of that title's instances came from an
+ * RRULE series (core/ics.js stamps this per-instance, including
+ * RECURRENCE-ID overrides — see mkEvent). A title with a mix of recurring and
+ * standalone instances under the same exact text still reads as recurring;
+ * that is the more useful signal for a user deciding whether a title is a
+ * standing commitment.
+ *
  * Sorted most-frequent first, ties broken case-insensitively by title so the
- * order is stable between calls.
+ * order is stable between calls. UNCHANGED by the above — the options page
+ * re-sorts alphabetically itself, so this sort is not what orders the picker,
+ * and other callers may depend on it as-is.
  *
  * @param {object[]} events
- * @returns {Array<{title:string, count:number, typicalMinutes:number}>}
+ * @param {number} [nowMs] injectable clock for tests — see titleSampleWindow
+ * @returns {Array<{title:string, count:number, typicalMinutes:number, recurring:boolean}>}
  */
-export function summarizeTitles(events) {
+export function summarizeTitles(events, nowMs) {
+  const today = civilFromEpoch((nowMs === undefined ? Date.now() : nowMs) / 1000);
+  const todayIso = `${today.y}-${pad2(today.mo)}-${pad2(today.d)}`;
   const byTitle = new Map();
   for (const ev of events || []) {
     if (!ev || ev.status === "cancelled") continue;
@@ -699,15 +749,19 @@ export function summarizeTitles(events) {
       mins = 0; // unparseable bound — count the event, claim no duration for it
     }
     if (!Number.isFinite(mins) || mins < 0) mins = 0;
-    const bucket = byTitle.get(title) || [];
-    bucket.push(mins);
+    const dateStr = trip[0].slice(0, 10); // "YYYY-MM-DD HH:MM" -> "YYYY-MM-DD"
+    const bucket = byTitle.get(title) || { durations: [], maxDate: dateStr, recurring: false };
+    bucket.durations.push(mins);
+    if (dateStr > bucket.maxDate) bucket.maxDate = dateStr;
+    if (ev.recurring === true) bucket.recurring = true;
     byTitle.set(title, bucket);
   }
   const out = [];
-  for (const [title, durations] of byTitle) {
-    durations.sort((a, b) => a - b);
+  for (const [title, bucket] of byTitle) {
+    if (bucket.maxDate < todayIso) continue; // stale one-off — no instance today-or-later
+    const durations = bucket.durations.slice().sort((a, b) => a - b);
     const mid = Math.floor((durations.length - 1) / 2); // lower median on ties
-    out.push({ title, count: durations.length, typicalMinutes: durations[mid] });
+    out.push({ title, count: durations.length, typicalMinutes: durations[mid], recurring: bucket.recurring });
   }
   out.sort((a, b) => {
     if (a.count !== b.count) return b.count - a.count;
@@ -716,6 +770,52 @@ export function summarizeTitles(events) {
     return at < bt ? -1 : at > bt ? 1 : 0;
   });
   return out;
+}
+
+/**
+ * Which of a feed's CURRENT today-or-later titles are genuinely new — the
+ * computation behind the "review new titles" nudge (see refreshCalendarData
+ * and handleListFeedTitles). A title is dropped from the result (never
+ * flagged) for any of three reasons, each of which means the user has already
+ * effectively dealt with it:
+ *
+ *   - already in `seenTitles` (whitespace-normalized exact match) — reviewed
+ *     in a prior picker session or seeded by the first-sync baseline;
+ *   - already covered by a ticked BLOCK title, by the same stem logic
+ *     titlesToMatcher uses for real scoring — a title that already blocks
+ *     shifts must not also nag;
+ *   - already in the NOTE list (whitespace-normalized exact match, matching
+ *     bucketEvents' own note-matching rule).
+ *
+ * Callers are responsible for the first-sync distinction: this function only
+ * compares against whatever `seenTitles` it is given, so an ABSENT baseline
+ * must be handled by the caller (seed silently, flag nothing) BEFORE calling
+ * this — passing `[]` for "never reviewed" would flag every title on a user's
+ * first sync, training them to ignore the banner. See SEEN_TITLES_KEY.
+ *
+ * @param {unknown} currentTitles  today-or-later title strings (summarizeTitles output, mapped to .title)
+ * @param {unknown} seenTitles  this feed's stored calSeenTitles entry (want string[])
+ * @param {unknown} blockTitlesForFeed  this feed's calBlockTitles entry (want string[])
+ * @param {unknown} noteTitlesForFeed  this feed's calNoteTitles entry (want string[])
+ * @returns {string[]} the subset of currentTitles that are new
+ */
+export function newTitlesForFeed(currentTitles, seenTitles, blockTitlesForFeed, noteTitlesForFeed) {
+  const seenSet = new Set(
+    (Array.isArray(seenTitles) ? seenTitles : []).map((t) => normalizeTitleWhitespace(t).trim())
+  );
+  const noteSet = new Set(
+    (Array.isArray(noteTitlesForFeed) ? noteTitlesForFeed : []).map((t) => normalizeTitleWhitespace(t).trim())
+  );
+  const blockMatches = titlesToMatcher(blockTitlesForFeed);
+  return (Array.isArray(currentTitles) ? currentTitles : []).filter((t) => {
+    if (typeof t !== "string") return false;
+    const norm = normalizeTitleWhitespace(t).trim();
+    if (norm === "") return false;
+    if (seenSet.has(norm)) return false;
+    if (noteSet.has(norm)) return false;
+    if (blockMatches(t)) return false;
+    return true;
+  });
 }
 
 /**
@@ -1010,12 +1110,21 @@ export function titleSampleWindow(start, end, nowMs) {
  *
  * FAILURE POLICY — the safety-critical decision in this file:
  *
- *   - A BLOCKING-CAPABLE feed (REJECT or RULE) that fails to load is FATAL: the
- *     whole refresh returns ok:false and the drawer shows its error state, so no
- *     scoring is presented at all. Deliberately blunt. If a feed that can hard-
- *     reject shifts did not load, every shift on the board would otherwise
- *     render as free — the single failure this extension exists to prevent. No
- *     answer beats a confidently wrong one.
+ *   - A BLOCKING-CAPABLE feed (REJECT or RULE) that fails to load does NOT
+ *     automatically fail the whole refresh. If a last-good `calCache` exists,
+ *     COVERS the requested window (windowCovers), and is no older than
+ *     STALE_MAX_MS, that cache is served instead: ok:true, stale:true,
+ *     fromCache:true, with fetchedAt carried from the CACHE's own timestamp
+ *     (never Date.now()) so the drawer's staleness banner names the true age.
+ *     The failing feed's error string rides along so the drawer can say which
+ *     feed to go fix. Only when the cache is missing, doesn't cover the
+ *     window, or has aged past the cap does the refresh give up outright and
+ *     return ok:false — because at that point "last sync" is no longer a
+ *     reasonable proxy for the user's actual commitments, and if a feed that
+ *     can hard-reject shifts did not load AND we have nothing trustworthy to
+ *     fall back on, every shift on the board would otherwise render as free —
+ *     the single failure this extension exists to prevent. No answer beats a
+ *     confidently wrong one; a stale-but-covering answer beats no answer.
  *   - A FLAG feed (notes only) that fails is NOT fatal. Notes are cosmetic;
  *     losing them degrades annotation, never correctness. It records a loud
  *     warning and scoring continues.
@@ -1041,6 +1150,7 @@ async function refreshCalendarData(windowStart, windowEnd) {
     BUFFER_BEFORE_KEY,
     BUFFER_AFTER_KEY,
     EVENT_BUFFERS_KEY,
+    SEEN_TITLES_KEY,
   ]);
   const feeds = resolveFeedRoles(store[FEEDS_KEY], store[ROLES_KEY]);
   const blockTitles = store[BLOCK_TITLES_KEY] || {};
@@ -1051,6 +1161,15 @@ async function refreshCalendarData(windowStart, windowEnd) {
   const bufferBefore = store[BUFFER_BEFORE_KEY] || {};
   const bufferAfter = store[BUFFER_AFTER_KEY] || {};
   const eventBuffers = store[EVENT_BUFFERS_KEY] || {};
+  // Mutated in place below (first-sync seeding only — see the per-feed loop).
+  // Read RAW (not defaulted per-feed with `|| []`): hasOwnProperty on this map
+  // is how a feed's never-reviewed state is told apart from "reviewed, saw
+  // nothing new" (a stored []). Only written back to storage if
+  // seenTitlesTouched ends up true, i.e. at least one feed was seeded.
+  const seenTitlesMap = store[SEEN_TITLES_KEY] || {};
+  let seenTitlesTouched = false;
+  // Rebuilt wholesale this run — see NEW_TITLES_KEY's doc comment.
+  const newTitlesByFeed = {};
 
   const timeMin = nyMidnightRfc3339(windowStart, 0);
   const timeMax = nyMidnightRfc3339(windowEnd, 1); // +1 day: exclusive upper bound
@@ -1072,7 +1191,23 @@ async function refreshCalendarData(windowStart, windowEnd) {
         warnings.push(`feed_unavailable: "${feed.name}" (${why}) — its notes are missing`);
         continue;
       }
-      return { ok: false, error: `feed_failed: "${feed.name}" — ${why}` };
+      const error = `feed_failed: "${feed.name}" — ${why}`;
+      // Blocking feed down. Before giving up outright, see if a last-good cache
+      // can stand in: it must cover the requested window (a partial cache would
+      // silently score the uncovered dates as free) and be within STALE_MAX_MS
+      // (past that, "last sync" stops being a reasonable proxy for reality).
+      const cached = (await chrome.storage.local.get(CACHE_KEY))[CACHE_KEY];
+      if (
+        cached &&
+        windowCovers(cached, windowStart, windowEnd) &&
+        Date.now() - cached.fetchedAt <= STALE_MAX_MS
+      ) {
+        return {
+          ok: true, stale: true, error, fromCache: true, fetchedAt: cached.fetchedAt,
+          commitments: cached.commitments, soft: cached.soft, warnings,
+        };
+      }
+      return { ok: false, error };
     }
 
     for (const w of parsed.warnings) warnings.push(`${feed.name}: ${w}`);
@@ -1081,6 +1216,29 @@ async function refreshCalendarData(windowStart, windowEnd) {
     // Ticked titles are per-feed and are the whole blocking set. The legacy
     // regex is consulted ONLY for a user who explicitly armed it.
     const { rule, mode } = calendarRule(blockTitles[feed.id], regexRule, cfg.usePattern);
+
+    // NEW-TITLE REVIEW NUDGE. Gate is EXACT and must not widen: only a RULE
+    // feed actually deciding its blocking set from ticked titles has a picker
+    // to review in the first place (REJECT has none and blocks everything
+    // anyway; RULE in "regex"/"none" mode isn't picker-driven; FLAG/OFF never
+    // block, so there is nothing to silently mis-score).
+    if (feed.role === "RULE" && mode === "titles") {
+      const currentTitles = summarizeTitles(parsed.events).map((t) => t.title);
+      if (!Object.prototype.hasOwnProperty.call(seenTitlesMap, feed.id)) {
+        // First sync for this feed: seed the baseline silently and flag
+        // NOTHING this run. Mirrors loadBannerFromLastDiff's first_run guard
+        // — without this, a user's very first sync would flag every title
+        // they already own, training them to ignore the banner forever after.
+        seenTitlesMap[feed.id] = currentTitles;
+        seenTitlesTouched = true;
+      } else {
+        const fresh = newTitlesForFeed(
+          currentTitles, seenTitlesMap[feed.id], blockTitles[feed.id], noteTitles[feed.id]
+        );
+        if (fresh.length > 0) newTitlesByFeed[feed.id] = { feedName: feed.name, titles: fresh };
+      }
+    }
+
     // A per-feed short name, when set, replaces the feed's display name as the
     // prefix on every note from it.
     const override = typeof labelOverride[feed.id] === "string" ? labelOverride[feed.id].trim() : "";
@@ -1105,9 +1263,15 @@ async function refreshCalendarData(windowStart, windowEnd) {
   soft.sort(byStart);
 
   const fetchedAt = Date.now();
-  await chrome.storage.local.set({
-    [CACHE_KEY]: { fetchedAt, commitments, soft, windowStart, windowEnd },
-  });
+  // newTitlesByFeed is written HERE, alongside the cache, never on an
+  // early-return path above (feed_unavailable/FLAG-continue aside, those
+  // don't return). A refresh that gives up early (ok:false, or the
+  // stale-cache fallback) returns before reaching this line, so a
+  // previously-computed newTitlesByFeed value is left exactly as it was
+  // rather than being clobbered with a partial or empty recomputation.
+  const toSet = { [CACHE_KEY]: { fetchedAt, commitments, soft, windowStart, windowEnd }, [NEW_TITLES_KEY]: newTitlesByFeed };
+  if (seenTitlesTouched) toSet[SEEN_TITLES_KEY] = seenTitlesMap;
+  await chrome.storage.local.set(toSet);
   await recordFeedMeta(meta);
 
   dlog("refresh done", { commitments: commitments.length, soft: soft.length, warnings });
@@ -1207,7 +1371,14 @@ async function handleGetCalendarData(msg) {
 
   if (mode === "cache") {
     const stored = (await chrome.storage.local.get(CACHE_KEY))[CACHE_KEY];
-    if (stored && windowCovers(stored, windowStart, windowEnd)) {
+    // Same STALE_MAX_MS bound as the refresh-failure fallback (refreshCalendarData
+    // above). Without it, boot's cache path would happily serve a week-old cache
+    // and flip calendarLoaded true before the refresh even runs, defeating that cap.
+    if (
+      stored &&
+      windowCovers(stored, windowStart, windowEnd) &&
+      Date.now() - stored.fetchedAt <= STALE_MAX_MS
+    ) {
       return {
         ok: true,
         fromCache: true,
@@ -1432,7 +1603,8 @@ async function handleSetRuleFilter(msg) {
  * "I am unavailable" instead of writing a regex.
  *
  * -> { type:"listFeedTitles", feedId[, windowStart, windowEnd] }
- * <- { ok:true, titles:[{title,count,typicalMinutes}], warnings, blockTitles, … }
+ * <- { ok:true, titles:[{title,count,typicalMinutes,recurring,isNew}], warnings,
+ *      blockTitles, … }
  * <- { ok:false, error }   error:"feed_off" when the feed is not switched on —
  *                          this handler reads events, so it is gated on the same
  *                          stored role everything else is.
@@ -1447,6 +1619,16 @@ async function handleSetRuleFilter(msg) {
  *
  * blockTitles — and the rest of the three-way state — echo back what is stored
  * for this feed, so the picker renders without a second round trip.
+ *
+ * OPENING THE PICKER MARKS IT REVIEWED. `isNew` on each returned title is
+ * computed against the PRE-write calSeenTitles baseline (never seen ⇒ nothing
+ * is flagged, mirroring the first-sync rule in refreshCalendarData — there is
+ * no prior state to compare against, so nothing can honestly be called
+ * "new"). AFTER computing it, this handler overwrites calSeenTitles[feedId]
+ * with the current today-or-later title set and clears this feed's
+ * newTitlesByFeed entry, so the drawer's nudge is gone by the next paint. The
+ * order matters: computing isNew from the POST-write state would mean the
+ * user always walks into a picker where nothing is ever flagged.
  */
 async function handleListFeedTitles(msg) {
   const feedId = msg && msg.feedId;
@@ -1461,6 +1643,8 @@ async function handleListFeedTitles(msg) {
     TITLE_LABELS_KEY,
     LABEL_OVERRIDE_KEY,
     EVENT_BUFFERS_KEY,
+    SEEN_TITLES_KEY,
+    NEW_TITLES_KEY,
   ]);
   const feed = resolveFeedRoles(stored[FEEDS_KEY], stored[ROLES_KEY]).find((f) => f.id === feedId);
   if (!feed) return { ok: false, error: "unknown_feed" };
@@ -1508,9 +1692,36 @@ async function handleListFeedTitles(msg) {
     );
     const titles = summarizeTitles(parsed.events);
     dlog("listFeedTitles", parsed.events.length, titles.length);
+
+    // isNew, computed against the state as it stands BEFORE the mark-seen
+    // write below — see the doc comment above for why the order is load-bearing.
+    const seenMap = stored[SEEN_TITLES_KEY] || {};
+    const hadSeen = Object.prototype.hasOwnProperty.call(seenMap, feedId);
+    const currentTitleStrings = titles.map((t) => t.title);
+    const newSet = hadSeen
+      ? new Set(
+          newTitlesForFeed(currentTitleStrings, seenMap[feedId], blockTitles, noteTitles)
+            .map((t) => normalizeTitleWhitespace(t).trim())
+        )
+      : new Set(); // never reviewed before — nothing to honestly call "new" yet
+    const titledOut = titles.map((t) => ({
+      ...t,
+      isNew: newSet.has(normalizeTitleWhitespace(t.title).trim()),
+    }));
+
+    // Mark reviewed: this feed's baseline becomes the set the user is looking
+    // at right now, and any pending nudge for it is cleared.
+    const nextSeenMap = { ...seenMap, [feedId]: currentTitleStrings };
+    const nextNewTitlesByFeed = { ...(stored[NEW_TITLES_KEY] || {}) };
+    delete nextNewTitlesByFeed[feedId];
+    await chrome.storage.local.set({
+      [SEEN_TITLES_KEY]: nextSeenMap,
+      [NEW_TITLES_KEY]: nextNewTitlesByFeed,
+    });
+
     return {
       ok: true,
-      titles,
+      titles: titledOut,
       // Per-event skips surface HERE too: a title the parser could not expand is
       // a title the user cannot tick, and they must be told rather than left
       // wondering why a known commitment never appears in the picker.
