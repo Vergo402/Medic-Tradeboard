@@ -682,12 +682,15 @@ function computeEndShape(start, props) {
 // Build one concrete occurrence (normalized event + instant bounds + the
 // recurrence key used for EXDATE/override matching) for a base event at date
 // `cand`. For a non-recurring event `cand` is just the event's own start date.
-function buildOccurrence(base, cand) {
+// `recurring` is threaded straight into the emitted event (see mkEvent) — it
+// says whether this occurrence came from an RRULE series, not whether `cand`
+// looks special.
+function buildOccurrence(base, cand, recurring) {
   if (base.start.allDay) {
     const endDate = addDaysYMD(cand, base.endShape.n);
     const startMs = civilToMs({ y: cand.y, mo: cand.mo, d: cand.d, h: 0, mi: 0, s: 0 }, NY);
     const endMs = civilToMs({ y: endDate.y, mo: endDate.mo, d: endDate.d, h: 0, mi: 0, s: 0 }, NY);
-    const ev = mkEvent(base, { date: dateStr(cand) }, { date: dateStr(endDate) });
+    const ev = mkEvent(base, { date: dateStr(cand) }, { date: dateStr(endDate) }, recurring);
     return { startMs, endMs, key: "d" + dateStr(cand), ev };
   }
   const zone = base.start.zone;
@@ -701,12 +704,12 @@ function buildOccurrence(base, cand) {
   const endMs = sh.kind === "nominal" && sh.days
     ? civilToMs(shiftWall(startCivil, sh.days * DAY_MS), zone) + sh.ms
     : startMs + sh.ms;
-  const ev = mkEvent(base, { dateTime: iso(startMs) }, { dateTime: iso(endMs) });
+  const ev = mkEvent(base, { dateTime: iso(startMs) }, { dateTime: iso(endMs) }, recurring);
   return { startMs, endMs, key: "t" + startMs, ev };
 }
 
-function mkEvent(base, start, end) {
-  return { summary: base.summary, status: base.status, start, end };
+function mkEvent(base, start, end, recurring) {
+  return { summary: base.summary, status: base.status, start, end, recurring };
 }
 
 // A raw VEVENT prop map -> the base event, or null (with a named warning) when it
@@ -858,10 +861,14 @@ function keep(built, base, out, warnings) {
   return false;
 }
 
-function emitSingle(props, winMin, winMax, out, warnings) {
+// `recurring` is passed in by the caller rather than inferred here: emitSingle
+// runs for BOTH genuine standalone VEVENTs (recurring: false) and liveOverrides
+// (recurring: true, since a RECURRENCE-ID exception is by definition part of a
+// series) — see the call sites in parseIcs for why each passes what it passes.
+function emitSingle(props, winMin, winMax, out, warnings, recurring) {
   const base = toEvent(props, warnings);
   if (!base) return;
-  const built = buildOccurrence(base, base.anchor);
+  const built = buildOccurrence(base, base.anchor, recurring);
   if (built.endMs > winMin && built.startMs < winMax) keep(built, base, out, warnings);
 }
 
@@ -885,7 +892,7 @@ function emitMaster(props, overrideKeys, winMin, winMax, out, warnings) {
     if (cmpYMD(cand, base.anchor) < 0) continue; // generator may open the block before DTSTART
     count++;
     if (rule.count !== null && count > rule.count) return;
-    const built = buildOccurrence(base, cand);
+    const built = buildOccurrence(base, cand, true); // every emitMaster occurrence is, by construction, from a recurring series
     if (rule.until !== null && built.startMs > rule.until) return;
     if (built.startMs >= winMax) return; // monotonic: nothing later is in-window
     // A timed series also honors a DATE-valued EXDATE by day (see parseExdates);
@@ -1020,8 +1027,13 @@ export function parseIcs(text, timeMinIso, timeMaxIso) {
   const liveOverrides = dedupeOverrides(overrides, warnings);
   const overrideKeys = indexOverrides(liveOverrides, warnings, masterKinds(masters));
 
-  for (const props of singles) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
-  for (const props of liveOverrides) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
+  for (const props of singles) guarded(() => emitSingle(props, winMin, winMax, events, warnings, false), props, events, warnings);
+  // A liveOverride carries RECURRENCE-ID — RFC 5545 §3.8.4.4 defines that as an
+  // exception instance of a recurring series, even though it's emitted through
+  // emitSingle (same one-occurrence code path as a standalone VEVENT). So this
+  // is the one emitSingle call site that must pass true: keying `recurring` off
+  // "which emit function ran" would misfile a moved occurrence as one-time.
+  for (const props of liveOverrides) guarded(() => emitSingle(props, winMin, winMax, events, warnings, true), props, events, warnings);
   for (const props of masters) guarded(() => emitMaster(props, overrideKeys, winMin, winMax, events, warnings), props, events, warnings);
 
   return { events, calName, tz, warnings };

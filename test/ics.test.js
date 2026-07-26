@@ -192,6 +192,39 @@ test("a cancelled instance removes the occurrence entirely (via bucketEvents)", 
 });
 
 // ---------------------------------------------------------------------------
+// `recurring` flag: series membership, not "which emit function ran"
+// ---------------------------------------------------------------------------
+
+test("a plain RRULE:FREQ=WEEKLY master's occurrences are all recurring:true", () => {
+  const r = parse(
+    ev("UID:a\nSUMMARY:Weekly Drill\nDTSTART;TZID=America/New_York:20260302T090000\nDTEND;TZID=America/New_York:20260302T100000\nRRULE:FREQ=WEEKLY;COUNT=3")
+  );
+  assert.equal(r.events.length, 3);
+  assert.deepEqual(r.events.map((e) => e.recurring), [true, true, true]);
+});
+
+test("a standalone VEVENT with no RRULE is recurring:false", () => {
+  const r = parse(ev("UID:a\nSUMMARY:One-off Standby\nDTSTART;TZID=America/New_York:20260302T090000\nDTEND;TZID=America/New_York:20260302T100000"));
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0].recurring, false);
+});
+
+test("a RECURRENCE-ID override instance is recurring:true (the moved-occurrence trap)", () => {
+  // A moved instance is emitted via emitSingle (same code path as a standalone
+  // VEVENT), but it is a RECURRENCE-ID exception of a WEEKLY series, so it must
+  // read as recurring — keying off emitSingle vs emitMaster would get this wrong.
+  const master = ev(
+    "UID:x\nSUMMARY:Weekly Drill\nDTSTART;TZID=America/New_York:20260302T080000\nDTEND;TZID=America/New_York:20260302T090000\nRRULE:FREQ=WEEKLY;COUNT=3"
+  );
+  const moved = ev(
+    "UID:x\nSUMMARY:Weekly Drill\nRECURRENCE-ID;TZID=America/New_York:20260309T080000\nDTSTART;TZID=America/New_York:20260309T200000\nDTEND;TZID=America/New_York:20260309T210000"
+  );
+  const r = parse(master + "\n" + moved);
+  assert.equal(r.events.length, 3);
+  assert.ok(r.events.every((e) => e.recurring === true), "every occurrence, including the moved override, must be recurring:true");
+});
+
+// ---------------------------------------------------------------------------
 // DST: recurrence keeps wall-clock; a single event keeps real elapsed time
 // ---------------------------------------------------------------------------
 
