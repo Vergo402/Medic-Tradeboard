@@ -258,6 +258,85 @@ test("getCalendarData: a feed answering with HTML is an error, never an empty ca
 // wall-clock wait.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Freshness window. A plain page-load refresh reuses a recent cache instead of
+// re-fetching — a subscribed calendar changes on the order of hours, and the
+// re-fetch is what invited the 429. force:true (Resync, config change) bypasses
+// it. The 10-minute bound has vast margin over a sub-second test run, so a
+// fetchedAt of Date.now() is "fresh" and Date.now()-11min is "past".
+// ---------------------------------------------------------------------------
+
+const FRESH_CACHE = () => ({
+  fetchedAt: Date.now(),
+  commitments: [["2026-08-15 08:00", "2026-08-15 18:00", "Cached"]],
+  soft: [],
+  windowStart: "2026-08-01",
+  windowEnd: "2026-08-31",
+});
+
+test("getCalendarData: an unforced refresh inside the freshness window reuses the cache, no fetch", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = FRESH_CACHE();
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(resp.fromCache, true, "a fresh cache is reused, not re-fetched");
+  assert.equal(resp.stale, undefined, "reusing a fresh cache is not a stale state");
+  assert.deepEqual(resp.commitments, STORE.calCache.commitments);
+  assert.equal(eventsFetchedFor("feed-fd").length, 0, "the whole point: no network on a fresh reload");
+});
+
+test("getCalendarData: an unforced refresh past the freshness window fetches fresh", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = { ...FRESH_CACHE(), fetchedAt: Date.now() - 11 * 60 * 1000 };
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(resp.fromCache, false, "a stale-enough cache must actually re-fetch");
+  assert.equal(resp.commitments.length, 1, "and the commitments come from the live fetch, not the cache");
+  assert.equal(eventsFetchedFor("feed-fd").length, 1);
+});
+
+test("getCalendarData: force:true always fetches, even inside the freshness window", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = FRESH_CACHE(); // fresh — an unforced refresh would reuse it
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(resp.fromCache, false, "Resync / config change must bypass the window");
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "force:true fetches even when a fresh cache exists");
+});
+
+test("getCalendarData: an unforced refresh with no cache fetches", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // no STORE.calCache at all
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "nothing to reuse — a cold load must fetch");
+});
+
+test("getCalendarData: an unforced refresh whose cache does NOT cover the window fetches", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Fresh in time, but its window ends before the requested one — a partial
+  // cache would leave the uncovered dates unscored, so it must not be reused.
+  STORE.calCache = { ...FRESH_CACHE(), windowEnd: "2026-08-10" };
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "a non-covering cache is not reusable, fresh or not");
+});
+
 test("getCalendarData: a 429 then a 200 succeeds — the retry rides out a rate limit", async () => {
   reset();
   setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);

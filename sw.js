@@ -218,6 +218,15 @@ const CACHE_KEY = "calCache";
 // for the user's actual commitments and we would rather show nothing.
 const STALE_MAX_MS = 24 * 60 * 60 * 1000;
 
+// How fresh a cache must be for an UNFORCED refresh (a plain page load) to reuse
+// it WITHOUT re-fetching. Distinct from STALE_MAX_MS above: that one asks "is
+// this cache too old to show at all?" (24h); this one asks "is it recent enough
+// that fetching again would just be redundant network traffic?". A subscribed
+// calendar changes on the order of hours, not seconds, so a reload inside this
+// window rides the cache — killing the rapid-reload 429 storm. A manual Resync
+// or a config change passes force:true to bypass it. See handleGetCalendarData.
+const REFRESH_TTL_MS = 10 * 60 * 1000;
+
 // Verbose logging is OFF in production. When flipped on for local debugging it
 // still must not log event titles or attendee data — only counts/ids/warnings.
 const DEBUG = false;
@@ -1441,6 +1450,35 @@ async function handleGetCalendarData(msg) {
     // "interactive" was the OAuth consent path. With no auth there is nothing to
     // prompt for, so it is simply a refresh — kept as an accepted mode so the
     // content script's existing connect affordance keeps working unchanged.
+    //
+    // FRESHNESS WINDOW. A tradeboard page load asks for a refresh every time,
+    // but a subscribed calendar does not change second to second — and the feed
+    // host rate-limits close-together polling (a reload plus the options-page
+    // picker can otherwise fetch the same feed twice in a breath and earn a
+    // 429). So an UNFORCED refresh reuses a covering cache that is younger than
+    // REFRESH_TTL_MS instead of hitting the network at all: instant, and a 429
+    // it can't provoke. Older than that, or no cache, and it actually fetches.
+    //
+    // `force` bypasses the window for the two moments the user is owed current
+    // data no matter what: a manual Resync, and a config change (new roles or
+    // ticked titles must re-bucket, not replay a cache scored under the old
+    // rules — config mutators also drop the cache, so force is belt-and-braces).
+    if (msg.force !== true) {
+      const stored = (await chrome.storage.local.get(CACHE_KEY))[CACHE_KEY];
+      if (
+        stored &&
+        windowCovers(stored, windowStart, windowEnd) &&
+        Date.now() - stored.fetchedAt <= REFRESH_TTL_MS
+      ) {
+        return {
+          ok: true,
+          fromCache: true,
+          fetchedAt: stored.fetchedAt,
+          commitments: stored.commitments,
+          soft: stored.soft,
+        };
+      }
+    }
     return refreshCalendarData(windowStart, windowEnd);
   }
   return { ok: false, error: "bad_mode" };

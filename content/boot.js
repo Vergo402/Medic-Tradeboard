@@ -166,9 +166,13 @@
       return chrome.runtime.sendMessage(msg);
     }
 
-    async function askCalendar(mode) {
+    // `force` bypasses the worker's freshness window (REFRESH_TTL_MS): a plain
+    // page-load refresh is unforced so it reuses a recent cache instead of
+    // re-fetching, but a manual Resync and a config-change refresh pass
+    // force:true — those are the moments the user is owed genuinely current data.
+    async function askCalendar(mode, force) {
       try {
-        return await sendToSW({ type: "getCalendarData", mode, windowStart: calWindowStart, windowEnd: calWindowEnd });
+        return await sendToSW({ type: "getCalendarData", mode, force: force === true, windowStart: calWindowStart, windowEnd: calWindowEnd });
       } catch (e) {
         return { ok: false, error: (e && e.message) || "sw_unavailable" };
       }
@@ -445,7 +449,9 @@
         // contract as onOpenSetup: a failure is logged, never thrown out of the
         // click handler.
         (async () => {
-          const resp = await askCalendar("refresh");
+          // force:true — Resync is the user explicitly asking for current data,
+          // so it bypasses the freshness window and always pulls fresh.
+          const resp = await askCalendar("refresh", true);
           applyCalResponse(resp);
           // Re-read regardless of resp.ok: a failed refresh never touches
           // `newTitlesByFeed` (see refreshCalendarData's persist-placement
@@ -503,7 +509,9 @@
         if (configChanged) await refreshBlockingSignal();
         let resp = null;
         if (configChanged) {
-          resp = await askCalendar("refresh");
+          // force:true — new roles/ticked titles must re-bucket against a fresh
+          // fetch, never replay a cache scored under the old rules.
+          resp = await askCalendar("refresh", true);
           applyCalResponse(resp);
         }
         newCalendarTitles = await loadNewCalendarTitles();
