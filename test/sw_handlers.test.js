@@ -25,6 +25,8 @@ let EVENTS = {}; // feedId -> events[] (declared normalized, served as .ics)
 let FEED_BODIES = {}; // feedId -> raw .ics text, when a test wants to control it
 let URL_TO_ID = {}; // feed URL -> feedId, for the fake fetch
 let FETCH_LOG = []; // every URL the worker requested, in order
+let FEED_STATUS_QUEUE = {}; // feedId -> [{status, retryAfter?}] popped per fetch; drives retry tests
+let SLEEP_LOG = []; // ms values the worker's feedSleep was asked to wait, in order
 
 function reset() {
   STORE = {};
@@ -32,6 +34,8 @@ function reset() {
   FEED_BODIES = {};
   URL_TO_ID = {};
   FETCH_LOG = [];
+  FEED_STATUS_QUEUE = {};
+  SLEEP_LOG = [];
 }
 
 // chrome.storage.local.get accepts a string, an array of keys, or an object of
@@ -123,22 +127,44 @@ function setFeeds(specs) {
   STORE.calRoles = roles;
 }
 
+// A minimal Headers-like stub: only .get(name) is read by the worker.
+function fakeHeaders(map) {
+  const lower = {};
+  for (const k of Object.keys(map || {})) lower[k.toLowerCase()] = String(map[k]);
+  return { get: (name) => (Object.prototype.hasOwnProperty.call(lower, String(name).toLowerCase()) ? lower[String(name).toLowerCase()] : null) };
+}
+
 globalThis.fetch = async (url) => {
   FETCH_LOG.push(url);
   const id = URL_TO_ID[url];
   if (!id) throw new Error("unexpected fetch: " + url);
+  // A scripted status sequence (429s, a network throw, …) takes priority, one
+  // entry per fetch, so retry behaviour can be exercised deterministically.
+  const queue = FEED_STATUS_QUEUE[id];
+  if (Array.isArray(queue) && queue.length > 0) {
+    const step = queue.shift();
+    if (step && step.throw) throw new Error(step.throw === true ? "network down" : step.throw);
+    if (step && step.status && step.status !== 200) {
+      return { ok: false, status: step.status, headers: fakeHeaders(step.headers || (step.retryAfter != null ? { "Retry-After": step.retryAfter } : {})), text: async () => "" };
+    }
+    // status 200 (or unspecified) falls through to the normal body below.
+  }
   if (Object.prototype.hasOwnProperty.call(FEED_BODIES, id)) {
     const body = FEED_BODIES[id];
-    if (body === null) return { ok: false, status: 404, text: async () => "" };
-    return { ok: true, status: 200, text: async () => body };
+    if (body === null) return { ok: false, status: 404, headers: fakeHeaders({}), text: async () => "" };
+    return { ok: true, status: 200, headers: fakeHeaders({}), text: async () => body };
   }
-  return { ok: true, status: 200, text: async () => icsFrom(EVENTS[id] || []) };
+  return { ok: true, status: 200, headers: fakeHeaders({}), text: async () => icsFrom(EVENTS[id] || []) };
 };
 
 // Import AFTER the globals exist — sw.js registers its listener at module load.
 const sw = await import("../sw.js");
 assert.equal(listeners.length, 1, "sw.js should register exactly one message listener");
 const onMessage = listeners[0];
+
+// Never actually sleep in tests: record the requested waits and return at once,
+// so the retry schedule is asserted without wall-clock delay.
+sw._setFeedSleepForTests((ms) => { SLEEP_LOG.push(ms); return Promise.resolve(); });
 
 /** Drive the real handler the same way chrome.runtime.sendMessage would. */
 function send(msg) {
@@ -221,6 +247,79 @@ test("getCalendarData: a feed answering with HTML is an error, never an empty ca
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
   assert.equal(resp.ok, false);
   assert.match(resp.error, /feed_failed/);
+});
+
+// ---------------------------------------------------------------------------
+// Rate-limit retry. A 429/503 is "slow down", not "broken": the fetch backs off
+// and retries before ever reaching the stale-cache handling. Confirmed live —
+// a real feed host answered http_429 to close-together polling, which stranded
+// the drawer on the amber banner and made Resync (another immediate fetch) a
+// no-op. sleep is stubbed to a recorder, so these assert the schedule with no
+// wall-clock wait.
+// ---------------------------------------------------------------------------
+
+test("getCalendarData: a 429 then a 200 succeeds — the retry rides out a rate limit", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }]; // first attempt 429, then the normal 200 body
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true, "a transient 429 must not drop the whole refresh");
+  assert.equal(resp.stale, undefined, "a recovered refresh is fresh, not stale");
+  assert.equal(resp.commitments.length, 1);
+  assert.equal(eventsFetchedFor("feed-fd").length, 2, "it must actually have retried once");
+  assert.deepEqual(SLEEP_LOG, [800], "one backoff wait, the first in the schedule");
+});
+
+test("getCalendarData: a persistent 429 with no cache fails after a bounded number of retries", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  // Enough 429s to outlast every retry — the loop must give up, not spin.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }, { status: 429 }, { status: 429 }];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false, "no cache to fall back on — a persistent limit is a hard failure");
+  assert.match(resp.error, /http_429/);
+  assert.equal(eventsFetchedFor("feed-fd").length, 3, "3 attempts total: the first plus two retries");
+  assert.deepEqual(SLEEP_LOG, [800, 2500], "the fixed backoff schedule, then it stops");
+});
+
+test("getCalendarData: a 404 is NOT retried — a dead link fails fast", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  FEED_BODIES["feed-fd"] = null; // 404 on every fetch
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false);
+  assert.match(resp.error, /http_404/);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "an expired link must not be retried");
+  assert.deepEqual(SLEEP_LOG, [], "no backoff for a non-retryable status");
+});
+
+test("getCalendarData: a Retry-After header overrides the default backoff", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Server asks for 2 seconds; the worker must honor it instead of its own 800ms.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429, retryAfter: 2 }];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(SLEEP_LOG, [2000], "honored the server's Retry-After, in ms");
+});
+
+test("getCalendarData: a 429 recovers into a served cache as fresh, not stale", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }]; // both retries 429, then 200 on the 3rd
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true, "two 429s then a 200 still recovers within the retry budget");
+  assert.equal(resp.stale, undefined);
+  assert.equal(eventsFetchedFor("feed-fd").length, 3);
+  assert.deepEqual(SLEEP_LOG, [800, 2500]);
 });
 
 test("getCalendarData: a FLAG feed that fails only warns — notes are cosmetic", async () => {

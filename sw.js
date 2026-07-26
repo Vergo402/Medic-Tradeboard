@@ -1018,6 +1018,40 @@ function newFeedId() {
  * feed that did not actually load: a blocking feed silently yielding zero events
  * is precisely how a shift the user is already committed to would look free.
  */
+// A 429/503 is the server saying "slow down", NOT "your feed is broken". Real
+// calendar hosts (Aladtec, some FD systems, Google's secret-ical endpoint)
+// rate-limit close-together polling — and a single page interaction can fire
+// several fetches of the SAME feed within a second: the tradeboard's boot
+// refresh, a Resync click, and the options-page picker all read it. Treating
+// the first 429 as fatal drops straight to the stale banner and, worse, makes
+// recovery hammer the very endpoint that asked for a pause (Resync → fetch →
+// 429 → still stale). So these statuses are RETRIED with backoff; only a
+// persistent limit falls through to the stale-cache handling. These GETs are
+// idempotent, so a retry is safe. Any OTHER status (404 expired link, 403) is
+// a hard failure and fails fast — retrying a dead link just wastes time.
+const FEED_RETRY_STATUS = new Set([429, 503]);
+// One wait per retry; length is also the retry count (2 retries, 3 attempts).
+// Worst-case added latency ~3.3s, tolerable for a background refresh the drawer
+// already paints cache under. A server-sent Retry-After overrides these.
+const FEED_RETRY_BACKOFF_MS = [800, 2500];
+const FEED_RETRY_MAX_WAIT_MS = 8000; // cap an honored Retry-After so it can't hang the worker
+
+// Injectable so tests don't actually sleep. The real path uses setTimeout,
+// which exists in the service-worker global. Mirrors summarizeTitles' nowMs
+// convention — a seam for determinism, not a production knob.
+let feedSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export function _setFeedSleepForTests(fn) { feedSleep = fn; }
+
+// How long before retry `attempt` (0-based): honor a numeric Retry-After
+// (seconds) when the server sends one — capped so a hostile or absurd value
+// can't wedge the worker — otherwise fall back to the fixed backoff schedule.
+function feedRetryWaitMs(resp, attempt) {
+  const hdr = resp && resp.headers && typeof resp.headers.get === "function" ? resp.headers.get("retry-after") : null;
+  const sec = hdr == null ? NaN : Number(hdr);
+  if (Number.isFinite(sec) && sec >= 0) return Math.min(sec * 1000, FEED_RETRY_MAX_WAIT_MS);
+  return FEED_RETRY_BACKOFF_MS[Math.min(attempt, FEED_RETRY_BACKOFF_MS.length - 1)];
+}
+
 async function fetchFeedText(feed) {
   if (feed.kind === "file") {
     if (typeof feed.content !== "string" || feed.content.trim() === "") {
@@ -1027,14 +1061,27 @@ async function fetchFeedText(feed) {
   }
   const url = normalizeFeedUrl(feed.url);
   if (!url) throw taggedError("feed_bad_url", "not a usable https feed URL");
-  let resp;
-  try {
-    resp = await fetch(url, { credentials: "omit", redirect: "follow" });
-  } catch (e) {
-    throw taggedError("feed_unreachable", "unreachable: " + (e && e.message ? e.message : String(e)));
+  // attempt 0 is the first try; attempts 1..N are retries, N = backoff length.
+  for (let attempt = 0; ; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url, { credentials: "omit", redirect: "follow" });
+    } catch (e) {
+      // A network throw can be a transient blip too — retry it on the same
+      // schedule before surfacing it, then give up.
+      if (attempt < FEED_RETRY_BACKOFF_MS.length) {
+        await feedSleep(FEED_RETRY_BACKOFF_MS[Math.min(attempt, FEED_RETRY_BACKOFF_MS.length - 1)]);
+        continue;
+      }
+      throw taggedError("feed_unreachable", "unreachable: " + (e && e.message ? e.message : String(e)));
+    }
+    if (resp.ok) return resp.text();
+    if (FEED_RETRY_STATUS.has(resp.status) && attempt < FEED_RETRY_BACKOFF_MS.length) {
+      await feedSleep(feedRetryWaitMs(resp, attempt));
+      continue;
+    }
+    throw taggedError("feed_http", "http_" + resp.status);
   }
-  if (!resp.ok) throw taggedError("feed_http", "http_" + resp.status);
-  return resp.text();
 }
 
 /**
