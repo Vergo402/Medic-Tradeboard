@@ -231,14 +231,27 @@ function decodeText(v) {
   return v.replace(/\\([\\,;nN])/g, (_m, c) => (c === "n" || c === "N" ? "\n" : c));
 }
 
+// Digit counts alone are not a valid date: Date.UTC ROLLS OVER an impossible
+// field (June 31 -> July 1, hour 25 -> next day 01:00), so an unvalidated value
+// becomes a confirmed commitment on a day the feed never stated. Every field is
+// range-checked here and an impossible one returns null, which every caller
+// already turns into a named skip. Deliberate narrowings vs the RFC grammar:
+// second 60 (§3.3.12 leap second) and the wild-in-practice hour 24 are refused
+// loudly rather than normalized.
+function validYMD(y, mo, d) {
+  return mo >= 1 && mo <= 12 && d >= 1 && d <= daysInMonth(y, mo);
+}
 function parseDateOnly(v) {
   const m = /^(\d{4})(\d{2})(\d{2})$/.exec(v);
-  return m ? { y: +m[1], mo: +m[2], d: +m[3] } : null;
+  if (!m || !validYMD(+m[1], +m[2], +m[3])) return null;
+  return { y: +m[1], mo: +m[2], d: +m[3] };
 }
 function parseDateTime(v) {
   const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/.exec(v);
-  if (!m) return null;
-  return { y: +m[1], mo: +m[2], d: +m[3], h: +m[4], mi: +m[5], s: +m[6], utc: m[7] === "Z" };
+  if (!m || !validYMD(+m[1], +m[2], +m[3])) return null;
+  const [h, mi, s] = [+m[4], +m[5], +m[6]];
+  if (h > 23 || mi > 59 || s > 59) return null;
+  return { y: +m[1], mo: +m[2], d: +m[3], h, mi, s, utc: m[7] === "Z" };
 }
 
 /**
@@ -276,6 +289,22 @@ function parseDuration(v) {
   return { days: sign * (+(m[2] || 0) * 7 + +(m[3] || 0)), ms: sign * secs * 1000 };
 }
 
+// The digit runs above are unbounded, so P99999999999999D lands an endpoint far
+// outside the ±8.64e15 Date range; iso()/Intl then throw a RangeError that used
+// to escape parseIcs and take the WHOLE feed down. A year is already orders of
+// magnitude past anything a shift feed can mean, so a longer one is refused here
+// as a named per-event skip.
+const MAX_DUR_DAYS = 3660;
+const MAX_DUR_MS = 366 * DAY_MS;
+function durationOf(v) {
+  const d = parseDuration(v);
+  if (!d) return { err: "unparseable DURATION: " + v };
+  if (Math.abs(d.days) > MAX_DUR_DAYS || Math.abs(d.ms) > MAX_DUR_MS) {
+    return { err: "unsupported DURATION (too large): " + v };
+  }
+  return { d };
+}
+
 // ---------------------------------------------------------------------------
 // RRULE
 // ---------------------------------------------------------------------------
@@ -290,9 +319,13 @@ function untilToMs(v, zone) {
   const dt = parseDateTime(v);
   if (dt) return dt.utc ? Date.UTC(dt.y, dt.mo - 1, dt.d, dt.h, dt.mi, dt.s) : civilToMs(dt, zone || NY);
   const d = parseDateOnly(v);
-  // Date-only UNTIL is inclusive through that whole day (NY frame, the app's
-  // civil frame for date-only values).
-  if (d) return civilToMs({ y: d.y, mo: d.mo, d: d.d, h: 23, mi: 59, s: 59 }, NY);
+  // Date-only UNTIL is inclusive through that whole day — end-of-day IN THE
+  // EVENT'S OWN ZONE. A hardcoded NY end-of-day is a different instant for any
+  // other zone, which let a Tokyo series emit a phantom occurrence the day AFTER
+  // UNTIL (NY 23:59:59 is already the next Tokyo morning) and truncated an LA
+  // evening series a day early. `zone` is NY for an all-day or floating series,
+  // so the app's civil frame still applies wherever there is no zone of its own.
+  if (d) return civilToMs({ y: d.y, mo: d.mo, d: d.d, h: 23, mi: 59, s: 59 }, zone || NY);
   return null;
 }
 
@@ -476,7 +509,54 @@ function* genMonthly(start, rule, ceil) {
   }
 }
 
+// The nth (or -nth, from year end) weekday of a whole YEAR, or null when the
+// ordinal runs off the year. Anchors on the first/last matching weekday and steps
+// whole weeks, so it needs no month arithmetic.
+function nthWeekdayOfYear(y, weekday, ord) {
+  const c = ord > 0
+    ? addDaysYMD({ y, mo: 1, d: 1 + ((weekday - weekdayOf(y, 1, 1) + 7) % 7) }, (ord - 1) * 7)
+    : addDaysYMD({ y, mo: 12, d: 31 - ((weekdayOf(y, 12, 31) - weekday + 7) % 7) }, (ord + 1) * 7);
+  return c.y === y ? c : null;
+}
+
+// RFC 5545 §3.3.10: under FREQ=YEARLY with no BYMONTH, BYDAY is scoped to the
+// WHOLE YEAR — a bare weekday means every one of them in the year, and an ordinal
+// (the RFC's own BYDAY=20MO, "every 20th Monday of the year") counts from January.
+// Deduped because BYDAY=MO,1MO legitimately collides on the year's first Monday.
+function bydayDaysInYear(y, byday) {
+  const out = [];
+  for (const b of byday) {
+    if (b.ord === null) {
+      for (let mo = 1; mo <= 12; mo++) {
+        for (let d = 1; d <= daysInMonth(y, mo); d++) if (weekdayOf(y, mo, d) === b.day) out.push({ y, mo, d });
+      }
+    } else {
+      const c = nthWeekdayOfYear(y, b.day, b.ord);
+      if (c) out.push(c);
+    }
+  }
+  const seen = new Set();
+  return out.filter((c) => !seen.has(dateStr(c)) && seen.add(dateStr(c))).sort(cmpYMD);
+}
+
+// Year-scoped BYDAY. Same self-bounding contract as its siblings: the outer
+// iteration count is what terminates it, and each year yields at most ~53 dates
+// per BYDAY token, so the consumer's own MAX_STEPS guard still applies normally.
+function* genYearlyByday(start, rule, ceil) {
+  let y = start.y;
+  for (let i = 0; y <= ceil.y; i++) {
+    if (i > MAX_STEPS) return yield OVERFLOW;
+    for (const c of bydayDaysInYear(y, rule.byday)) yield c;
+    y += rule.interval;
+  }
+}
+
 function* genYearly(start, rule, ceil) {
+  // Restricting a BYMONTH-less YEARLY BYDAY rule to DTSTART's month is a silent
+  // partial expansion (11 months of real commitments vanish), so it goes to the
+  // year-scoped expander instead. BYMONTH present keeps the month-scoped path,
+  // where ordinals are month-relative per the RFC.
+  if (rule.byday && !rule.bymonth && !rule.bymonthday) return yield* genYearlyByday(start, rule, ceil);
   const months = [...(rule.bymonth || [start.mo])].sort((a, b) => a - b);
   let y = start.y;
   for (let i = 0; y <= ceil.y; i++) {
@@ -544,8 +624,8 @@ function allDayEndShape(start, props) {
     return n >= 1 ? { kind: "days", n } : { err: "DTEND at or before DTSTART" };
   }
   if (props.DURATION) {
-    const d = parseDuration(props.DURATION.value);
-    if (!d) return { err: "unparseable DURATION: " + props.DURATION.value };
+    const { d, err } = durationOf(props.DURATION.value);
+    if (err) return { err };
     // RFC 5545 §3.6.1: a DATE-valued event's DURATION must be dur-day/dur-week.
     if (d.ms !== 0) return { err: "time-part DURATION on all-day event: " + props.DURATION.value };
     if (d.days < 1) return { err: "non-positive DURATION: " + props.DURATION.value };
@@ -566,8 +646,8 @@ function computeEndShape(start, props) {
     return ms > 0 ? { kind: "exact", ms } : { err: "DTEND at or before DTSTART" };
   }
   if (props.DURATION) {
-    const d = parseDuration(props.DURATION.value);
-    if (!d) return { err: "unparseable DURATION: " + props.DURATION.value };
+    const { d, err } = durationOf(props.DURATION.value);
+    if (err) return { err };
     if (d.days <= 0 && d.ms <= 0) return { err: "non-positive DURATION: " + props.DURATION.value };
     return { kind: "nominal", days: d.days, ms: d.ms };
   }
@@ -649,14 +729,21 @@ function occKey(cv) {
   return null;
 }
 
-function parseExdates(props, warnings) {
+// RFC 5545 §3.8.5.1 requires EXDATE's value type to match DTSTART's, but real
+// producers emit a DATE-valued EXDATE against a timed series. That one is honored
+// BY DATE (emitMaster also tests the candidate's "d<date>" key), matching what
+// the majority of importers do — the instance the user deleted really goes away.
+// The reverse, a timed EXDATE against an all-day series, names no single day to
+// remove, so it is refused loudly rather than dropped on the floor.
+function parseExdates(props, warnings, allDay) {
   const set = new Set();
   for (const p of props._EXDATE) {
     for (const v of p.value.split(",")) {
       const cv = classifyValue(v, p.params);
       const k = cv && occKey(cv);
-      if (k) set.add(k);
-      else warnings.push("unresolvable_exdate: " + v + (p.params.TZID ? " (timezone " + p.params.TZID + ")" : ""));
+      if (!k) warnings.push("unresolvable_exdate: " + v + (p.params.TZID ? " (timezone " + p.params.TZID + ")" : ""));
+      else if (allDay && !cv.allDay) warnings.push("unresolvable_exdate: " + v + " (EXDATE value type does not match series)");
+      else set.add(k);
     }
   }
   return set;
@@ -665,7 +752,19 @@ function parseExdates(props, warnings) {
 // Index override VEVENTs (those carrying RECURRENCE-ID) by UID -> set of the
 // original-occurrence keys they replace, so master expansion can suppress the
 // base occurrence at each moved/cancelled instance.
-function indexOverrides(overrides, warnings) {
+// UID -> whether that master series is all-day, so a RECURRENCE-ID of the wrong
+// value type can be recognized instead of matching nothing.
+function masterKinds(masters) {
+  const map = new Map();
+  for (const props of masters) {
+    const ds = props.DTSTART;
+    const cv = ds && classifyValue(ds.value, ds.params);
+    if (cv) map.set(props.UID ? props.UID.value : "", cv.allDay);
+  }
+  return map;
+}
+
+function indexOverrides(overrides, warnings, kinds) {
   const map = new Map();
   for (const props of overrides) {
     const rid = props["RECURRENCE-ID"];
@@ -677,6 +776,16 @@ function indexOverrides(overrides, warnings) {
       continue;
     }
     const uid = props.UID ? props.UID.value : "";
+    // §3.8.4.4 requires RECURRENCE-ID's value type to match the master DTSTART's.
+    // A DATE-valued id against a timed series (or vice versa) resolves to a key of
+    // the wrong kind, so it suppresses nothing and the base occurrence stays put
+    // beside the override — a phantom duplicate. Matching across kinds would be
+    // guesswork about WHICH instant was replaced, so the mismatch is named instead
+    // and the override still emits as its own event.
+    if (kinds.has(uid) && kinds.get(uid) !== cv.allDay) {
+      warnings.push("unresolvable_recurrence_id: " + evTitle(props) + " (value type does not match series)");
+      continue;
+    }
     if (!map.has(uid)) map.set(uid, new Set());
     map.get(uid).add(k);
   }
@@ -711,7 +820,7 @@ function emitMaster(props, overrideKeys, winMin, winMax, out, warnings) {
     warnings.push(skipMsg(base.summary, "unsupported recurrence: " + rule.unsupported));
     return;
   }
-  const exdates = parseExdates(props, warnings);
+  const exdates = parseExdates(props, warnings, base.start.allDay);
   const okeys = overrideKeys.get(base.uid) || EMPTY_SET;
   let count = 0;
   let steps = 0;
@@ -726,10 +835,29 @@ function emitMaster(props, overrideKeys, winMin, winMax, out, warnings) {
     const built = buildOccurrence(base, cand);
     if (rule.until !== null && built.startMs > rule.until) return;
     if (built.startMs >= winMax) return; // monotonic: nothing later is in-window
-    if (exdates.has(built.key) || okeys.has(built.key)) continue;
+    // A timed series also honors a DATE-valued EXDATE by day (see parseExdates);
+    // for an all-day series built.key IS the "d<date>" key, so this adds nothing.
+    if (exdates.has(built.key) || exdates.has("d" + dateStr(cand)) || okeys.has(built.key)) continue;
     // One bad occurrence means a bad duration, which is a property of the whole
     // series — warn once and drop the rest rather than repeating per instance.
     if (built.endMs > winMin && !keep(built, base, out, warnings)) return;
+  }
+}
+
+// Defense in depth around ONE event's emit. Every known bad value is already a
+// named skip, but a whole-feed crash is the worst possible outcome here (a
+// scheduler with no calendar at all), so an unforeseen throw is demoted to a skip
+// of just that event. Any occurrence already pushed is rolled back, otherwise the
+// "skipped" warning would be a lie. IcsError still propagates: a structural
+// problem is a property of the feed, not of one VEVENT.
+function guarded(emit, props, out, warnings) {
+  const mark = out.length;
+  try {
+    emit();
+  } catch (e) {
+    if (e instanceof IcsError) throw e;
+    out.length = mark;
+    warnings.push(skipMsg(evTitle(props), "internal error: " + ((e && e.message) || e)));
   }
 }
 
@@ -803,14 +931,22 @@ function collectComponents(lines) {
  * @throws {IcsError}  when `text` is not an iCalendar body, or the window is unparseable
  */
 export function parseIcs(text, timeMinIso, timeMaxIso) {
-  if (typeof text !== "string" || text.indexOf("BEGIN:VCALENDAR") === -1) {
-    throw new IcsError("not_icalendar");
-  }
+  if (typeof text !== "string") throw new IcsError("not_icalendar");
+  // A leading UTF-8 BOM (Outlook/Windows exports carry one) would glue to the
+  // first line and make a valid feed read as structurally broken.
+  const lines = unfold(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  // The wrapper test runs on the first non-empty LOGICAL line, post-unfold, and
+  // demands the whole line. A substring search on the raw text was wrong in both
+  // directions: an error page merely QUOTING "BEGIN:VCALENDAR" mid-sentence passed
+  // and returned a quietly empty calendar (every shift then looks free), while a
+  // legally folded wrapper line failed.
+  const first = lines.find((l) => l.trim() !== "");
+  if (!first || first.trimEnd().toUpperCase() !== "BEGIN:VCALENDAR") throw new IcsError("not_icalendar");
   const winMin = Date.parse(timeMinIso);
   const winMax = Date.parse(timeMaxIso);
   if (!Number.isFinite(winMin) || !Number.isFinite(winMax)) throw new IcsError("bad_window");
 
-  const { vevents, calName, tz } = collectComponents(unfold(text));
+  const { vevents, calName, tz } = collectComponents(lines);
 
   const masters = [];
   const overrides = [];
@@ -822,11 +958,11 @@ export function parseIcs(text, timeMinIso, timeMaxIso) {
   }
   const events = [];
   const warnings = [];
-  const overrideKeys = indexOverrides(overrides, warnings);
+  const overrideKeys = indexOverrides(overrides, warnings, masterKinds(masters));
 
-  for (const props of singles) emitSingle(props, winMin, winMax, events, warnings);
-  for (const props of overrides) emitSingle(props, winMin, winMax, events, warnings);
-  for (const props of masters) emitMaster(props, overrideKeys, winMin, winMax, events, warnings);
+  for (const props of singles) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
+  for (const props of overrides) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
+  for (const props of masters) guarded(() => emitMaster(props, overrideKeys, winMin, winMax, events, warnings), props, events, warnings);
 
   return { events, calName, tz, warnings };
 }

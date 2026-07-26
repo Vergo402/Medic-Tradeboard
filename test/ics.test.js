@@ -857,3 +857,194 @@ END:VCALENDAR`;
   assert.equal(rNonPositive.warnings.length, 1);
   assert.match(rNonPositive.warnings[0], /non-positive DURATION: P/);
 });
+
+// ---------------------------------------------------------------------------
+// Adversarial-review regressions. Each one pins a defect an audit found against
+// this parser: a silent partial expansion, a phantom or vanished occurrence, a
+// mis-framed bound, or a whole-feed crash. The unifying contract is the module
+// header's: nothing is dropped or invented in silence, and no single VEVENT can
+// take the feed down.
+// ---------------------------------------------------------------------------
+
+test("YEARLY ordinal BYDAY with no BYMONTH counts from January, not within DTSTART's month", () => {
+  // RFC 5545 3.3.10's own example, "every 20th Monday of the year". Under a
+  // month-scoped reading nthWeekday(y, 5, MO, 20) finds no 20th Monday inside May
+  // and the whole series vanished with no warning. Hand-checked: 1997-01-01 is a
+  // Wednesday so the year's first Monday is Jan 6, and Jan 6 + 19 weeks (133 days)
+  // = May 19; 1998 starts Thursday -> Jan 5 + 133 = May 18; 1999 starts Friday ->
+  // Jan 4 + 133 = May 17. 09:00 floating = NY = 13:00Z under EDT.
+  const text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:t10\r\nSUMMARY:T10\r\nDTSTART:19970519T090000\r\nDTEND:19970519T100000\r\nRRULE:FREQ=YEARLY;BYDAY=20MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "1997-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.events.map((e) => e.start.dateTime), [
+    "1997-05-19T13:00:00.000Z",
+    "1998-05-18T13:00:00.000Z",
+    "1999-05-17T13:00:00.000Z",
+  ]);
+});
+
+test("YEARLY non-ordinal BYDAY with no BYMONTH covers the whole year, not just DTSTART's month", () => {
+  // The dangerous shape: month-scoping emitted the five January Thursdays and
+  // nothing else, so the output looked plausible while ~48 commitments a year
+  // went missing. 2026 opens AND closes on a Thursday, so it holds 53 of them.
+  const text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:t11\r\nSUMMARY:T11\r\nDTSTART:20260101T090000\r\nDTEND:20260101T100000\r\nRRULE:FREQ=YEARLY;BYDAY=TH\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z");
+  assert.deepEqual(r.warnings, []);
+  const starts = r.events.map((e) => e.start.dateTime);
+  assert.equal(starts.length, 53);
+  assert.equal(starts[0], "2026-01-01T14:00:00.000Z");
+  assert.equal(starts[52], "2026-12-31T14:00:00.000Z");
+  // Each occurrence is resolved in ITS OWN offset rather than reusing DTSTART's:
+  // 09:00 NY is 14:00Z under EST and 13:00Z under EDT. 2026 runs EDT 03-08..11-01,
+  // leaving 10 EST Thursdays before it (5 Jan + 4 Feb + Mar 5) and 9 after
+  // (4 Nov + 5 Dec) = 19, so 34 fall in EDT.
+  assert.equal(starts.filter((s) => s.endsWith("T14:00:00.000Z")).length, 19);
+  assert.equal(starts.filter((s) => s.endsWith("T13:00:00.000Z")).length, 34);
+});
+
+test("a date-only UNTIL ends the day in the EVENT'S zone, not a hardcoded NY end-of-day", () => {
+  // NY 23:59:59 on Jul 10 is 2026-07-11T03:59:59Z, which is already Jul 11 in
+  // Tokyo: the series emitted a fourth, phantom occurrence a full day past UNTIL.
+  // The mirror error truncated a west-coast evening series a day early.
+  const tokyo = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:t1\r\nSUMMARY:Tky\r\nDTSTART;TZID=Asia/Tokyo:20260708T090000\r\nDTEND;TZID=Asia/Tokyo:20260708T100000\r\nRRULE:FREQ=DAILY;UNTIL=20260710\r\nEND:VEVENT\r\nEND:VCALENDAR";
+  const rt = parseIcs(tokyo, "2026-07-01T00:00:00Z", "2026-07-20T00:00:00Z");
+  assert.deepEqual(rt.warnings, []);
+  assert.deepEqual(rt.events.map((e) => e.start.dateTime), [
+    "2026-07-08T00:00:00.000Z", // Jul 8 09:00 Tokyo (UTC+9)
+    "2026-07-09T00:00:00.000Z",
+    "2026-07-10T00:00:00.000Z", // UNTIL day, inclusive; no Jul 11
+  ]);
+  // Westward: 22:00 LA on the UNTIL day is 05:00Z the NEXT day and used to fall
+  // outside the NY bound, silently dropping the series' last occurrence.
+  const la = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:t2\r\nSUMMARY:LA\r\nDTSTART;TZID=America/Los_Angeles:20260708T220000\r\nDTEND;TZID=America/Los_Angeles:20260708T230000\r\nRRULE:FREQ=DAILY;UNTIL=20260710\r\nEND:VEVENT\r\nEND:VCALENDAR";
+  const rl = parseIcs(la, "2026-07-01T00:00:00Z", "2026-07-20T00:00:00Z");
+  assert.deepEqual(rl.warnings, []);
+  assert.deepEqual(rl.events.map((e) => e.start.dateTime), [
+    "2026-07-09T05:00:00.000Z", // Jul 8 22:00 PDT
+    "2026-07-10T05:00:00.000Z",
+    "2026-07-11T05:00:00.000Z", // Jul 10 22:00 PDT — the UNTIL day, kept
+  ]);
+});
+
+test("a DATE-valued EXDATE on a timed series excludes by date; the reverse mismatch warns", () => {
+  // Producer-invalid per RFC 5545 3.8.5.1, but common, and the majority of
+  // importers honor it. It used to resolve to a "d<date>" key that could never
+  // match a timed "t<ms>" occurrence, so the instance the user deleted stayed on
+  // the calendar with no warning at all.
+  const timed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:em1\r\nSUMMARY:MM1\r\nDTSTART;TZID=America/New_York:20260706T100000\r\nDTEND;TZID=America/New_York:20260706T110000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEXDATE;VALUE=DATE:20260707\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const rt = parseIcs(timed, "2026-07-01T00:00:00Z", "2026-07-31T00:00:00Z");
+  assert.deepEqual(rt.warnings, []);
+  assert.deepEqual(rt.events.map((e) => e.start.dateTime), [
+    "2026-07-06T14:00:00.000Z",
+    "2026-07-08T14:00:00.000Z", // Jul 7 excluded
+  ]);
+  // A timed EXDATE against an ALL-DAY series names no single day to remove, so it
+  // is refused loudly instead of being dropped on the floor.
+  const allDay = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:em1b\r\nSUMMARY:AD\r\nDTSTART;VALUE=DATE:20260706\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEXDATE;TZID=America/New_York:20260707T000000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const ra = parseIcs(allDay, "2026-07-01T00:00:00Z", "2026-07-31T00:00:00Z");
+  assert.equal(ra.events.length, 3);
+  assert.equal(ra.warnings.length, 1);
+  assert.match(ra.warnings[0], /unresolvable_exdate: 20260707T000000 \(EXDATE value type does not match series\)/);
+});
+
+test("a type-mismatched RECURRENCE-ID warns instead of silently leaving a duplicate", () => {
+  // A DATE-valued RECURRENCE-ID against a timed master suppresses nothing, so the
+  // user sees the moved instance AND the base slot it was supposed to replace.
+  // Matching across kinds would be a guess about which instant was replaced, so
+  // the override still emits on its own and the mismatch is named.
+  const text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:em2\r\nSUMMARY:MM2\r\nDTSTART;TZID=America/New_York:20260706T100000\r\nDTEND;TZID=America/New_York:20260706T110000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:em2\r\nSUMMARY:MovedMM2\r\nRECURRENCE-ID;VALUE=DATE:20260707\r\nDTSTART;TZID=America/New_York:20260707T120000\r\nDTEND;TZID=America/New_York:20260707T130000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-07-01T00:00:00Z", "2026-07-31T00:00:00Z");
+  assert.equal(r.events.length, 4);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /unresolvable_recurrence_id: MovedMM2 \(value type does not match series\)/);
+});
+
+test("a huge DURATION skips only its own event; the rest of the feed survives", () => {
+  // The endpoint overflowed the Date range and iso()/Intl threw a RangeError that
+  // escaped parseIcs entirely, so one corrupt VEVENT destroyed the whole calendar
+  // with an exception type the documented contract never promised.
+  for (const bad of ["P99999999999999D", "PT9999999999999H"]) {
+    const text = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Bad\r\nDTSTART:20260710T120000Z\r\nDURATION:${bad}\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:Good\r\nDTSTART:20260711T120000Z\r\nDTEND:20260711T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
+    const r = parseIcs(text, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+    assert.equal(r.events.length, 1, bad);
+    assert.equal(r.events[0].summary, "Good", bad);
+    assert.equal(r.warnings.length, 1, bad);
+    assert.match(r.warnings[0], /skipped_event: "Bad" \(unsupported DURATION \(too large\)/, bad);
+  }
+  // The all-day branch reaches the overflow through zoneParts/Intl instead of
+  // iso(), so it gets its own case rather than sharing the timed one.
+  const week = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:BadW\r\nDTSTART;VALUE=DATE:20260710\r\nDURATION:P99999999999999W\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const rw = parseIcs(week, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.deepEqual(rw.events, []);
+  assert.match(rw.warnings[0], /unsupported DURATION \(too large\): P99999999999999W/);
+});
+
+test("an impossible DATE-TIME field is a loud skip, never a rolled-over phantom event", () => {
+  // Date.UTC normalizes overflow, so June 31 became a confirmed commitment on
+  // July 1, hour 25 slid to the next morning, minute 75 became 13:15, and Feb 30
+  // rolled clean out of the query window and vanished without a word.
+  for (const v of ["20260631T120000Z", "20260710T250000Z", "20260710T127500Z", "20260230T120000Z"]) {
+    const text = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Ghost\r\nDTSTART:${v}\r\nDTEND:20260710T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
+    const r = parseIcs(text, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+    assert.deepEqual(r.events, [], v);
+    assert.deepEqual(r.warnings, ['skipped_event: "Ghost" (unparseable DTSTART)'], v);
+  }
+});
+
+test("an impossible all-day DATE is a loud skip, never an invalid \"2026-06-32\" literal", () => {
+  // dateStr stamped the unvalidated fields straight through for the start while
+  // addDaysYMD normalized the end, so the emitted pair was not even self
+  // consistent — and nytime's parseCivil cannot resolve the start downstream.
+  const text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Day32\r\nDTSTART;VALUE=DATE:20260632\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.deepEqual(r.events, []);
+  assert.deepEqual(r.warnings, ['skipped_event: "Day32" (unparseable DTSTART)']);
+});
+
+test("a leading UTF-8 BOM is stripped instead of being read as a broken component", () => {
+  // Outlook/Windows exports carry one. It glued to the first line, so the
+  // VCALENDAR wrapper never opened and a valid feed threw unbalanced_component —
+  // loud, but pointing at the wrong cause.
+  const text = "﻿BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Ok\r\nDTSTART:20260710T120000Z\r\nDTEND:20260710T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0].start.dateTime, "2026-07-10T12:00:00.000Z");
+});
+
+test("a folded BEGIN:VCALENDAR line is accepted (the wrapper test runs after unfolding)", () => {
+  // RFC 5545 3.1 permits a fold at any point in any content line, and every OTHER
+  // folded line already worked; only the wrapper was tested against the raw text.
+  const text = "BEGIN:VCAL\r\n ENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:x\r\nDTSTART:20260710T120000Z\r\nDTEND:20260710T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z");
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.events.length, 1);
+});
+
+test("a body that merely quotes BEGIN:VCALENDAR mid-line throws, never a quiet empty calendar", () => {
+  // A proxy or validator error page that echoes the marker it expected used to
+  // pass the substring test and return {events:[]} — indistinguishable from a
+  // healthy empty calendar, which makes every shift look free.
+  const body = '{"error":"upstream said: expected BEGIN:VCALENDAR header","code":502}';
+  assert.throws(() => parseIcs(body, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z"), (e) => e instanceof IcsError && /not_icalendar/.test(e.message));
+  // The marker must be the whole first logical line, but ordinary trailing
+  // whitespace and case variation stay acceptable.
+  const ok = "begin:vcalendar  \r\nBEGIN:VEVENT\r\nSUMMARY:y\r\nDTSTART:20260710T120000Z\r\nDTEND:20260710T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  assert.equal(parseIcs(ok, "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z").events.length, 1);
+});
+
+test("YEARLY BYMONTH+ordinal BYDAY stays MONTH-scoped (the year-scoped path must not leak)", () => {
+  // Discriminator for the branch added above: with BYMONTH present the ordinal is
+  // month-relative per RFC 5545 3.3.10, so this is the first Thursday of NOVEMBER,
+  // not of the year. 2026-11-01 is a Sunday -> Nov 5; 2027-11-01 is a Monday ->
+  // Nov 4. DST ends on the first Sunday in November, so 2026-11-05 is already EST
+  // (09:00 NY = 14:00Z) while 2027-11-04 still precedes the Nov 7 changeover and
+  // is EDT (13:00Z) — the same own-offset resolution the year-scoped case checks.
+  const text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ym\r\nSUMMARY:YM\r\nDTSTART;TZID=America/New_York:20261105T090000\r\nDTEND;TZID=America/New_York:20261105T100000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1TH\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const r = parseIcs(text, "2026-01-01T00:00:00Z", "2028-01-01T00:00:00Z");
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.events.map((e) => e.start.dateTime), [
+    "2026-11-05T14:00:00.000Z",
+    "2027-11-04T13:00:00.000Z",
+  ]);
+});
