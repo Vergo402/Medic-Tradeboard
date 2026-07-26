@@ -1711,7 +1711,28 @@ async function handleListFeedTitles(msg) {
 
     // Mark reviewed: this feed's baseline becomes the set the user is looking
     // at right now, and any pending nudge for it is cleared.
-    const nextSeenMap = { ...seenMap, [feedId]: currentTitleStrings };
+    //
+    // The baseline UNIONS the pending flagged titles rather than being just the
+    // visible ones, because the two windows genuinely differ: refreshCalendarData
+    // flags against the SCORING window (four months out, see boot.js) while this
+    // picker samples titleSampleWindow (30 back / 60 forward). A title whose only
+    // instance lands past day 60 is therefore flaggable but un-listable — so a
+    // baseline of only what's on screen would never contain it, and the next
+    // refresh would flag it again. That is a banner the user cannot dismiss by
+    // doing exactly what it asks. Opening the picker means "I have reviewed this
+    // feed", so everything outstanding for it is absorbed.
+    const pendingRaw = (stored[NEW_TITLES_KEY] || {})[feedId];
+    const pending = pendingRaw && Array.isArray(pendingRaw.titles) ? pendingRaw.titles : [];
+    const seenNorm = new Set(currentTitleStrings.map((t) => normalizeTitleWhitespace(t).trim()));
+    const nextSeen = [...currentTitleStrings];
+    for (const t of pending) {
+      if (typeof t !== "string") continue;
+      const norm = normalizeTitleWhitespace(t).trim();
+      if (norm === "" || seenNorm.has(norm)) continue;
+      seenNorm.add(norm);
+      nextSeen.push(t);
+    }
+    const nextSeenMap = { ...seenMap, [feedId]: nextSeen };
     const nextNewTitlesByFeed = { ...(stored[NEW_TITLES_KEY] || {}) };
     delete nextNewTitlesByFeed[feedId];
     await chrome.storage.local.set({

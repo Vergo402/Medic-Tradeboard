@@ -949,6 +949,50 @@ test("getCalendarData: first sync for a RULE/titles feed seeds calSeenTitles and
   );
 });
 
+test("getCalendarData: an EMPTY calSeenTitles entry is a review, not a first sync", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  // PRESENT but empty: the user has reviewed this feed before, at a moment when
+  // it genuinely had no titles. That is NOT the same as never having reviewed
+  // it, and the difference decides whether a title appearing now is new. A
+  // truthiness check cannot tell the two apart -- only key presence can.
+  STORE.calSeenTitles = { "cal-r": [] };
+  // "Crew - Desk" is the ticked title (it is what gives this feed mode
+  // "titles"), and a ticked title is never flagged -- it already blocks. The
+  // untouched one is the one that must surface.
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(
+    STORE.newTitlesByFeed["cal-r"],
+    { feedName: "Crew Schedule", titles: ["Brand New Training"] },
+    "an empty baseline means anything unticked present now arrived since the last review"
+  );
+});
+
+test("getCalendarData: a RULE feed with nothing ticked (mode none) is never tracked", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  // RULE, but no ticked titles -- calendarRule resolves to mode "none", so this
+  // feed blocks nothing and has no hand-picked set to review against. The role
+  // half of the gate passes here; only the mode half excludes it.
+  STORE.calBlockTitles = { "cal-r": [] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "nothing is ticked, so there is no hand-picked set for a new title to be new against"
+  );
+});
+
 test("getCalendarData: a title new since the last review IS flagged in newTitlesByFeed", async () => {
   reset();
   setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
@@ -1028,6 +1072,34 @@ test("listFeedTitles: isNew reflects the PRE-review state, then marks the feed r
     ["Brand New Training", "Crew - Desk"]
   );
   assert.equal(STORE.newTitlesByFeed["cal-r"], undefined);
+});
+
+test("listFeedTitles: a flagged title the picker cannot list is still marked reviewed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  // Flagged by a refresh over the SCORING window (four months out) but absent
+  // from this picker's own sample (30 back / 60 forward) -- the two windows
+  // genuinely differ. A baseline of only the visible titles would never absorb
+  // it, so the next refresh would flag it again: a banner the user cannot
+  // dismiss by doing exactly what it asks.
+  STORE.newTitlesByFeed = { "cal-r": { feedName: "Crew Schedule", titles: ["Far Future Drill"] } };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    resp.titles.some((t) => t.title === "Far Future Drill"),
+    false,
+    "precondition: the off-sample title is genuinely not listable here"
+  );
+  assert.deepEqual(
+    STORE.calSeenTitles["cal-r"].slice().sort(),
+    ["Crew - Desk", "Far Future Drill"],
+    "opening the picker means the whole feed is reviewed, including what it could not show"
+  );
 });
 
 test("listFeedTitles: the very first time a feed's picker is opened, nothing is flagged isNew", async () => {
