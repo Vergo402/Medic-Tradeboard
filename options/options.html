@@ -137,11 +137,23 @@
 
     /* one title row: header line (title + meta + segmented control), then an
        optional "show as" line revealed when the row is Block or Note */
-    .title-row { padding: 7px 8px; border-radius: 5px; }
+    .title-row { padding: 7px 8px; border-radius: 5px; border-left: 3px solid transparent; }
     .title-row:hover { background: var(--bg-soft); }
     .title-main { display: flex; align-items: center; gap: 10px; }
     .title-main .t { flex: 1; word-break: break-word; font-size: 14px; }
     .title-main .meta { color: var(--ink-soft); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+    /* Never-reviewed title: a quiet left accent + faint tint (not a saturated
+       fill — the row still has to be easy to read), plus a small blue badge
+       next to the title text. Sorts in place within its Recurring/One-time
+       group; this is a highlight, not a third group. */
+    .title-row.new { border-left-color: var(--accent); background: #f2f8fe; }
+    .title-row.new:hover { background: #e8f2fc; }
+    .new-badge {
+      flex: none; background: var(--accent); color: #fff; font-size: 10.5px;
+      font-weight: 700; letter-spacing: .03em; border-radius: 3px; padding: 1px 5px;
+      line-height: 1.5;
+    }
 
     /* Block / Note / Ignore segmented control */
     .seg { display: inline-flex; flex: none; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
@@ -312,6 +324,11 @@
         Google: Settings &rsaquo; your calendar &rsaquo; <b>Secret address in iCal format</b>.
         Apple: Share calendar &rsaquo; Public calendar. Or any <code>.ics</code> or
         <code>webcal://</code> link.
+      </p>
+      <p class="add-hint">
+        Chrome will ask to &ldquo;read and change&rdquo; the site. That&rsquo;s Chrome&rsquo;s
+        wording for any site access; this extension only reads your feed, and never
+        writes to it.
       </p>
     </div>
 

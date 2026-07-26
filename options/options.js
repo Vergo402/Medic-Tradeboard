@@ -334,7 +334,13 @@ function normalizeTitleItems(raw) {
     out.push({
       title,
       count: Number.isFinite(count) ? count : NaN,
-      minutes: Number.isFinite(minutes) ? minutes : NaN
+      minutes: Number.isFinite(minutes) ? minutes : NaN,
+      // Parser-derived, NOT count-derived: a monthly drill with one in-window
+      // instance is still `recurring` (it comes from an RRULE series). Keep it
+      // alongside `isNew` — both would silently vanish here otherwise, since
+      // this function rebuilds a fixed-shape object from the raw wire item.
+      recurring: Boolean(src.recurring),
+      isNew: Boolean(src.isNew)
     });
   }
   out.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
@@ -735,10 +741,11 @@ function modeOf(t, title) {
 // control), then a "show as" line revealed only when the row is Block or Note.
 function buildTitleRow(cal, t, item) {
   const mode = modeOf(t, item.title);
-  const row = el('div', 'title-row');
+  const row = el('div', 'title-row' + (item.isNew ? ' new' : ''));
 
   const main = el('div', 'title-main');
   main.appendChild(el('span', 't', item.title));
+  if (item.isNew) main.appendChild(el('span', 'new-badge', 'NEW'));
   const meta = metaFor(item);
   if (meta) main.appendChild(el('span', 'meta', meta));
 
@@ -779,6 +786,16 @@ function buildTitleRow(cal, t, item) {
   if (mode === 'block') row.appendChild(buildEventBufferRow(cal, t, item));
 
   return row;
+}
+
+// A section header + its rows, or nothing at all when the group is empty —
+// including when the search filter above has emptied it. A lone header over
+// no rows would read as a bug, and the "no matches" empty-state already covers
+// the case where BOTH groups are empty.
+function appendTitleGroup(wrap, cal, t, items, label) {
+  if (items.length === 0) return;
+  wrap.appendChild(el('div', 'group-label', label));
+  for (const item of items) wrap.appendChild(buildTitleRow(cal, t, item));
 }
 
 function buildPicker(cal) {
@@ -852,7 +869,12 @@ function buildPicker(cal) {
   if (shown.length === 0) {
     wrap.appendChild(el('div', 'empty-group', 'No matches for “' + query.trim() + '”.'));
   } else {
-    for (const item of shown) wrap.appendChild(buildTitleRow(cal, t, item));
+    // Two labelled groups, each already alphabetical (normalizeTitleItems sorts
+    // A→Z and that order survives the filter above). A never-reviewed title
+    // sorts IN PLACE within its group — carrying a NEW badge, not hoisted into
+    // a third group — so recurring vs one-time stays the only grouping axis.
+    appendTitleGroup(wrap, cal, t, shown.filter((i) => i.recurring), 'Recurring events');
+    appendTitleGroup(wrap, cal, t, shown.filter((i) => !i.recurring), 'One-time events');
   }
 
   // Running total, counted over the titles in this sample so it always sums to
