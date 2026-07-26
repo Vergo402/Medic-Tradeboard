@@ -1103,3 +1103,31 @@ test("a gapped DTSTART only drags a same-zone DTEND with it when honoring it as 
     [["2026-03-08T07:30:00.000Z", "2026-03-08T08:00:00.000Z"]]);
   assert.deepEqual([a.warnings, b.warnings], [[], []]);
 });
+
+// --- Round-4 adversarial findings -------------------------------------------
+
+test("a nested non-VALARM component's props never leak into the enclosing VEVENT", () => {
+  const r = parseIcs("BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Host\nDTSTART:20260710T100000Z\nDTEND:20260710T110000Z\nBEGIN:X-IMPOSTOR\nDTSTART:20260720T220000Z\nDTEND:20260720T230000Z\nEND:X-IMPOSTOR\nEND:VEVENT\nEND:VCALENDAR",
+    "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(r.events.map((e) => [e.summary, e.start.dateTime, e.end.dateTime]),
+    [["Host", "2026-07-10T10:00:00.000Z", "2026-07-10T11:00:00.000Z"]]);
+  assert.deepEqual(r.warnings, []);
+  // Ordering variant: the impostor block sits BEFORE the event's own DTEND.
+  const v = parseIcs("BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Host2\nDTSTART:20260710T100000Z\nBEGIN:VTODO\nDTSTART:20260701T220000Z\nDTEND:20260701T230000Z\nEND:VTODO\nDTEND:20260710T110000Z\nEND:VEVENT\nEND:VCALENDAR",
+    "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(v.events.map((e) => [e.summary, e.start.dateTime]), [["Host2", "2026-07-10T10:00:00.000Z"]]);
+  assert.deepEqual(v.warnings, []);
+});
+
+test("duplicate overrides for one recurrence instance: highest SEQUENCE wins, stale revision warns", () => {
+  const r = parse(ev("UID:e1\nSUMMARY:Base\nDTSTART;TZID=America/New_York:20260706T100000\nDTEND;TZID=America/New_York:20260706T110000\nRRULE:FREQ=DAILY;COUNT=3")
+    + "\n" + ev("UID:e1\nSUMMARY:OvrOld\nSEQUENCE:1\nRECURRENCE-ID;TZID=America/New_York:20260707T100000\nDTSTART;TZID=America/New_York:20260707T120000\nDTEND;TZID=America/New_York:20260707T130000")
+    + "\n" + ev("UID:e1\nSUMMARY:OvrNew\nSEQUENCE:2\nRECURRENCE-ID;TZID=America/New_York:20260707T100000\nDTSTART;TZID=America/New_York:20260707T150000\nDTEND;TZID=America/New_York:20260707T160000"),
+    "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+  assert.deepEqual(r.events.map((e) => [e.summary, e.start.dateTime]).sort(), [
+    ["Base", "2026-07-06T14:00:00.000Z"],
+    ["Base", "2026-07-08T14:00:00.000Z"],
+    ["OvrNew", "2026-07-07T19:00:00.000Z"],
+  ]);
+  assert.deepEqual(r.warnings, ['duplicate_override: OvrOld (stale revision discarded)']);
+});

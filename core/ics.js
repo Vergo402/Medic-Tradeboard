@@ -764,6 +764,34 @@ function parseExdates(props, warnings, allDay) {
   return set;
 }
 
+// Sync chains sometimes append a new override revision without pruning the old
+// one; both carry the same (UID, RECURRENCE-ID) pair, which RFC 5545 §3.8.4.4
+// defines as ONE recurrence instance. The highest SEQUENCE (§3.8.7.4) is the
+// live revision; stale ones are discarded with a named warning rather than
+// emitted as phantom commitments. Overrides whose key cannot resolve pass
+// through untouched (they are warned about downstream, and suppress nothing).
+function dedupeOverrides(overrides, warnings) {
+  const best = new Map(); // "uid|occKey" -> { props, seq }
+  const ids = new Map();
+  for (const props of overrides) {
+    const rid = props["RECURRENCE-ID"];
+    const cv = rid && classifyValue(rid.value, rid.params);
+    const k = cv && occKey(cv);
+    if (!k) continue;
+    const id = (props.UID ? props.UID.value : "") + "|" + k;
+    ids.set(props, id);
+    const seq = props.SEQUENCE ? parseInt(props.SEQUENCE.value, 10) || 0 : 0;
+    const prev = best.get(id);
+    if (!prev || seq > prev.seq) best.set(id, { props, seq });
+  }
+  return overrides.filter((props) => {
+    const id = ids.get(props);
+    if (!id || best.get(id).props === props) return true;
+    warnings.push("duplicate_override: " + evTitle(props) + " (stale revision discarded)");
+    return false;
+  });
+}
+
 // Index override VEVENTs (those carrying RECURRENCE-ID) by UID -> set of the
 // original-occurrence keys they replace, so master expansion can suppress the
 // base occurrence at each moved/cancelled instance.
@@ -886,14 +914,15 @@ function addProp(map, p) {
 }
 
 // Walk unfolded lines, returning each top-level VEVENT's prop map plus the
-// calendar-level X-WR-CALNAME / X-WR-TIMEZONE (UI defaults). VALARM props are
-// suppressed so a reminder's own TRIGGER/DTSTART can't be mistaken for the
-// event's; VTIMEZONE and other components are ignored (IANA zones are resolved
-// via Intl).
-// BEGIN:<comp> — st is the collector's mutable {cur, depth, inAlarm} state.
+// calendar-level X-WR-CALNAME / X-WR-TIMEZONE (UI defaults). The props of ANY
+// component nested inside a VEVENT (VALARM, VTODO, X-anything) are suppressed —
+// RFC 5545 scopes properties to their own BEGIN/END block, and merging a nested
+// block's DTSTART/DTEND into the event would silently re-time it. VTIMEZONE and
+// other top-level components are ignored (IANA zones are resolved via Intl).
+// BEGIN:<comp> — st is the collector's mutable {cur, depth, nested} state.
 function beginComponent(st, comp) {
-  if (comp === "VEVENT" && st.depth === 1) st.cur = { _EXDATE: [] };
-  else if (st.cur && comp === "VALARM") st.inAlarm++;
+  if (st.cur) st.nested++; // any component opened inside an open VEVENT
+  else if (comp === "VEVENT" && st.depth === 1) st.cur = { _EXDATE: [] };
   st.depth++;
 }
 
@@ -902,11 +931,12 @@ function beginComponent(st, comp) {
 function endComponent(st, comp, vevents) {
   st.depth--;
   if (st.depth < 0) throw new IcsError("unbalanced_component: END:" + comp + " with no matching BEGIN");
-  if (comp === "VEVENT") {
+  if (st.nested) st.nested--; // closing a component nested inside the open VEVENT
+  else if (comp === "VEVENT") {
     if (!st.cur) throw new IcsError("unbalanced_component: END:VEVENT with no matching BEGIN:VEVENT");
     vevents.push(st.cur);
     st.cur = null;
-  } else if (comp === "VALARM" && st.inAlarm) st.inAlarm--;
+  }
 }
 
 // One unbalanced BEGIN:/END: anywhere in the feed must throw rather than
@@ -916,7 +946,7 @@ function collectComponents(lines) {
   const vevents = [];
   let calName = null;
   let tz = null;
-  const st = { cur: null, depth: 0, inAlarm: 0 };
+  const st = { cur: null, depth: 0, nested: 0 };
   for (const line of lines) {
     const uline = line.toUpperCase(); // BEGIN:/END: are property names -> case-insensitive (§3.1)
     // trim(): stray whitespace around a component name (a real producer quirk)
@@ -925,7 +955,7 @@ function collectComponents(lines) {
     // vanish without a warning OR a throw (depth still balances).
     if (uline.startsWith("BEGIN:")) beginComponent(st, uline.slice(6).trim());
     else if (uline.startsWith("END:")) endComponent(st, uline.slice(4).trim(), vevents);
-    else if (st.cur && !st.inAlarm) {
+    else if (st.cur && !st.nested) {
       const p = splitProp(line);
       if (p) addProp(st.cur, p);
     } else if (!st.cur) {
@@ -977,10 +1007,11 @@ export function parseIcs(text, timeMinIso, timeMaxIso) {
   }
   const events = [];
   const warnings = [];
-  const overrideKeys = indexOverrides(overrides, warnings, masterKinds(masters));
+  const liveOverrides = dedupeOverrides(overrides, warnings);
+  const overrideKeys = indexOverrides(liveOverrides, warnings, masterKinds(masters));
 
   for (const props of singles) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
-  for (const props of overrides) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
+  for (const props of liveOverrides) guarded(() => emitSingle(props, winMin, winMax, events, warnings), props, events, warnings);
   for (const props of masters) guarded(() => emitMaster(props, overrideKeys, winMin, winMax, events, warnings), props, events, warnings);
 
   return { events, calName, tz, warnings };
