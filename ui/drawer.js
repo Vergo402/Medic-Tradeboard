@@ -2,7 +2,7 @@
  * ESM module -- dynamic-imported via chrome.runtime.getURL('ui/drawer.js').
  *
  * export function initDrawer(callbacks) -> controller
- *   callbacks = { onRowClick(w2w_id), onOpenSetup() }
+ *   callbacks = { onRowClick(w2w_id), onOpenSetup(), onResync() }
  *   controller.update(state) fully rerenders the drawer from `state`.
  *
  * Mounting: a single fixed-position host <div> is appended to
@@ -78,6 +78,20 @@ function myschedHtml(status) {
 }
 
 function calSegmentHtml(state) {
+  if (state.calStale) {
+    // Checked BEFORE calError: a stale response deliberately carries an error
+    // string too (so the banner below can name the feed), but that must not
+    // make this segment render as FEED ERR -- the board is still scored, just
+    // against a cached commitment set. Age comes from the cache's own
+    // timestamp; force amber rather than letting calAgeInfo's thresholds pick
+    // red at 24h+, since "stale" is already the whole story here.
+    // The outer status line already prints the literal "CAL " label before
+    // this segment (see render()), so this returns "STALE 2h" -- not "CAL
+    // STALE 2h" -- to match how the healthy/error branches below only ever
+    // return their own value half.
+    const { text } = calAgeInfo(state.calAgeMs);
+    return `<span class="cal-age cal-amber">STALE ${escapeHtml(text.replace(/\s*ago$/, ""))}</span>`;
+  }
   if (state.calError) {
     // Any truthy error needs a visible signal rather than silently falling back
     // to the healthy age display. A feed that did not load gets its own wording,
@@ -133,7 +147,7 @@ function bannerHtml(banner) {
     segs.push(`<span class="banner-gone">${banner.goneLabels.length} gone (${escapeHtml(banner.goneLabels.join(" · "))})</span>`);
   }
   if (banner.changedCount > 0) segs.push(`<span class="banner-changed">${banner.changedCount} change</span>`);
-  return `<div class="since-banner"><div class="since-label">SINCE LAST VISIT</div><div class="since-segs">${segs.join(" · ")}</div></div>`;
+  return `<div class="since-banner"><div class="since-label">NEW MEDIC SHIFTS SINCE LAST VISIT</div><div class="since-segs">${segs.join(" · ")}</div></div>`;
 }
 
 function statsHtml(stats) {
@@ -176,16 +190,38 @@ function deconfidenceBannerHtml() {
 }
 
 /**
+ * Pull the feed name out of sw.js's `feed_failed: "<name>" — <why>` error.
+ * Shared by both the broken-feed and the stale-feed banners so there is one
+ * parser for that error shape, not two. Returns "" (never null) when the name
+ * can't be extracted, so callers can fall back to neutral wording.
+ */
+function feedNameFromError(err) {
+  const m = /^feed_failed: "([^"]*)"/.exec(String(err || ""));
+  return m ? m[1] : "";
+}
+
+/**
  * Pull the feed name out of sw.js's `feed_failed: "<name>" — <why>` error so the
  * banner can say WHICH feed to go fix. Falls back to neutral wording rather than
  * rendering the raw error string at a user.
  */
 function feedErrorDetail(err) {
-  const m = /^feed_failed: "([^"]*)"/.exec(String(err || ""));
-  const who = m ? m[1] : "";
+  const who = feedNameFromError(err);
   return who
     ? `${who} didn't load, so these shifts aren't checked against it.`
     : "A calendar feed didn't load, so these shifts aren't checked against it.";
+}
+
+/**
+ * Same extraction, worded for the stale case: the feed DID load once (that's
+ * the cached data scoring is running against) but the refresh attempt failed,
+ * so rows are still checked -- just against last-known commitments.
+ */
+function staleFeedDetail(err) {
+  const who = feedNameFromError(err);
+  return who
+    ? `${who} didn't reload. Rows are still checked against your last sync.`
+    : "A calendar feed didn't reload. Rows are still checked against your last sync.";
 }
 
 /**
@@ -201,7 +237,40 @@ function feedErrorBannerHtml(state) {
   return `<div class="deconf-banner">
     <div class="deconf-head">Not scoring right now</div>
     <div class="deconf-body">${escapeHtml(feedErrorDetail(state.calError))}</div>
+    <button type="button" class="deconf-cta deconf-cta-secondary" data-action="resync">Resync</button>
     <button type="button" class="deconf-cta" data-action="open-setup">Fix feed →</button>
+  </div>`;
+}
+
+/**
+ * The amber "scoring against a cached feed" banner. Distinct from
+ * feedErrorBannerHtml/deconfidenceBannerHtml because the meaning is different:
+ * this is NOT a de-confidence state (rows still carry real ranks/tiers/scores,
+ * see the `stale` vs `muted` split above render()), just a heads-up that the
+ * commitments behind those scores are as-of the last successful sync, not now.
+ */
+function staleBannerHtml(state) {
+  return `<div class="stale-banner">
+    <div class="stale-head">Showing last sync · couldn't refresh</div>
+    <div class="stale-body">${escapeHtml(staleFeedDetail(state.calError))}</div>
+    <button type="button" class="stale-cta stale-cta-secondary" data-action="resync">Resync</button>
+    <button type="button" class="stale-cta" data-action="open-setup">Fix feed →</button>
+  </div>`;
+}
+
+/**
+ * The blue "new calendar events" banner. `info` is state.newCalendarTitles:
+ * { feedName, count } for a hand-picked-titles feed that surfaced event
+ * titles the user has never reviewed. These titles don't block anything until
+ * reviewed, so this is purely informational -- no red/amber urgency implied.
+ */
+function newEventsBannerHtml(info) {
+  const n = info.count || 0;
+  const noun = n === 1 ? "event type" : "event types";
+  return `<div class="newevents-banner">
+    <div class="newevents-head">New calendar events</div>
+    <div class="newevents-body">${escapeHtml(n)} ${noun} on ${escapeHtml(info.feedName)} you haven't reviewed. Until you do, they don't block anything.</div>
+    <button type="button" class="newevents-cta" data-action="open-setup">Review →</button>
   </div>`;
 }
 
@@ -330,7 +399,7 @@ function collapsedTabHtml() {
 }
 
 /**
- * @param {{onRowClick?:Function, onOpenSetup?:Function}} callbacks
+ * @param {{onRowClick?:Function, onOpenSetup?:Function, onResync?:Function}} callbacks
  */
 export function initDrawer(callbacks) {
   const cb = callbacks || {};
@@ -451,22 +520,49 @@ export function initDrawer(callbacks) {
     // STATE 1: the normal list view, plus the compose bar when >=1 shift
     // is selected.
     //
-    // The "muted" pass strips every rank number, tier colour and score, so
-    // nothing on screen can read as a real ranking. It fires for BOTH ways the
-    // board can be unscored:
-    //   - no feed is set to block (nothing was ever going to be checked), or
-    //   - a blocking feed failed to load, so sw.js refused to score at all.
-    // The feed failure wins the banner slot: it names something the user can go
-    // fix, and stacking both would just dilute it. When neither holds,
-    // EVERYTHING below renders exactly as it did before these states existed.
-    const feedBroken = Boolean(state.calError);
-    const muted = !state.anyCalendarBlocks || feedBroken;
+    // Three honest states, not two:
+    //   - noData: NOTHING usable to score against (no fresh commitments, no
+    //     cache either). The "muted" pass below strips every rank number,
+    //     tier colour and score so nothing on screen can read as a real
+    //     ranking -- it also fires when no feed is set to block at all.
+    //   - stale: there IS usable data, just from a last-good cache because the
+    //     latest refresh failed. This is deliberately NOT muted -- ranks,
+    //     tiers and scores stay on screen because the board genuinely was
+    //     scored, just against slightly older commitments. Only the amber
+    //     banner + CAL STALE segment tell the story.
+    //   - feedBroken: noData AND an error naming what broke -- the red,
+    //     actionable case.
+    // calError is set in BOTH the stale and broken cases (it always carries
+    // the feed_failed detail), which is why noData gates feedBroken here
+    // rather than calError alone.
+    const noData = !state.hasCalData;
+    const stale = Boolean(state.calStale) && !noData;
+    const feedBroken = noData && Boolean(state.calError);
+    const muted = !state.anyCalendarBlocks || noData;
 
     let html = headerHtml();
     // Gear, always present, at the end of the status line. It pulses amber
     // (gear-attention) whenever nothing is set to block, calm otherwise.
     const gearClass = state.anyCalendarBlocks ? "gear-btn" : "gear-btn gear-attention";
     html += `<div class="status-line">${escapeHtml(state.monthLabel)} · CAL ${calSegmentHtml(state)} · MYSCHED ${myschedHtml(state.myschedStatus)}<button type="button" class="${gearClass}" data-action="open-setup" title="Calendar setup" aria-label="Calendar setup">⚙</button></div>`;
+
+    // Banner stack order is severity-first, most-actionable on top: the feed
+    // state (a correctness warning -- something may be wrong with what's
+    // being scored) sits above the new-events notice (informational: nothing
+    // is wrong, just unreviewed), which sits above the since-last-visit strip
+    // (purely informational, no action implied at all). This inverts the
+    // pre-existing order, which put the since-last-visit strip first.
+    // `muted` outranks `stale` deliberately. A RULE feed that blocks NOTHING is
+    // still blocking-capable, so it can fail and produce a stale response while
+    // anyCalendarBlocks is false -- and then the amber banner would promise
+    // "rows are still checked" over rows the muted pass has just stripped of
+    // every rank and score. Nothing-is-being-checked is the bigger, more
+    // actionable truth, so it takes the slot.
+    if (feedBroken) html += feedErrorBannerHtml(state);
+    else if (muted) html += deconfidenceBannerHtml();
+    else if (stale) html += staleBannerHtml(state);
+
+    if (state.newCalendarTitles) html += newEventsBannerHtml(state.newCalendarTitles);
 
     const banner = state.banner;
     const bannerHasContent = banner && (
@@ -475,9 +571,6 @@ export function initDrawer(callbacks) {
       (banner.changedCount || 0) > 0
     );
     if (bannerHasContent) html += bannerHtml(banner);
-
-    if (feedBroken) html += feedErrorBannerHtml(state);
-    else if (muted) html += deconfidenceBannerHtml();
 
     html += muted
       ? mutedStatsHtml(state.rows ? state.rows.length : 0)
@@ -523,6 +616,8 @@ export function initDrawer(callbacks) {
       render();
     } else if (action === "open-setup") {
       cb.onOpenSetup && cb.onOpenSetup();
+    } else if (action === "resync") {
+      cb.onResync && cb.onResync();
     } else if (action === "filter") {
       filterTour = target.dataset.tour;
       render();
