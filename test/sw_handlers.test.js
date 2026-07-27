@@ -1358,6 +1358,33 @@ test("listFeedTitles: a flagged title the picker cannot list is still marked rev
   );
 });
 
+test("listFeedTitles: reviewing never forgets a previously-seen title outside the picker window", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  // Already reviewed on a prior sync: "Quarterly Drill" is in the baseline but
+  // its only instance is beyond the picker's 30/60-day sample, so it is NOT on
+  // screen now and NOT pending. Rebuilding the baseline from just the visible
+  // titles would drop it, and the next scoring-window refresh would re-flag it
+  // as new — the false-positive nag Alex saw ("7 event types you haven't
+  // reviewed" for titles that were never new). The baseline must only ever grow.
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk", "Quarterly Drill"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")]; // the only title in the picker's window
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    resp.titles.some((t) => t.title === "Quarterly Drill"),
+    false,
+    "precondition: the out-of-window title is genuinely not on screen"
+  );
+  assert.ok(
+    STORE.calSeenTitles["cal-r"].includes("Quarterly Drill"),
+    "an out-of-window title reviewed earlier must survive: " + JSON.stringify(STORE.calSeenTitles["cal-r"])
+  );
+});
+
 test("listFeedTitles: the very first time a feed's picker is opened, nothing is flagged isNew", async () => {
   reset();
   setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
