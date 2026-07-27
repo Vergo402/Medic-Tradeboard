@@ -20,21 +20,35 @@ See [`PRIVACY.md`](PRIVACY.md) for the full data-handling policy.
 
 On a supported tradeboard page, the extension:
 
-1. Reads the posted shifts directly from the page DOM.
+1. Reads the posted shifts directly from the page DOM. It also reads your own
+   "My Upcoming Shifts" list from W2W, so a shift you're already working can
+   never be scored as one you could pick up.
 2. Fetches the calendar feeds you added and caches them locally. There is no
    background timer: a feed is read when you open the tradeboard, when you
-   change a feed's settings, or when you click **Resync** — and a page load
-   reuses a recent cache rather than re-fetching, so a feed host is never
-   polled more than it needs to be.
-3. Scores each open shift: does it overlap something you're already
-   committed to? Is it too close to another commitment to leave a realistic
-   gap to work it?
-4. Renders a ranked drawer over the page — eligible shifts sorted by score,
+   change a feed's settings, or when you click **Resync**. A page load reuses
+   a recent cache rather than re-fetching, and a burst of triggers collapses
+   into a single request, so a feed host is never polled more than it needs
+   to be.
+3. Scores each posted shift: does it overlap something you're already
+   committed to, or land inside a commitment's rest buffer (see below)?
+   Eligible shifts are ranked by how many clear hours they leave to the
+   nearest commitment.
+4. Marks up the board itself: eligible shifts get small score chips (plus a
+   **NEW** chip when a shift appeared since your last visit, and a note chip
+   when a soft-flag calendar has something that day), while rejected shifts
+   are struck through with a muted chip naming the reason — so the verdicts
+   are visible right where you'd click.
+5. Renders a ranked drawer over the page — eligible shifts sorted by score,
    rejected shifts collapsed with their reason, and a compose tool that
    builds a plain-text "Available Medic Shifts" message from the ones you
    check off (date-sorted lines like `* Th Jul 23, D 7am-7pm`). There's no
    `sms:` link and no recipient — it's copy-to-clipboard only, so nothing is
-   ever auto-sent.
+   ever auto-sent. A ⚙ **SETTINGS** button in the drawer header opens the
+   options page.
+6. Diffs the board against your last visit and, when something changed,
+   heads the drawer with a "new medic shifts since last visit" banner
+   (new / gone / changed counts), so you don't have to re-read the whole
+   board to spot what moved.
 
 If a feed fails to refresh, the drawer never silently pretends every shift is
 free. It keeps scoring against the last good sync and shows an amber "showing
@@ -61,14 +75,26 @@ every feed you add plays one of four roles:
 | **REJECT** | Hard commitment. Any shift overlapping an event here is rejected outright. |
 | **RULE** ("only some events") | You hand-pick, per event title, what each one means: **Block** (a hard commitment), **Note** (a soft flag), or **Ignore**. Everything you don't mark is ignored, so the calendar stays quiet by default. |
 
+Each blocking feed can also carry:
+
+- **A label.** The word its rejected shifts wear in the drawer and on the
+  board ("WORK", "FAMILY", whatever reads best to you); leave it blank for a
+  neutral one. On a RULE feed you can also set a per-event "show as" label.
+- **Rest buffers.** Hours of clear time a commitment demands before it starts
+  and after it ends. A shift that starts too soon after (or ends too close
+  before) a buffered commitment is rejected even though it doesn't overlap,
+  with the reason showing the gap it failed by. Buffers default to 0 — plain
+  overlap only — and can be set per calendar, with a per-event override on a
+  RULE feed's blocked titles. Gaps are true elapsed hours, so a DST change
+  doesn't shift the math.
+
 For a RULE feed, the options page shows a **title picker**: every event title on
 that calendar, grouped into **Recurring** and **One-time** sections and sorted
-alphabetically, each with a Block / Note / Ignore control and an optional "show
-as" label. When a sync surfaces a title you have never reviewed, the drawer
-raises a "new calendar events" nudge and the picker highlights it with a **NEW**
-badge, so a new kind of commitment can't be silently scored as free. The picker
-only lists titles with an upcoming instance, so stale one-off events from the
-past don't clutter it.
+alphabetically, each with a Block / Note / Ignore control. When a sync surfaces
+a title you have never reviewed, the drawer raises a "new calendar events"
+nudge and the picker highlights it with a **NEW** badge, so a new kind of
+commitment can't be silently scored as free. The picker only lists titles with
+an upcoming instance, so stale one-off events from the past don't clutter it.
 
 An advanced regex hatch (an include pattern plus a comma-separated exclude list)
 is still available for a RULE feed that has nothing ticked, but the picker is the
@@ -77,15 +103,21 @@ be left blank — an empty regex matches every event title, which would turn a
 RULE calendar into a blanket block on every shift, so a blank value is reset to
 the default at both save and read time.
 
-## Install (from source)
+## Install
 
-There is no Chrome Web Store listing yet. To run it locally:
+There is no Chrome Web Store listing yet (the planned listing is unlisted,
+link-only — see [`STORE_SUBMISSION.md`](STORE_SUBMISSION.md)). To run it from
+source:
 
 1. Clone this repository.
 2. Go to `chrome://extensions`, enable **Developer mode**.
 3. **Load unpacked** → select the repository's root directory (the one with
    `manifest.json` in it).
 4. Open the extension's **Options** page and add a feed.
+
+To build a Web Store upload instead, `bash scripts/pack-extension.sh` produces
+`dist/medic-tradeboard-v<version>.zip` with only the runtime files (no docs,
+no tests, no key).
 
 ## Add a calendar feed
 
@@ -115,31 +147,49 @@ there rather than silently leaving the board unscored.
     ui/         the drawer (shadow DOM) + its stylesheet
     sw.js       service worker — owns feed fetching and .ics parsing
     options/    the extension's settings page
-    test/       node:test suites + an offline drawer harness
+    test/       node:test suites, anonymized board fixtures, offline harnesses
+    scripts/    CI gate (scripts/ci/) + the Web Store packaging script
+    tools/      repo hygiene: fixture scrubber, packaging, key-leak guard
 
 Only `sw.js` fetches a feed; `core/ics.js` is the pure parser it hands the
 bytes to. The drawer receives everything through a plain `state` object and
 never reads `chrome.storage` directly.
 
-## Tests
+## Tests & checks
 
     node --test 'test/*.test.js'
 
 This is the full offline suite — no network, no browser, no W2W session
-required.
+required. The board fixtures in `test/fixtures/` are anonymized captures
+(synthetic names only).
 
-There's also a standalone drawer-fidelity harness with no extension APIs
-beyond a `chrome.runtime.getURL` shim: serve the repository root over HTTP
-(e.g. `python3 -m http.server 8123`) and open
-`http://localhost:8123/test/harness/drawer-harness.html`. It feeds the drawer
-synthetic rows and rejects covering the Day/Night boundary cases (07:00,
-07:30, 19:00, 23:00, 00:00), and has buttons to replay scan-progress repaints
-and to simulate a shift dropping off the board. It needs an HTTP server
-because it loads ES modules — `file://` won't work.
+The same checks CI runs are available locally:
+
+    bash scripts/ci/gate.sh          # eslint + wording scan + guards + full test suite
+    bash scripts/ci/gate.sh --fast   # the instant subset (pre-commit)
+
+Enable the git hooks once per clone with
+`git config core.hooksPath .githooks`: pre-commit runs the fast gate,
+pre-push runs the full one. GitHub Actions runs the full gate on every PR.
+
+There are also standalone browser harnesses with no extension APIs beyond a
+`chrome.runtime.getURL` shim. Serve the repository root over HTTP
+(e.g. `python3 -m http.server 8123`) and open:
+
+- `http://localhost:8123/test/harness/drawer-harness.html` — feeds the drawer
+  synthetic rows and rejects covering the Day/Night boundary cases (07:00,
+  07:30, 19:00, 23:00, 00:00), with buttons to replay scan-progress repaints
+  and to simulate a shift dropping off the board.
+- `http://localhost:8123/test/harness/options-harness.html` — the options
+  page's title picker against synthetic feeds.
+
+They need an HTTP server because they load ES modules — `file://` won't work.
 
 ## Contributing
 
 This project descends from a private, single-user prototype. If you're
 porting logic in from somewhere else, make sure it's genuinely general — no
 hardcoded calendar IDs, employer names, coworker names, or one person's
-station/shift-code vocabulary. Test fixtures must be synthetic.
+station/shift-code vocabulary. Test fixtures must be synthetic
+(`tools/scrub-fixtures.mjs` is the scrubber). Run `bash scripts/ci/gate.sh`
+before pushing — it's the same gate CI enforces.
