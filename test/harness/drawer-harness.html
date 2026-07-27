@@ -8,9 +8,12 @@
 </style>
 <h1>Drawer harness</h1>
 <p>Offline fidelity harness for the compose-text drawer. No W2W, no network, no extension APIs beyond a getURL shim.</p>
-<button id="tick">simulate scan tick x5</button>
 <button id="swap">swap board (drop Jul 27)</button>
 <button id="blocks">toggle calendar-blocks (de-confidence state)</button>
+<button id="healthy">state: healthy</button>
+<button id="stale">state: stale (still scored)</button>
+<button id="nodata">state: no-data (feed broken)</button>
+<button id="newevents">state: new-events banner</button>
 <h2>Expected message for Jul 23 + Jul 27</h2>
 <pre id="expected"></pre>
 
@@ -59,21 +62,23 @@
       monthLabel: "JUL 2026",
       calAgeMs: 2 * 60 * 1000,
       calError: null,
+      calStale: false,
+      hasCalData: true,
+      newCalendarTitles: null,
       myschedStatus: "ok",
       banner: null,
       stats: { elig: rows.length, rej: rejects.length, best: 52, topCount: 1 },
       rows,
       rejects,
-      scanning: null,
       anyCalendarBlocks,
     }, extra || {});
   }
 
   const controller = initDrawer({
-    onScanAll: () => console.log("[harness] onScanAll"),
     onRowClick: (id) => console.log("[harness] onRowClick", id),
     onConnectCalendar: () => console.log("[harness] onConnectCalendar"),
     onOpenSetup: () => console.log("[harness] onOpenSetup"),
+    onResync: () => console.log("[harness] onResync"),
   });
   controller.update(state());
   window.__ctl = controller;
@@ -84,14 +89,6 @@
     { date: "2026-07-27", start: "23:00", end: "06:00" },
   ]);
 
-  document.getElementById("tick").onclick = () => {
-    for (let i = 1; i <= 5; i++) {
-      controller.update(state({ scanning: { active: true, done: i, total: 4 } }));
-    }
-    controller.update(state());
-    console.log("[harness] 5 scan ticks + final repaint done");
-  };
-
   document.getElementById("swap").onclick = () => {
     controller.update(state({ rows: rows.filter((r) => r.w2w_id !== "id-jul27") }));
     console.log("[harness] board swapped — id-jul27 removed");
@@ -101,5 +98,55 @@
     anyCalendarBlocks = !anyCalendarBlocks;
     controller.update(state());
     console.log("[harness] anyCalendarBlocks =", anyCalendarBlocks);
+  };
+
+  // Four fixture states for the calStale/hasCalData split (see drawer.js
+  // render()'s noData/stale/feedBroken/muted comment). Each button sets the
+  // full state fresh rather than toggling flags, so they can't combine into
+  // a state the real extension would never produce.
+
+  document.getElementById("healthy").onclick = () => {
+    anyCalendarBlocks = true;
+    controller.update(state({
+      calAgeMs: 2 * 60 * 1000, calError: null, calStale: false, hasCalData: true,
+    }));
+    console.log("[harness] state = healthy");
+  };
+
+  document.getElementById("stale").onclick = () => {
+    // Rows/rejects/stats stay populated -- calStale keeps ranks and scores on
+    // screen (NOT the de-confidence mute) while the amber banner + CAL STALE
+    // segment tell the user the commitments behind them are cached.
+    anyCalendarBlocks = true;
+    controller.update(state({
+      calAgeMs: 2 * 60 * 60 * 1000,
+      calError: 'feed_failed: "Work Calendar" — 504 timeout',
+      calStale: true,
+      hasCalData: true,
+    }));
+    console.log("[harness] state = stale");
+  };
+
+  document.getElementById("nodata").onclick = () => {
+    // The genuinely broken case: nothing usable to score against at all.
+    anyCalendarBlocks = true;
+    controller.update(state({
+      calAgeMs: null,
+      calError: 'feed_failed: "Work Calendar" — 504 timeout',
+      calStale: false,
+      hasCalData: false,
+    }));
+    console.log("[harness] state = no-data (feed broken)");
+  };
+
+  document.getElementById("newevents").onclick = () => {
+    // Layers on top of the healthy state -- new-events is informational and
+    // can appear regardless of the feed's health.
+    anyCalendarBlocks = true;
+    controller.update(state({
+      calAgeMs: 2 * 60 * 1000, calError: null, calStale: false, hasCalData: true,
+      newCalendarTitles: { feedName: "Work Calendar", count: 3 },
+    }));
+    console.log("[harness] state = new-events");
   };
 </script>

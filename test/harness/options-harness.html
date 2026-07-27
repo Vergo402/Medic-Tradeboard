@@ -11,34 +11,48 @@
 <script>
   // ---- synthetic canned data (no real calendars/names) --------------------
   const CALS = [
-    { id: 'primary', summary: 'me@example.com', primary: true, role: 'RULE',
-      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: ['ACME - Desk'],
-      bufferBefore: 0, bufferAfter: 12 },
-    { id: 'crew', summary: 'Crew Schedule', primary: false, role: 'REJECT',
-      accessRole: 'reader', selected: true, hiddenInGoogle: false, blockTitles: [],
-      bufferBefore: 8, bufferAfter: 8 },
-    { id: 'fam', summary: 'Family calendar', primary: false, role: 'OFF',
-      accessRole: 'owner', selected: true, hiddenInGoogle: false, blockTitles: [],
-      bufferBefore: 0, bufferAfter: 0 },
+    { id: 'primary', name: 'me@example.com', kind: 'url', source: 'example.com', role: 'RULE',
+      syncedAt: Date.now() - 3 * 60000, blockLabel: '', bufferBefore: 0, bufferAfter: 12 },
+    { id: 'crew', name: 'Crew Schedule', kind: 'url', source: 'crew.example.com', role: 'REJECT',
+      syncedAt: Date.now() - 3600000, blockLabel: '', bufferBefore: 8, bufferAfter: 8 },
+    { id: 'fam', name: 'Family calendar', kind: 'url', source: 'fam.example.com', role: 'OFF',
+      syncedAt: null, blockLabel: '', bufferBefore: 0, bufferAfter: 0 },
+    // Exercises the grouped picker's empty-group case: every title here is
+    // one-time, so "Recurring events" must not render a header over nothing.
+    { id: 'onetime-only', name: 'One-time only feed', kind: 'url', source: 'events.example.com',
+      role: 'RULE', syncedAt: Date.now() - 60000, blockLabel: '', bufferBefore: 0, bufferAfter: 0 },
   ];
   const TITLES = {
     primary: {
-      ok: true, accessRole: 'owner',
+      ok: true,
       titles: [
-        { title: 'ACME - Desk', count: 2, minutes: 1440 },
-        { title: 'ACME - Water Rescue Drill', count: 2, minutes: 300 },
-        { title: 'Kid book and drink', count: 1, minutes: 120 },
-        { title: 'Music Class', count: 5, minutes: 60 },
-        { title: 'Session', count: 8, minutes: 60 },
+        // recurring + never-reviewed (NEW badge, sorts in place within
+        // "Recurring events" — not hoisted out)
+        { title: 'ACME - Desk', count: 2, minutes: 1440, recurring: true, isNew: false },
+        { title: 'ACME - Water Rescue Drill', count: 1, minutes: 300, recurring: true, isNew: true },
+        { title: 'Kid book and drink', count: 1, minutes: 120, recurring: false, isNew: false },
+        { title: 'Music Class', count: 5, minutes: 60, recurring: true, isNew: false },
+        // one-time + never-reviewed
+        { title: 'Session', count: 8, minutes: 60, recurring: false, isNew: true },
       ],
+      warnings: [],
       blockTitles: ['ACME - Desk'],
       noteTitles: ['Kid book and drink'],
       titleLabels: { 'ACME - Water Rescue Drill': 'Drill', 'Kid book and drink': 'Kid' },
       calLabel: 'Fam',
       eventBuffers: { 'ACME - Desk': { before: 0, after: 24 } },
     },
+    'onetime-only': {
+      ok: true,
+      titles: [
+        { title: 'Conference Day 1', count: 1, minutes: 480, recurring: false, isNew: false },
+        { title: 'Conference Day 2', count: 1, minutes: 480, recurring: false, isNew: true },
+      ],
+      warnings: [], blockTitles: [], noteTitles: [], titleLabels: {}, calLabel: '',
+      eventBuffers: {},
+    },
   };
-  const storage = { commitmentLabel: 'Fire Dept', ruleInclude: '', ruleExclude: '', ruleUsePattern: false };
+  const storage = { ruleInclude: '', ruleExclude: '', ruleUsePattern: false };
 
   window.chrome = {
     runtime: {
@@ -46,11 +60,12 @@
       getURL: (p) => p,
       sendMessage(msg, cb) {
         let r = { ok: false, error: 'unhandled: ' + msg.type };
-        if (msg.type === 'listCalendars') r = { ok: true, calendars: CALS, ruleFilter: { include: '', exclude: '', usePattern: false } };
-        else if (msg.type === 'listCalendarTitles') r = TITLES[msg.calendarId] || { ok: true, accessRole: 'owner', titles: [], blockTitles: [], noteTitles: [], titleLabels: {}, calLabel: '' };
+        if (msg.type === 'listFeeds') r = { ok: true, feeds: CALS, ruleFilter: { include: '', exclude: '', usePattern: false } };
+        else if (msg.type === 'listFeedTitles') r = TITLES[msg.feedId] || { ok: true, titles: [], warnings: [], blockTitles: [], noteTitles: [], titleLabels: {}, calLabel: '' };
         else if (msg.type === 'setEventRules') { console.log('[harness] setEventRules', JSON.stringify(msg)); r = { ok: true }; }
         else if (msg.type === 'setCalendarBuffer') { console.log('[harness] setCalendarBuffer', JSON.stringify(msg)); r = { ok: true }; }
-        else if (msg.type === 'setCalendarRole') { console.log('[harness] setCalendarRole', msg.calendarId, msg.role); r = { ok: true }; }
+        else if (msg.type === 'setFeedRole') { console.log('[harness] setFeedRole', msg.feedId, msg.role); r = { ok: true }; }
+        else if (msg.type === 'setFeedBlockLabel') { console.log('[harness] setFeedBlockLabel', JSON.stringify(msg)); r = { ok: true }; }
         else if (msg.type === 'setRuleFilter') r = { ok: true };
         setTimeout(() => cb(r), 0);
       },

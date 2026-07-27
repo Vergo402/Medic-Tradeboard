@@ -1,32 +1,34 @@
 /**
- * Options page — "Choose your calendars".
+ * Options page — "Your calendar feeds".
  *
- * SAFETY PREMISE. This page is the only place a user can say "this calendar
- * means I am already committed". Until they do, NOTHING blocks: defaultRole()
- * in sw.js gives EVERY calendar OFF, the primary included, so a 24-hour tour on
- * the user's own calendar happily coexists with a shift ranked "top eligible".
- * That is the failure this page exists to fix, so two states are deliberately
- * LOUD:
+ * SAFETY PREMISE. This page is the only place a user can say "this feed means I
+ * am already committed". Until they do, NOTHING blocks: defaultRole() in sw.js
+ * gives EVERY feed OFF, so a 24-hour tour on the user's own calendar happily
+ * coexists with a shift ranked "top eligible". That is the failure this page
+ * exists to fix, so two states are deliberately LOUD:
  *
- *   1. #loadBanner — we could not list the calendars at all (not signed in,
- *      token expired, HTTP error). Never allowed to degrade into a calm empty
- *      list, because an empty list would render as "nothing is blocking" and
- *      hide the real cause.
- *   2. #noBlockBanner — signed in, list loaded, and no calendar blocks anything.
+ *   1. #loadBanner — we could not read the feeds at all. Never allowed to
+ *      degrade into a calm empty list, because an empty list would render as
+ *      "nothing is blocking" and hide the real cause.
+ *   2. #noBlockBanner — feeds loaded, and none of them blocks anything.
  *
- * A calendar counts as blocking only if its role is REJECT, or its role is RULE
- * AND (it has at least one ticked title OR the advanced pattern hatch is armed).
- * That last clause is why an unloaded RULE calendar can still count: a stored
+ * A feed counts as blocking only if its role is REJECT, or its role is RULE AND
+ * (it has at least one ticked title OR the advanced pattern hatch is armed).
+ * That last clause is why an unloaded RULE feed can still count: a stored
  * ruleUsePattern blocks via the regex regardless of what titles we have listed.
- * A RULE calendar with nothing ticked and no pattern blocks nothing. This is
- * the shared core/blocks.js definition (see calBlocks below), the same one the
+ * A RULE feed with nothing ticked and no pattern blocks nothing. This is the
+ * shared core/blocks.js definition (see calBlocks below), the same one the
  * drawer uses, so the two surfaces cannot disagree.
  *
- * PRIVACY. Turning a calendar on is the only thing that reads it. We never show
- * event counts on the calendar list itself — that would require reading every
- * calendar including the switched-off ones, breaking PRIVACY.md's promise that
- * only configured calendars are read. Counts appear inside the picker only,
- * which is reached only after a deliberate toggle.
+ * PRIVACY. Switching a feed on is the only thing that reads it. We never show
+ * event counts on the feed list itself — that would require reading every feed
+ * including the switched-off ones, breaking PRIVACY.md's promise that only
+ * configured feeds are read. Counts appear inside the picker only, which is
+ * reached only after a deliberate toggle.
+ *
+ * A feed URL is a CREDENTIAL — a capability link that grants read access to the
+ * whole calendar. sw.js never sends one to this page: rows show redactFeedUrl's
+ * host form, so the token cannot leak into a screenshot or a support paste.
  *
  * ---------------------------------------------------------------------------
  * SERVICE-WORKER CONTRACT ASSUMED BY THIS PAGE
@@ -34,68 +36,87 @@
  * These are the exact shapes this page sends and expects; a mismatch should be
  * fixed here, not papered over.
  *
- *   → { type: "listCalendarTitles", calendarId }
+ *   → { type: "listFeeds" }
+ *   ← { ok:true,
+ *       feeds:[{ id, name, kind:"url"|"file", role, source, syncedAt,
+ *                blockTitles, blockLabel, bufferBefore, bufferAfter }],
+ *       ruleFilter:{ include, exclude, usePattern } }
+ *     source: the feed's HOST only ("calendar.example.com/…") or "uploaded file".
+ *     syncedAt: last successful read (ms), or null. A file feed is static, so
+ *       the row says so instead of implying it refreshes itself.
+ *     usePattern: whether the advanced regex hatch is actually armed.
+ *     blockLabel: the word THIS feed's rejected shifts wear ("" = the neutral
+ *       default). Per feed, never global — see setFeedBlockLabel below.
+ *
+ *   → { type: "listFeedTitles", feedId }
  *     NOTE: no time window is sent. The options page has no board month, so the
- *     HANDLER owns the range it samples (e.g. a few months either side of now).
+ *     HANDLER owns the range it samples (a few months either side of now).
  *   ← { ok: true,
- *       accessRole: "owner" | "writer" | "reader" | "freeBusyReader",
  *       titles: [ { title: string,
  *                   count: number,            // occurrences in the sampled range
  *                   minutes: number } ],      // typical duration, minutes
+ *       warnings: string[],                   // events core/ics.js had to skip
  *       blockTitles: string[],                // persisted Block set (stem match)
  *       noteTitles: string[],                 // persisted Note set (exact match)
  *       titleLabels: { [title]: shortLabel }, // per-event "show as" overrides
- *       calLabel: string }                    // per-calendar short name ("" = none)
- *   ← { ok: false, error: string, accessRole?: string }
- *     error "calendar_off": the worker refuses to read a calendar that is not
- *     switched on, whoever asked. Reachable only out of order — setRole() awaits
- *     setCalendarRole before it asks for titles.
+ *       calLabel: string }                    // per-feed short name ("" = none)
+ *   ← { ok: false, error: string }
+ *     error "feed_off": the worker refuses to read a feed that is not switched
+ *     on, whoever asked. Reachable only out of order — setRole() awaits
+ *     setFeedRole before it asks for titles.
+ *     `warnings` is NOT decoration: a skipped event is one the user cannot tick
+ *     and one that will not block, so the row renders them rather than leaving
+ *     the gap invisible.
  *     The block/note/label sets are the FULL persisted state, including titles
  *     whose events fall outside the sample and so never render as rows. The
  *     picker seeds its authoritative sets from these and re-sends them whole via
  *     setEventRules, so an off-sample Block title is never dropped — dropping it
  *     would silently weaken blocking.
  *
- *   → { type: "setEventRules", calendarId,
- *       block: string[], note: string[],
- *       labels: { [title]: shortLabel }, calLabel: string }
- *   ← { ok: true } | { ok: false, error: string }
- *     ONE atomic write of the whole three-way picker state for the calendar.
- *     The page sends the entire current sets on every change (snapshot at send
- *     time), so there are no per-control races. The legacy setBlockTitles
- *     handler still exists in sw.js but this page no longer calls it.
+ *   → { type: "addFeedUrl", url, name, role }
+ *   → { type: "addFeedFile", content, name, role }
+ *   ← { ok:true, feedId } | { ok:false, error }
+ *     The worker FETCHES AND PARSES the feed before storing it, so a dead link
+ *     fails while the user is still looking at the field they pasted into. A URL
+ *     feed needs host access first: this page asks for it with
+ *     chrome.permissions.request() inside the click's user gesture (see
+ *     requestOrigin), one origin at a time, so the extension never holds broad
+ *     browsing access it does not need.
+ *
+ *   → { type: "removeFeed", feedId }   also deletes that feed's whole config
+ *   → { type: "setFeedRole", feedId, role }   role ∈ OFF|FLAG|REJECT|RULE
+ *   → { type: "setEventRules", feedId, block, note, labels, calLabel, eventBuffers }
+ *     ONE atomic write of the whole three-way picker state for the feed. The
+ *     page sends the entire current sets on every change (snapshot at send time),
+ *     so there are no per-control races.
+ *   → { type: "setCalendarBuffer", feedId, before, after }
+ *   → { type: "setFeedBlockLabel", feedId, label }
+ *     The word on this feed's reject chips. Its own tiny handler rather than a
+ *     field on setEventRules: that one writes a snapshot of the whole picker,
+ *     and a REJECT feed never loads a picker, so routing this through it would
+ *     send empty block/note arrays and wipe config. A blank label REMOVES the
+ *     stored entry, so "unset" has exactly one representation.
+ *   → { type: "setRuleFilter", include, exclude }   (advanced escape hatch only)
  *
  * Tolerated aliases (defensive only — the names above are the contract):
  *   titles[].typicalMinutes / durationMinutes as alternates for `minutes`,
  *   titles[].n as an alternate for `count`,
  *   a bare string instead of an object (title with unknown count/duration).
- *
- * Already in sw.js and unchanged:
- *   → { type: "listCalendars", interactive }
- *   ← { ok:true, calendars:[{id,summary,primary,role,accessRole,hiddenInGoogle}],
- *       ruleFilter:{include,exclude,usePattern} }
- *     hiddenInGoogle: hidden in Google Calendar but still configured here, so
- *       still read — the row is labelled rather than silently dropped.
- *     usePattern: whether the advanced regex hatch is actually armed.
- *   → { type: "setCalendarRole", calendarId, role }   role ∈ OFF|FLAG|REJECT|RULE
- *   → { type: "setRuleFilter", include, exclude }     (advanced escape hatch only)
  */
 
-// The per-calendar block predicate, shared with content/boot.js's
+// The per-feed block predicate, shared with content/boot.js's
 // anyCalendarBlocks signal so the drawer's muted state and this page's "nothing
 // blocks" banner can never disagree. This is why options.html loads options.js
 // as type="module".
 import { calendarBlocks } from '../core/blocks.js';
 
-// `commitmentLabel` must match core/rowshape.js's DEFAULT_COMMITMENT_LABEL,
-// which is what content/boot.js falls back to. `ruleInclude` must match sw.js's
-// DEFAULTS.ruleInclude and must stay a real, non-empty, anchored pattern:
-// new RegExp("") matches EVERY string, so an empty include would make a RULE
-// calendar hard-reject all of its events and silently hide every shift.
+// `ruleInclude` must match sw.js's DEFAULTS.ruleInclude and must stay a real,
+// non-empty, anchored pattern: new RegExp("") matches EVERY string, so an empty
+// include would make a RULE feed hard-reject all of its events and silently hide
+// every shift.
 const DEFAULTS = {
   ruleInclude: '^Work\\b',
-  ruleExclude: '',
-  commitmentLabel: 'Commitment'
+  ruleExclude: ''
 };
 
 // Plain-language labels. The STORED values are unchanged — only the words move.
@@ -105,7 +126,7 @@ const ROLE_CHOICES = [
   { role: 'FLAG', label: 'Notes only' }
 ];
 
-// The role a calendar takes the moment its toggle is ticked. FLAG, never
+// The role a feed takes the moment its toggle is ticked. FLAG, never
 // REJECT: turning a switch on must not silently start hiding shifts. Blocking
 // is always a second, deliberate choice.
 const ROLE_ON_ENABLE = 'FLAG';
@@ -117,7 +138,7 @@ const ROLE_ON_ENABLE = 'FLAG';
 const state = {
   calendars: [],          // [{id, summary, primary, role}]
   loadError: null,        // string | null — set means the LOUD load banner shows
-  // calId -> { status, accessRole, error, saveError,
+  // feedId -> { status, error, saveError,
   //            items:[{title,count,minutes}],  // distinct titles in the sample
   //            blockSet:Set<title>,            // Block — stem match, safety-critical
   //            noteSet:Set<title>,             // Note — exact match, cosmetic
@@ -186,34 +207,52 @@ function joinNames(names) {
 }
 
 function calDisplayName(cal) {
-  // Google returns the account email as the primary calendar's summary — not a
-  // name, and an address we should not be rendering.
-  return cal.primary ? 'Your calendar' : (cal.summary || '(unnamed calendar)');
+  // resolveFeedRoles already resolved this: the user's own name, else the
+  // calendar's X-WR-CALNAME, else a placeholder. Never the feed URL.
+  return cal.name || '(unnamed feed)';
 }
 
-// Human wording for the sw.js error strings ("auth_required", "auth_expired",
-// "oauth_config: …", "http_403", "fetch_failed: …", "sw_unreachable: …").
+// "4m ago" / "3h ago" / "2d ago" for a feed's last successful read.
+function fmtSince(ms) {
+  const mins = (Date.now() - ms) / 60000;
+  if (!Number.isFinite(mins) || mins < 0) return 'just now';
+  if (mins < 1) return 'just now';
+  if (mins < 60) return Math.round(mins) + 'm ago';
+  if (mins < 1440) return Math.round(mins / 60) + 'h ago';
+  return Math.round(mins / 1440) + 'd ago';
+}
+
+// Human wording for the sw.js feed error strings ("feed_http: http_404",
+// "feed_unreachable: …", "feed_unparseable: …", "feed_bad_url", "feed_empty",
+// "feed_off", "sw_unreachable: …").
 function explainError(err) {
   const e = String(err || '');
-  if (e === 'auth_required') {
-    return { title: 'Not connected to Google', body: 'This page has not been given access to your Google Calendar yet, so it cannot show you any calendars — and nothing is blocking shifts.' };
+  if (e.startsWith('feed_http')) {
+    const code = (e.match(/http_(\d+)/) || [])[1];
+    return {
+      title: 'That link did not work',
+      body: 'The calendar answered with HTTP ' + (code || '?') + '. Secret calendar links can be reset by the provider — open your calendar settings, copy the link again, and replace it here.'
+    };
   }
-  if (e === 'auth_expired') {
-    return { title: 'Google sign-in expired', body: 'Your access to Google Calendar expired. Until you reconnect, no calendar is being read and nothing is blocking shifts.' };
+  if (e.startsWith('feed_unreachable')) {
+    return { title: 'Could not reach that calendar', body: 'The link could not be loaded: ' + e + '. Check the address, your connection, and that you allowed access to the site when asked.' };
   }
-  if (e.startsWith('oauth_config')) {
-    return { title: 'Extension is not configured for sign-in', body: 'Google refused the sign-in request because of the extension\'s OAuth configuration: ' + e };
+  if (e.startsWith('feed_unparseable') || e.includes('not_icalendar')) {
+    return { title: 'That link is not a calendar feed', body: 'The address loaded, but what came back is not an iCalendar (.ics) file — usually a sign-in page instead of the feed. Copy the link labelled iCal or "secret address" rather than the one from your browser bar.' };
   }
-  if (e.startsWith('http_')) {
-    return { title: 'Google refused the request', body: 'Google Calendar returned ' + e.replace('http_', 'HTTP ') + '. No calendars could be listed, so nothing is blocking shifts.' };
+  if (e === 'feed_bad_url') {
+    return { title: 'That is not a usable calendar address', body: 'A feed link has to start with https:// or webcal://. Paste the iCal link from your calendar provider.' };
   }
-  if (e === 'calendar_off') {
-    return { title: 'That calendar is switched off', body: 'The extension only reads calendars that are switched on here, so it did not open this one. Switch it on and try again.' };
+  if (e === 'feed_empty') {
+    return { title: 'That file was empty', body: 'The uploaded .ics file had no content in it. Export the calendar again and upload the new file.' };
+  }
+  if (e === 'feed_off') {
+    return { title: 'That feed is switched off', body: 'The extension only reads feeds that are switched on here, so it did not open this one. Switch it on and try again.' };
   }
   if (e.startsWith('sw_unreachable')) {
     return { title: 'The extension\'s background worker did not answer', body: e + '. Try reloading this page; if it persists, reload the extension.' };
   }
-  return { title: 'Can’t read your calendar list', body: 'Something went wrong: ' + e + '. No calendars could be listed, so nothing is blocking shifts.' };
+  return { title: 'Can’t read your feeds', body: 'Something went wrong: ' + e + '. Nothing is blocking shifts.' };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,12 +299,16 @@ function renderPrivacyNote() {
   }
   const total = state.calendars.length;
   const on = state.calendars.filter((c) => c.role !== 'OFF');
-  if (total === 0 || on.length === 0) {
-    note.textContent = 'These are the calendar names on your account. Their contents are not read unless you switch one on.';
+  if (total === 0) {
+    note.textContent = 'No feeds yet. Feed links are stored on this computer only and are never synced.';
+    return;
+  }
+  if (on.length === 0) {
+    note.textContent = 'These feeds are added but switched off. Their contents are not read unless you switch one on.';
     return;
   }
   const off = state.calendars.filter((c) => c.role === 'OFF').map(calDisplayName);
-  let text = 'Reading ' + on.length + ' of ' + total + ' calendar' + (total === 1 ? '' : 's') + '.';
+  let text = 'Reading ' + on.length + ' of ' + total + ' feed' + (total === 1 ? '' : 's') + '.';
   if (off.length) text += ' ' + joinNames(off) + (off.length === 1 ? ' is' : ' are') + ' never opened.';
   note.textContent = text;
 }
@@ -291,7 +334,13 @@ function normalizeTitleItems(raw) {
     out.push({
       title,
       count: Number.isFinite(count) ? count : NaN,
-      minutes: Number.isFinite(minutes) ? minutes : NaN
+      minutes: Number.isFinite(minutes) ? minutes : NaN,
+      // Parser-derived, NOT count-derived: a monthly drill with one in-window
+      // instance is still `recurring` (it comes from an RRULE series). Keep it
+      // alongside `isNew` — both would silently vanish here otherwise, since
+      // this function rebuilds a fixed-shape object from the raw wire item.
+      recurring: Boolean(src.recurring),
+      isNew: Boolean(src.isNew)
     });
   }
   out.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
@@ -357,20 +406,21 @@ async function loadTitles(calId, force) {
   state.titles.set(calId, { status: 'loading', items: [], ...emptyThreeWay() });
   render();
 
-  const resp = await send({ type: 'listCalendarTitles', calendarId: calId });
+  const resp = await send({ type: 'listFeedTitles', feedId: calId });
   if (!resp.ok) {
     state.titles.set(calId, {
       status: 'error',
       error: resp.error,
-      accessRole: resp.accessRole,
       items: [],
       ...emptyThreeWay()
     });
   } else {
     state.titles.set(calId, {
       status: 'ok',
-      accessRole: resp.accessRole || '',
       items: normalizeTitleItems(resp.titles),
+      // Events core/ics.js had to skip on this feed. They are not being applied,
+      // so the row renders them rather than letting the gap stay invisible.
+      warnings: Array.isArray(resp.warnings) ? resp.warnings : [],
       ...seedThreeWay(resp)
     });
   }
@@ -526,8 +576,73 @@ function buildBufferField(cal, key, label) {
   return wrap;
 }
 
-// Calendar-level "Rest buffer" block — shown on any calendar that can block:
-// a REJECT card's body, and the header of a RULE calendar's picker.
+// One in-flight save per feed, chained — same reasoning as the buffer and
+// event-rule chains above: typing fires a save per keystroke, and two
+// concurrent read-modify-writes can land out of order so an older snapshot wins.
+const blockLabelChains = new Map();
+const blockLabelTimers = new Map();
+
+function persistBlockLabel(calId) {
+  const prev = blockLabelChains.get(calId) || Promise.resolve();
+  const next = prev.then(() => sendBlockLabel(calId)).catch(() => {});
+  blockLabelChains.set(calId, next);
+  return next;
+}
+
+function persistBlockLabelDebounced(calId, ms = 400) {
+  clearTimeout(blockLabelTimers.get(calId));
+  blockLabelTimers.set(calId, setTimeout(() => persistBlockLabel(calId), ms));
+}
+
+// Snapshot at SEND time, not queue time, so the last write always carries what
+// is on screen.
+async function sendBlockLabel(calId) {
+  const cal = state.calendars.find((c) => c.id === calId);
+  if (!cal) return;
+  const hadError = Boolean(cal.blockLabelSaveError);
+  try {
+    const resp = await send({ type: 'setFeedBlockLabel', feedId: calId, label: cal.blockLabel || '' });
+    cal.blockLabelSaveError = resp.ok ? null : resp.error;
+  } catch (e) {
+    cal.blockLabelSaveError = e && e.message ? e.message : String(e);
+  }
+  if (cal.blockLabelSaveError || hadError) render();
+}
+
+/**
+ * The word this feed's rejected shifts wear ("✕ Fire Dept").
+ *
+ * Lives beside the rest buffer because both belong to the same question — what
+ * this feed does when it blocks — and both therefore render on exactly the roles
+ * that CAN block. A "Notes only" feed never rejects anything, so it never shows
+ * this field.
+ *
+ * No render() on input: rebuilding the list mid-keystroke would steal focus. The
+ * chip preview is updated in place instead.
+ */
+function buildBlockLabelRow(cal) {
+  const row = el('div', 'cal-label-row');
+  row.appendChild(el('label', null, 'Rejected shifts say →'));
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'Commitment';
+  input.value = cal.blockLabel || '';
+
+  const chip = el('span', 'chip', '✕ ' + (cal.blockLabel || 'Commitment'));
+  input.addEventListener('input', () => {
+    cal.blockLabel = input.value;
+    chip.textContent = '✕ ' + (input.value.trim() || 'Commitment');
+    persistBlockLabelDebounced(cal.id);
+  });
+
+  row.appendChild(input);
+  row.appendChild(chip);
+  return row;
+}
+
+// Feed-level "Rest buffer" block — shown on any feed that can block: a REJECT
+// card's body, and the header of a RULE feed's picker.
 function buildBufferBlock(cal) {
   const box = el('div', 'buffer-block');
   box.appendChild(el('div', 'buffer-title', 'Rest buffer'));
@@ -539,6 +654,12 @@ function buildBufferBlock(cal) {
     'Shifts within this window of a blocking event are rejected. 0 = block only direct overlaps.'));
   if (cal.bufferSaveError) {
     box.appendChild(el('div', 'cal-status error', 'Not saved (' + cal.bufferSaveError + ').'));
+  }
+  box.appendChild(buildBlockLabelRow(cal));
+  box.appendChild(el('p', 'buffer-hint',
+    'The word shown on shifts this feed knocks out. Leave blank for “Commitment”.'));
+  if (cal.blockLabelSaveError) {
+    box.appendChild(el('div', 'cal-status error', 'Label not saved (' + cal.blockLabelSaveError + ').'));
   }
   return box;
 }
@@ -616,35 +737,15 @@ function modeOf(t, title) {
   return 'ignore';
 }
 
-function buildFreeBusyNotice(cal) {
-  const box = el('div', 'freebusy');
-  box.appendChild(el('div', null,
-    'This calendar only shares free/busy times with you, not event titles, so its '
-    + 'individual events cannot be listed. Pick one of the two things it can still do.'));
-  const acts = el('div', 'acts');
-
-  const blockAll = el('button', null, 'Block every busy time');
-  blockAll.type = 'button';
-  blockAll.addEventListener('click', () => setRole(cal.id, 'REJECT'));
-
-  const notes = el('button', 'ghost', 'Notes only');
-  notes.type = 'button';
-  notes.addEventListener('click', () => setRole(cal.id, 'FLAG'));
-
-  acts.appendChild(blockAll);
-  acts.appendChild(notes);
-  box.appendChild(acts);
-  return box;
-}
-
 // One title row: a header line (title + meta + the Block/Note/Ignore segmented
 // control), then a "show as" line revealed only when the row is Block or Note.
 function buildTitleRow(cal, t, item) {
   const mode = modeOf(t, item.title);
-  const row = el('div', 'title-row');
+  const row = el('div', 'title-row' + (item.isNew ? ' new' : ''));
 
   const main = el('div', 'title-main');
   main.appendChild(el('span', 't', item.title));
+  if (item.isNew) main.appendChild(el('span', 'new-badge', 'NEW'));
   const meta = metaFor(item);
   if (meta) main.appendChild(el('span', 'meta', meta));
 
@@ -687,9 +788,19 @@ function buildTitleRow(cal, t, item) {
   return row;
 }
 
+// A section header + its rows, or nothing at all when the group is empty —
+// including when the search filter above has emptied it. A lone header over
+// no rows would read as a bug, and the "no matches" empty-state already covers
+// the case where BOTH groups are empty.
+function appendTitleGroup(wrap, cal, t, items, label) {
+  if (items.length === 0) return;
+  wrap.appendChild(el('div', 'group-label', label));
+  for (const item of items) wrap.appendChild(buildTitleRow(cal, t, item));
+}
+
 function buildPicker(cal) {
   const wrap = el('div', 'picker');
-  wrap.appendChild(el('h3', null, 'What matters on this calendar?'));
+  wrap.appendChild(el('h3', null, 'What matters on this feed?'));
   wrap.appendChild(el('p', 'hint',
     'Mark an event Block to knock out an overlapping shift, or Note to leave a '
     + 'reminder. Everything you leave on Ignore is dropped.'));
@@ -702,18 +813,14 @@ function buildPicker(cal) {
   const t = state.titles.get(cal.id);
 
   if (!t || t.status === 'loading') {
-    wrap.appendChild(el('div', 'cal-status', 'Reading this calendar…'));
+    wrap.appendChild(el('div', 'cal-status', 'Reading this feed…'));
     return wrap;
   }
 
-  if (t.status === 'error' || t.accessRole === 'freeBusyReader') {
-    if (t.accessRole === 'freeBusyReader') {
-      wrap.appendChild(buildFreeBusyNotice(cal));
-      return wrap;
-    }
+  if (t.status === 'error') {
     const info = explainError(t.error);
     const err = el('div', 'cal-status error',
-      'Could not read this calendar — ' + info.title + ' (' + t.error + '). '
+      'Could not read this feed — ' + info.title + ' (' + t.error + '). '
       + 'Nothing from it is blocking shifts.');
     wrap.appendChild(err);
     const retry = el('button', 'ghost', 'Try again');
@@ -726,14 +833,14 @@ function buildPicker(cal) {
 
   if (t.items.length === 0) {
     wrap.appendChild(el('div', 'cal-status',
-      'No events found on this calendar, so nothing here can block a shift.'));
+      'No events found on this feed, so nothing here can block a shift.'));
     return wrap;
   }
 
   // Per-calendar short name: prefixes every note from this calendar in place of
   // its full display name. No render() on input — same reasoning as "show as".
   const calLabelRow = el('div', 'cal-label-row');
-  calLabelRow.appendChild(el('label', null, 'Show this calendar as →'));
+  calLabelRow.appendChild(el('label', null, 'Show this feed as →'));
   const calInput = document.createElement('input');
   calInput.type = 'text';
   calInput.placeholder = calDisplayName(cal);
@@ -762,7 +869,12 @@ function buildPicker(cal) {
   if (shown.length === 0) {
     wrap.appendChild(el('div', 'empty-group', 'No matches for “' + query.trim() + '”.'));
   } else {
-    for (const item of shown) wrap.appendChild(buildTitleRow(cal, t, item));
+    // Two labelled groups, each already alphabetical (normalizeTitleItems sorts
+    // A→Z and that order survives the filter above). A never-reviewed title
+    // sorts IN PLACE within its group — carrying a NEW badge, not hoisted into
+    // a third group — so recurring vs one-time stays the only grouping axis.
+    appendTitleGroup(wrap, cal, t, shown.filter((i) => i.recurring), 'Recurring events');
+    appendTitleGroup(wrap, cal, t, shown.filter((i) => !i.recurring), 'One-time events');
   }
 
   // Running total, counted over the titles in this sample so it always sums to
@@ -805,10 +917,10 @@ async function setRole(calId, role) {
   cal.role = role;
   render();
 
-  const resp = await send({ type: 'setCalendarRole', calendarId: calId, role });
+  const resp = await send({ type: 'setFeedRole', feedId: calId, role });
   if (!resp.ok) {
     cal.role = previous;
-    cal.roleError = 'Not saved (' + resp.error + ') — this calendar is still "'
+    cal.roleError = 'Not saved (' + resp.error + ') — this feed is still "'
       + previous + '".';
     render();
     return;
@@ -861,16 +973,24 @@ function buildCalendar(cal) {
   head.appendChild(sw);
 
   const name = el('div', 'cal-name', calDisplayName(cal));
-  if (cal.hiddenInGoogle) {
-    // It is hidden in Google Calendar but still configured here, so it is still
-    // being read. Saying so is the difference between "why is this blocking me?"
-    // and a calendar the user cannot find to turn off.
-    const tag = el('span', 'tag', 'hidden in Google Calendar');
-    tag.title = 'You hid this calendar in Google Calendar. It is still switched '
-      + 'on here, so it still counts.';
-    name.appendChild(tag);
-  }
+  // The host only — never the secret capability URL, which sw.js does not even
+  // send to this page.
+  if (cal.source) name.appendChild(el('span', 'tag', cal.source));
   head.appendChild(name);
+
+  // A URL feed refreshes itself, so it shows how fresh it is. An uploaded file
+  // never can, so it says so outright rather than showing an age that would
+  // imply it updates on its own.
+  head.appendChild(el('span', 'cal-sync', cal.kind === 'file'
+    ? 'static — re-upload to update'
+    : (cal.syncedAt ? 'synced ' + fmtSince(cal.syncedAt) : 'not read yet')));
+
+  const remove = el('button', 'feed-remove', '✕');
+  remove.type = 'button';
+  remove.title = 'Remove this feed';
+  remove.setAttribute('aria-label', 'Remove ' + calDisplayName(cal));
+  remove.addEventListener('click', () => removeFeed(cal));
+  head.appendChild(remove);
   card.appendChild(head);
 
   if (on) {
@@ -889,10 +1009,15 @@ function buildCalendar(cal) {
       body.appendChild(el('div', 'cal-status error',
         'This calendar is switched on but could not be read (' + t.error
         + '), so nothing from it is being applied.'));
-    } else if (t && t.accessRole === 'freeBusyReader' && cal.role !== 'REJECT') {
-      body.appendChild(el('div', 'cal-status',
-        'This calendar only shares free/busy times, so its event names cannot be listed. '
-        + '“Only some events” is not available for it.'));
+    }
+    // Events the parser had to skip on this feed. They are NOT being applied, so
+    // saying which ones is the difference between a known gap and a silent one.
+    if (t && Array.isArray(t.warnings) && t.warnings.length) {
+      const warn = el('div', 'cal-warn');
+      warn.appendChild(el('div', 'cal-warn-head',
+        t.warnings.length + (t.warnings.length === 1 ? ' event was skipped' : ' events were skipped')));
+      warn.appendChild(el('div', 'cal-warn-body', t.warnings.join(' · ')));
+      body.appendChild(warn);
     }
     card.appendChild(body);
   }
@@ -951,7 +1076,7 @@ async function loadCalendars(interactive) {
     state.ruleUsePattern = false;
   }
 
-  const resp = await send({ type: 'listCalendars', interactive: Boolean(interactive) });
+  const resp = await send({ type: 'listFeeds' });
   if (!resp.ok) {
     state.loadError = resp.error || 'unknown_error';
     state.calendars = [];
@@ -959,13 +1084,16 @@ async function loadCalendars(interactive) {
     return;
   }
   state.loadError = null;
-  state.calendars = (resp.calendars || []).map((c) => ({
+  state.calendars = (resp.feeds || []).map((c) => ({
     id: c.id,
-    summary: c.summary || '',
-    primary: c.primary === true,
+    name: c.name || '',
+    kind: c.kind === 'file' ? 'file' : 'url',
+    source: c.source || '',
+    syncedAt: typeof c.syncedAt === 'number' ? c.syncedAt : null,
     role: c.role || 'OFF',
-    hiddenInGoogle: c.hiddenInGoogle === true,
     roleError: null,
+    blockLabel: typeof c.blockLabel === 'string' ? c.blockLabel : '',
+    blockLabelSaveError: null,
     bufferBefore: toHours(c.bufferBefore),
     bufferAfter: toHours(c.bufferAfter),
     bufferSaveError: null
@@ -981,7 +1109,7 @@ async function loadCalendars(interactive) {
 }
 
 // ---------------------------------------------------------------------------
-// commitmentLabel + the advanced pattern escape hatch
+// The advanced pattern escape hatch
 // ---------------------------------------------------------------------------
 
 function setStatus(id, text, isError) {
@@ -996,22 +1124,6 @@ function setStatus(id, text, isError) {
       }
     }, 2000);
   }
-}
-
-function paintChip() {
-  const raw = document.getElementById('commitmentLabel').value.trim();
-  document.getElementById('chipPreview').textContent =
-    '✕ ' + (raw || DEFAULTS.commitmentLabel);
-}
-
-function saveCommitmentLabel() {
-  const field = document.getElementById('commitmentLabel');
-  const label = field.value.trim() === '' ? DEFAULTS.commitmentLabel : field.value.trim();
-  chrome.storage.local.set({ commitmentLabel: label }, () => {
-    field.value = label;
-    paintChip();
-    setStatus('status', 'Saved');
-  });
 }
 
 function savePattern() {
@@ -1043,10 +1155,6 @@ function savePattern() {
 
 function loadLocalFields() {
   chrome.storage.local.get(DEFAULTS, (items) => {
-    const label = (typeof items.commitmentLabel === 'string' && items.commitmentLabel.trim())
-      ? items.commitmentLabel
-      : DEFAULTS.commitmentLabel;
-    document.getElementById('commitmentLabel').value = label;
     // The RAW stored pattern is shown, not the compiled fallback: when a stored
     // regex is broken sw.js silently uses the default, but the user still needs
     // to see the broken value in order to fix it.
@@ -1056,15 +1164,152 @@ function loadLocalFields() {
         : DEFAULTS.ruleInclude;
     document.getElementById('ruleExclude').value =
       typeof items.ruleExclude === 'string' ? items.ruleExclude : DEFAULTS.ruleExclude;
-    paintChip();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Adding and removing feeds
+// ---------------------------------------------------------------------------
+
+// The origin pattern Chrome needs before the worker may fetch this feed.
+function originPatternFor(url) {
+  try {
+    const u = new URL(String(url || '').trim().replace(/^webcal:\/\//i, 'https://'));
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    return u.origin + '/*';
+  } catch (_e) {
+    return null;
+  }
+}
+
+// Host access is OPTIONAL and asked for one origin at a time, at the moment the
+// user adds that feed — so the extension never holds broad browsing access it
+// does not need, and the prompt names the site the user just pasted.
+function requestOrigin(pattern) {
+  return new Promise((resolve) => {
+    try {
+      chrome.permissions.request({ origins: [pattern] }, (granted) => {
+        // lastError fires when the call is not tied to a user gesture.
+        resolve(!chrome.runtime.lastError && granted === true);
+      });
+    } catch (_e) {
+      resolve(false);
+    }
+  });
+}
+
+function addStatus(text, isError) {
+  const node = document.getElementById('addFeedStatus');
+  node.textContent = text || '';
+  node.classList.toggle('error', Boolean(isError));
+}
+
+function readFileText(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ''));
+    fr.onerror = () => reject(new Error('unreadable file'));
+    fr.readAsText(file);
+  });
+}
+
+function currentFeedKind() {
+  const picked = document.querySelector('input[name="feedKind"]:checked');
+  return picked && picked.value === 'file' ? 'file' : 'url';
+}
+
+function reportAddFailure(err) {
+  const info = explainError(err);
+  addStatus(info.title + ' — ' + info.body, true);
+}
+
+async function addUrlFeed(name, role) {
+  const raw = document.getElementById('feedUrl').value.trim();
+  const pattern = originPatternFor(raw);
+  if (!pattern) {
+    addStatus('That is not a usable calendar link — it has to start with https:// or webcal://.', true);
+    return false;
+  }
+  // Runs inside the click's user gesture: nothing may be awaited before it.
+  if (!(await requestOrigin(pattern))) {
+    addStatus('Chrome needs permission to read ' + pattern + ' before this feed can be added.', true);
+    return false;
+  }
+  addStatus('Checking the link…');
+  const resp = await send({ type: 'addFeedUrl', url: raw, name, role });
+  if (!resp.ok) { reportAddFailure(resp.error); return false; }
+  document.getElementById('feedUrl').value = '';
+  return true;
+}
+
+async function addFileFeed(name, role) {
+  const file = document.getElementById('feedFile').files[0];
+  if (!file) { addStatus('Choose an .ics file first.', true); return false; }
+  addStatus('Reading the file…');
+  let content;
+  try {
+    content = await readFileText(file);
+  } catch (_e) {
+    addStatus('Could not read that file.', true);
+    return false;
+  }
+  const resp = await send({ type: 'addFeedFile', content, name, role });
+  if (!resp.ok) { reportAddFailure(resp.error); return false; }
+  document.getElementById('feedFile').value = '';
+  return true;
+}
+
+// The feed is fetched and parsed BEFORE it is stored, so a bad link fails here —
+// while the user is still looking at the field they pasted into — rather than
+// silently at the next refresh, when the board would just look empty.
+async function addFeed() {
+  const name = document.getElementById('feedName').value.trim();
+  const role = document.getElementById('feedRole').value;
+  addStatus('');
+  const ok = currentFeedKind() === 'url'
+    ? await addUrlFeed(name, role)
+    : await addFileFeed(name, role);
+  if (!ok) return;
+  document.getElementById('feedName').value = '';
+  addStatus('Feed added.');
+  await loadCalendars(false);
+}
+
+async function removeFeed(cal) {
+  // Removing also deletes this feed's block list, notes, labels and rest hours —
+  // say so, because none of it can be recovered.
+  const sure = window.confirm('Remove “' + calDisplayName(cal)
+    + '”?\n\nIts block list, notes and rest hours are deleted too.');
+  if (!sure) return;
+  const resp = await send({ type: 'removeFeed', feedId: cal.id });
+  if (!resp.ok) {
+    setStatus('status', 'Could not remove that feed: ' + resp.error, true);
+    return;
+  }
+  state.titles.delete(cal.id);
+  await loadCalendars(false);
+}
+
+function wireAddFeed() {
+  const kinds = document.getElementById('feedKinds');
+  kinds.addEventListener('change', () => {
+    const kind = currentFeedKind();
+    document.getElementById('feedUrlWrap').hidden = kind !== 'url';
+    document.getElementById('feedFileWrap').hidden = kind !== 'file';
+    for (const pill of kinds.querySelectorAll('.role-pill')) {
+      pill.classList.toggle('sel', pill.querySelector('input').checked);
+    }
+    addStatus('');
+  });
+  document.getElementById('addFeed').addEventListener('click', () => {
+    addFeed().catch((e) => addStatus('Could not add that feed: ' + (e && e.message ? e.message : e), true));
   });
 }
 
 function init() {
-  document.getElementById('commitmentLabel').addEventListener('input', paintChip);
-  document.getElementById('commitmentLabel').addEventListener('change', saveCommitmentLabel);
   document.getElementById('savePattern').addEventListener('click', savePattern);
   document.getElementById('loadRetry').addEventListener('click', () => loadCalendars(true));
+  wireAddFeed();
   loadLocalFields();
   loadCalendars(false);
 }

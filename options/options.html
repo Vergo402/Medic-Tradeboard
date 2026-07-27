@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Choose your calendars</title>
+  <title>Your calendar feeds</title>
   <style>
     :root {
       --ink: #16191d;
@@ -137,11 +137,23 @@
 
     /* one title row: header line (title + meta + segmented control), then an
        optional "show as" line revealed when the row is Block or Note */
-    .title-row { padding: 7px 8px; border-radius: 5px; }
+    .title-row { padding: 7px 8px; border-radius: 5px; border-left: 3px solid transparent; }
     .title-row:hover { background: var(--bg-soft); }
     .title-main { display: flex; align-items: center; gap: 10px; }
     .title-main .t { flex: 1; word-break: break-word; font-size: 14px; }
     .title-main .meta { color: var(--ink-soft); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+    /* Never-reviewed title: a quiet left accent + faint tint (not a saturated
+       fill — the row still has to be easy to read), plus a small blue badge
+       next to the title text. Sorts in place within its Recurring/One-time
+       group; this is a highlight, not a third group. */
+    .title-row.new { border-left-color: var(--accent); background: #f2f8fe; }
+    .title-row.new:hover { background: #e8f2fc; }
+    .new-badge {
+      flex: none; background: var(--accent); color: #fff; font-size: 10.5px;
+      font-weight: 700; letter-spacing: .03em; border-radius: 3px; padding: 1px 5px;
+      line-height: 1.5;
+    }
 
     /* Block / Note / Ignore segmented control */
     .seg { display: inline-flex; flex: none; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
@@ -193,12 +205,6 @@
       font-size: 13.5px; color: var(--ink-soft);
     }
     .totals strong { color: var(--ink); }
-    .freebusy {
-      background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px;
-      padding: 10px 12px; font-size: 13.5px;
-    }
-    .freebusy .acts { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
-
     /* ---- inputs / buttons -------------------------------------------- */
     input[type="text"], input[type="search"] {
       width: 100%; padding: 8px 10px; border: 1px solid #ccd2d9; border-radius: 5px;
@@ -237,60 +243,121 @@
     details.advanced .row { margin-bottom: 10px; }
     #status { margin-top: 12px; font-size: 13.5px; color: #0a7d33; min-height: 20px; }
     #status.error { color: var(--danger); }
+
+    /* ---- feed rows --------------------------------------------------- */
+    .cal-sync { font-size: 12.5px; color: var(--ink-soft); white-space: nowrap; }
+    .cal-sync.fresh { color: #3B6D11; }
+    .feed-remove {
+      border: 1px solid var(--line); background: #fff; border-radius: 6px;
+      padding: 3px 9px; font-size: 13px; color: var(--ink-soft); cursor: pointer; line-height: 1.3;
+    }
+    .feed-remove:hover { border-color: var(--danger-line); color: var(--danger); background: var(--danger-bg); }
+
+    /* Events the parser had to skip: never silent. */
+    .cal-warn {
+      margin-top: 10px; border: 1px solid #f0d9a0; border-left: 4px solid #BA7517;
+      background: #fff8e6; padding: 9px 11px;
+    }
+    .cal-warn-head { color: #854F0B; font-weight: 600; font-size: 13.5px; }
+    .cal-warn-body { color: #633806; font-size: 13px; margin-top: 3px; word-break: break-word; }
+
+    /* ---- add a feed --------------------------------------------------- */
+    .add-feed {
+      border: 1px solid var(--line); border-radius: 8px; background: var(--bg-soft);
+      padding: 13px 14px; margin-bottom: 16px;
+    }
+    .add-feed h2 { margin-bottom: 9px; }
+    .add-kinds { display: flex; gap: 8px; margin-bottom: 11px; }
+    .add-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .add-row input[type="text"] { flex: 1; min-width: 150px; }
+    .add-feed input[type="text"], .add-feed select {
+      border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+      font-size: 13.5px; background: #fff; color: var(--ink); font-family: inherit;
+    }
+    #feedUrl { width: 100%; margin-bottom: 6px; }
+    .add-hint { color: var(--ink-soft); font-size: 12.5px; margin: 0 0 11px; }
+    #addFeedStatus { font-size: 13px; margin-top: 9px; min-height: 18px; }
+    #addFeedStatus.error { color: var(--danger); font-weight: 600; }
   </style>
 </head>
 <body>
-  <h1>Choose your calendars</h1>
-  <p class="subtitle">Nothing is read until you turn it on.</p>
+  <h1>Your calendar feeds</h1>
+  <p class="subtitle">Subscribe a read-only calendar link. No sign-in, and nothing is ever written back.</p>
 
-  <!-- Loud state 1: we could not even list the calendars (auth / network). This
-       must never be mistaken for "you have no blocking calendars". -->
+  <!-- Loud state 1: we could not read the feeds at all. This must never be
+       mistaken for "you have no blocking feeds". -->
   <div class="banner" id="loadBanner" hidden>
-    <h2 id="loadBannerTitle">Can&rsquo;t read your calendar list</h2>
+    <h2 id="loadBannerTitle">Can&rsquo;t read your feeds</h2>
     <div class="banner-sub" id="loadBannerSub"></div>
     <p id="loadBannerBody"></p>
-    <button id="loadRetry" type="button">Connect Google Calendar</button>
+    <button id="loadRetry" type="button">Try again</button>
   </div>
 
-  <!-- Loud state 2: signed in, but nothing on this page blocks anything.
-       The heading must be true in BOTH states this covers: no calendar switched
-       on at all, AND several switched on but every one of them "Notes only".
-       "No calendars selected" was false in the second case. -->
+  <!-- Loud state 2: feeds loaded, but nothing on this page blocks anything.
+       The heading must be true in BOTH states this covers: no feed switched on
+       at all, AND several switched on but every one of them "Notes only". -->
   <div class="banner" id="noBlockBanner" hidden>
-    <h2>No calendar is blocking shifts</h2>
+    <h2>No feed is blocking shifts</h2>
     <div class="banner-sub">Nothing is blocking shifts right now</div>
     <p>
       Every open shift will show as available &mdash; including ones that overlap
-      something already on your calendar. Turn a calendar on and set it to
+      something already on your calendar. Add a feed and set it to
       &ldquo;All of it blocks&rdquo; or &ldquo;Only some events&rdquo; so real
       commitments knock a shift out.
     </p>
   </div>
 
   <p class="note" id="privacyNote">
-    These are the calendar names on your account. Their contents are not read
-    unless you switch one on.
+    No feeds yet. Feed links are stored on this computer only and are never synced.
   </p>
+
+  <div class="add-feed">
+    <h2>Add a feed</h2>
+    <div class="add-kinds" id="feedKinds">
+      <label class="role-pill sel"><input type="radio" name="feedKind" value="url" checked><span>Paste a link</span></label>
+      <label class="role-pill"><input type="radio" name="feedKind" value="file"><span>Upload an .ics file</span></label>
+    </div>
+
+    <div id="feedUrlWrap">
+      <input type="text" id="feedUrl" placeholder="https://calendar.google.com/calendar/ical/&hellip;/basic.ics">
+      <p class="add-hint">
+        Google: Settings &rsaquo; your calendar &rsaquo; <b>Secret address in iCal format</b>.
+        Apple: Share calendar &rsaquo; Public calendar. Or any <code>.ics</code> or
+        <code>webcal://</code> link.
+      </p>
+      <p class="add-hint">
+        Chrome will ask to &ldquo;read and change&rdquo; the site. That&rsquo;s Chrome&rsquo;s
+        wording for any site access; this extension only reads your feed, and never
+        writes to it.
+      </p>
+    </div>
+
+    <div id="feedFileWrap" hidden>
+      <input type="file" id="feedFile" accept=".ics,text/calendar">
+      <p class="add-hint">
+        A file is a snapshot &mdash; it never updates on its own, so re-upload it when
+        your schedule changes. Use this when your provider has no shareable link.
+      </p>
+    </div>
+
+    <div class="add-row">
+      <input type="text" id="feedName" placeholder="Name it (e.g. Crew Schedule)">
+      <select id="feedRole">
+        <option value="REJECT">All of it blocks</option>
+        <option value="RULE">Only some events</option>
+        <option value="FLAG">Notes only</option>
+      </select>
+      <button id="addFeed" type="button">Add feed</button>
+    </div>
+    <div id="addFeedStatus" role="status" aria-live="polite"></div>
+  </div>
 
   <div id="calList"></div>
 
   <div class="section">
-    <label class="field" for="commitmentLabel">Commitment label (shown on rejected shifts)</label>
-    <input type="text" id="commitmentLabel" value="Commitment" placeholder="e.g. Fire Dept">
-    <p class="field-hint">
-      The word for &ldquo;I am already committed&rdquo; &mdash; your department,
-      second job, whatever.
-    </p>
-
-    <div class="preview">
-      <div class="preview-cap">Preview</div>
-      <div class="shift-line">
-        <span class="when">Sat 15 &middot; 07:00&ndash;19:00</span>
-        <span class="who">Medic &middot; Unit 2</span>
-        <span class="chip" id="chipPreview">&#10005; Commitment</span>
-      </div>
-    </div>
-
+    <!-- The word shown on a rejected shift is set PER FEED, on the feed's own
+         card, so two feeds can say two different things. There is deliberately
+         no global one here any more. -->
     <div id="status" role="status" aria-live="polite"></div>
 
     <details class="advanced" id="advanced">

@@ -170,7 +170,7 @@ export function evaluate(rec, commitments, myShifts = [], softEvents = []) {
       rejectKind: "commitment",
       // The overlapping commitment's per-event "show as" label, or "" when it
       // carries none. The display layer (rowshape.rejectChipLabel) uses this to
-      // label the reject chip, falling back to the user's global commitmentLabel
+      // label the reject chip, falling back to DEFAULT_COMMITMENT_LABEL
       // when it is empty. This module stays user-agnostic: the string it emits
       // is the user's OWN calendar label, never an employer default baked in.
       rejectLabel: c.label,

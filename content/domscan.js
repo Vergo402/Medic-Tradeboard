@@ -65,7 +65,7 @@
 
   /**
    * @param {{strategy?: "dom"|"refetch"|"diag", host: string, dll: string, sid: string}} opts
-   * @returns {Promise<{records: object[], year: number, month: number, monthName: string, source: "dom"|"refetch"}|{error: "no_month_header"}>}
+   * @returns {Promise<{records: object[], anchors: number, year: number, month: number, monthName: string, source: "dom"|"refetch"}|{error: "no_month_header"}>}
    */
   async function scanVisibleMonth({ strategy, host, dll, sid } = {}) {
     const mode = strategy || "dom"; // storage default per the module contract (boot.js must match)
@@ -76,9 +76,13 @@
     if (!monthName) return { error: "no_month_header" };
     const month = MONTH_NAMES.indexOf(monthName) + 1;
 
+    // `anchors` rides along with `records` from the SAME parse so boot.js can
+    // run core/parse.js's driftCheck against the very HTML that produced the
+    // records (a second, independent DOM parse could pair refetch records with
+    // DOM anchors and fire a false drift).
     async function domResult() {
-      const { records } = parseMonth(document.body.innerHTML, year, month);
-      return { records, year, month, monthName, source: "dom" };
+      const { records, anchors } = parseMonth(document.body.innerHTML, year, month);
+      return { records, anchors, year, month, monthName, source: "dom" };
     }
 
     async function refetchResult() {
@@ -88,8 +92,8 @@
       const url = `${host}${dll}empmonthtradeboard?SID=${sid}`;
       const res = await fetch(url, { credentials: "include" });
       const html = await res.text();
-      const { records } = parseMonth(html, year, month);
-      return { records, year, month, monthName, source: "refetch" };
+      const { records, anchors } = parseMonth(html, year, month);
+      return { records, anchors, year, month, monthName, source: "refetch" };
     }
 
     if (mode === "dom") return domResult();

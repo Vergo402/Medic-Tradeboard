@@ -1,7 +1,7 @@
 # Medic Tradeboard
 
 A Chrome extension that overlays a WhenToWork monthly tradeboard and scores
-every posted shift against your own Google Calendar — so you can see, at a
+every posted shift against calendar feeds you subscribe — so you can see, at a
 glance, which open shifts you could actually take and which ones conflict
 with something you're already committed to.
 
@@ -10,7 +10,8 @@ It is **read-only** in both directions:
 - Toward WhenToWork: it only reads the tradeboard page you're already logged
   into. It has no login code of its own and never picks up, requests, or
   accepts a shift for you — you still do that in W2W yourself.
-- Toward Google: it requests the `calendar.readonly` scope and only ever
+- Toward your calendars: there is no sign-in at all. It reads only the
+  read-only `.ics` feeds you paste in (or files you upload) and only ever
   issues `GET` requests. It never creates, edits, or deletes a calendar event.
 
 See [`PRIVACY.md`](PRIVACY.md) for the full data-handling policy.
@@ -20,7 +21,7 @@ See [`PRIVACY.md`](PRIVACY.md) for the full data-handling policy.
 On a supported tradeboard page, the extension:
 
 1. Reads the posted shifts directly from the page DOM.
-2. Fetches your connected Google Calendar(s) (cached locally, refreshed
+2. Fetches the calendar feeds you added (cached locally, refreshed
    periodically).
 3. Scores each open shift: does it overlap something you're already
    committed to? Is it too close to another commitment to leave a realistic
@@ -36,13 +37,13 @@ Shifts are classified Day when their start time falls in `[07:00, 19:00)` and
 Night otherwise; that split drives the drawer's pills, filters, and the
 compose tool.
 
-Nothing here is specific to one person's schedule. Every user signs in with
-their own Google account and points the extension at their own calendars.
+Nothing here is specific to one person's schedule. Every user adds their own
+feeds and decides what each one means.
 
 ## How calendar roles work
 
-You decide what each of your calendars means to the scorer. Conceptually,
-every calendar you connect plays one of four roles:
+You decide what each of your feeds means to the scorer. Conceptually,
+every feed you add plays one of four roles:
 
 | Role | Effect |
 |------|--------|
@@ -70,50 +71,41 @@ There is no Chrome Web Store listing yet. To run it locally:
 2. Go to `chrome://extensions`, enable **Developer mode**.
 3. **Load unpacked** → select the repository's root directory (the one with
    `manifest.json` in it).
-4. Note the extension ID Chrome assigns. Because `manifest.json` pins a
-   signing key (`key.pub.txt`), this ID is deterministic — the same for
-   everyone who loads this exact code — and you'll need it for the OAuth
-   setup below.
+4. Open the extension's **Options** page and add a feed.
 
-## Connect a Google Calendar
+## Add a calendar feed
 
-Calendar access uses OAuth, not a bundled secret, so it needs a one-time setup
-per deployment:
+No sign-in, no OAuth, no Google Cloud project — you paste a read-only calendar
+link. Open the extension's **Options** page and either:
 
-- **Once published to the Chrome Web Store**, the extension will ship with a
-  verified OAuth client ID and this step goes away — you'll just click
-  **Connect calendar** in the drawer and approve the consent screen.
-- **Running from source today**, `manifest.json`'s `oauth2.client_id` is a
-  placeholder (see the `TODO` in that file) and calendar access won't work
-  until you supply your own:
-  1. In [Google Cloud Console](https://console.cloud.google.com), create or
-     select a project, then enable the **Google Calendar API**.
-  2. Under **APIs & Services → OAuth consent screen**, configure an External
-     app in Testing mode, add the `calendar.readonly` scope, and add your own
-     Google account as a test user.
-  3. Under **Credentials**, create an OAuth client of type **Chrome
-     Extension**, using the extension ID from the install step above as the
-     Application ID.
-  4. Paste the resulting client ID into `manifest.json`'s `oauth2.client_id`,
-     reload the extension, then click **Connect calendar** in the drawer and
-     approve the consent screen once.
+- **Paste a link.** In Google Calendar: Settings › the calendar › **Secret
+  address in iCal format**. In Apple Calendar: share the calendar as public and
+  copy its `webcal://` link. Any other `.ics` URL works too. Chrome will ask you
+  to grant access to that one site.
+- **Upload an `.ics` file.** No site permission and no network — useful when a
+  provider gives you an export but no link. It is a snapshot, so re-upload it
+  when your schedule changes.
 
-Once connected, open the extension's **Options** page to tune which calendar
-events count as commitments vs. soft flags (see "How calendar roles work"
-above).
+Name the feed, choose what it means (see "How calendar roles work" above), and
+add it. The feed is fetched and parsed immediately, so a bad link fails right
+there rather than silently leaving the board unscored.
+
+> Treat a subscription link like a password: anyone holding it can read that
+> calendar. It is stored on this machine only, never synced, and never shown
+> again — see [`PRIVACY.md`](PRIVACY.md), including how to revoke one.
 
 ## Layout
 
     core/       pure scoring/parsing logic — no DOM, no chrome.* — unit tested
     content/    content scripts injected into the tradeboard page
     ui/         the drawer (shadow DOM) + its stylesheet
-    sw.js       service worker — owns all Google OAuth and calendar fetching
+    sw.js       service worker — owns feed fetching and .ics parsing
     options/    the extension's settings page
     test/       node:test suites + an offline drawer harness
 
-Only `sw.js` touches `chrome.identity` or the Google Calendar API. The drawer
-receives everything through a plain `state` object and never reads
-`chrome.storage` directly.
+Only `sw.js` fetches a feed; `core/ics.js` is the pure parser it hands the
+bytes to. The drawer receives everything through a plain `state` object and
+never reads `chrome.storage` directly.
 
 ## Tests
 

@@ -5,18 +5,22 @@ import {
   buildTriplet,
   ruleMatches,
   defaultRole,
-  resolveRoles,
+  resolveFeedRoles,
+  normalizeFeedUrl,
+  redactFeedUrl,
   bucketEvents,
   resolveIncludeRegex,
   parseExcludes,
   titleStem,
   titlesToMatcher,
   summarizeTitles,
+  newTitlesForFeed,
   calendarRule,
   titleSampleWindow,
   normalizeTitleWhitespace,
   resolvePatternOptIn,
 } from "../sw.js";
+import { rejectChipLabel } from "../core/rowshape.js";
 
 // Every fixture in this file is synthetic. This repo is public and its git
 // history is permanent: no real calendar id, calendar name, event title, or
@@ -288,11 +292,11 @@ test("bucketEvents three-way: blocks STILL match by stem (unchanged, safety-crit
 // Inverted deliberately (was FLAG): the primary calendar is the most sensitive
 // one an account holds, and reading it was never something the user consented
 // to. Nothing is read until it is explicitly turned on.
-test("defaultRole: even the account's own primary calendar defaults to OFF", () => {
+test("defaultRole: a feed the user has not spoken about defaults to OFF", () => {
   assert.equal(defaultRole({ id: "p", summary: "user@example.com", primary: true }), "OFF");
 });
 
-test("defaultRole: every non-primary calendar defaults to OFF", () => {
+test("defaultRole: every feed defaults to OFF", () => {
   assert.equal(defaultRole({ id: "a", summary: "Shared Household" }), "OFF");
   assert.equal(defaultRole({ id: "b", summary: "Holidays in United States" }), "OFF");
   assert.equal(defaultRole({ id: "c", summary: "Crew Schedule" }), "OFF");
@@ -352,104 +356,141 @@ test("defaultRole: NO input ever defaults to anything but OFF", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveRoles
+// resolveFeedRoles — the stored feed list resolved against calRoles
 // ---------------------------------------------------------------------------
 
-test("resolveRoles: a stored role overrides the default", () => {
-  const items = [{ id: "a", summary: "Crew Schedule" }];
-  assert.equal(resolveRoles(items, { a: "REJECT" })[0].role, "REJECT");
-  assert.equal(resolveRoles(items, { a: "RULE" })[0].role, "RULE");
+// A synthetic feed. `url` is a made-up example.com address, never a real one.
+function feed(over) {
+  return Object.assign(
+    { id: "f1", kind: "url", url: "https://example.com/a.ics", name: "Crew Schedule" },
+    over || {}
+  );
+}
+
+test("resolveFeedRoles: a stored role overrides the default", () => {
+  assert.equal(resolveFeedRoles([feed()], { f1: "REJECT" })[0].role, "REJECT");
 });
 
-test("resolveRoles: a stored role can turn the primary calendar off", () => {
-  const items = [{ id: "p", summary: "user@example.com", primary: true }];
-  assert.equal(resolveRoles(items, { p: "OFF" })[0].role, "OFF");
+test("resolveFeedRoles: an unrecognised stored value falls back to OFF", () => {
+  assert.equal(resolveFeedRoles([feed()], { f1: "NONSENSE" })[0].role, "OFF");
 });
 
-test("resolveRoles: an unrecognised stored value falls back to the default", () => {
-  const items = [{ id: "p", summary: "user@example.com", primary: true }];
-  assert.equal(resolveRoles(items, { p: "BOGUS" })[0].role, "OFF");
-  assert.equal(resolveRoles(items, { p: null })[0].role, "OFF");
-  assert.equal(resolveRoles(items, { p: "reject" })[0].role, "OFF"); // case-sensitive
-});
-
-test("resolveRoles: an entry for a calendar that is no longer listed is ignored", () => {
-  const out = resolveRoles([{ id: "a", summary: "Crew Schedule" }], { gone: "REJECT" });
+test("resolveFeedRoles: a role for a feed that no longer exists is ignored", () => {
+  const out = resolveFeedRoles([feed()], { gone: "REJECT" });
   assert.equal(out.length, 1);
   assert.equal(out[0].role, "OFF");
 });
 
-test("resolveRoles: undefined or empty storedRoles is safe", () => {
-  const items = [{ id: "a", summary: "Crew Schedule" }];
-  assert.equal(resolveRoles(items, undefined)[0].role, "OFF");
-  assert.equal(resolveRoles(items, {})[0].role, "OFF");
-  assert.deepEqual(resolveRoles(undefined, {}), []);
-  assert.deepEqual(resolveRoles(null, undefined), []);
+test("resolveFeedRoles: undefined or empty roles is safe", () => {
+  assert.equal(resolveFeedRoles([feed()], undefined)[0].role, "OFF");
+  assert.equal(resolveFeedRoles([feed()], {})[0].role, "OFF");
 });
 
-// First run for a brand-new user: sign in, configure nothing. NOTHING is
-// enabled — not one calendar is fetched until the user turns it on.
-test("resolveRoles: an unconfigured user gets OFF on every calendar, primary included", () => {
-  const items = [
-    { id: "p", summary: "user@example.com", primary: true },
-    { id: "a", summary: "Shared Household" },
-    { id: "b", summary: "Holidays in United States" },
-    { id: "c", summary: "Crew Schedule" },
-  ];
-  const out = resolveRoles(items, {});
-  assert.deepEqual(
-    out.map((c) => c.role),
-    ["OFF", "OFF", "OFF", "OFF"]
-  );
-  assert.equal(out.filter((c) => c.role !== "OFF").length, 0);
+test("resolveFeedRoles: an unconfigured user gets OFF on every feed", () => {
+  const out = resolveFeedRoles([feed(), feed({ id: "f2", name: "Family" })], {});
+  assert.deepEqual(out.map((f) => f.role), ["OFF", "OFF"]);
 });
 
-test("resolveRoles: primary sorts first, then case-insensitive alpha by summary", () => {
-  const items = [
-    { id: "c", summary: "zebra" },
-    { id: "a", summary: "Apple" },
-    { id: "p", summary: "user@example.com", primary: true },
-    { id: "b", summary: "banana" },
-  ];
-  assert.deepEqual(
-    resolveRoles(items, {}).map((c) => c.id),
-    ["p", "a", "b", "c"]
-  );
+test("resolveFeedRoles: malformed input yields an empty list, never a crash", () => {
+  assert.deepEqual(resolveFeedRoles(undefined, {}), []);
+  assert.deepEqual(resolveFeedRoles(null, {}), []);
+  assert.deepEqual(resolveFeedRoles("nope", {}), []);
+  // An entry with no usable id could not be keyed to a role or a block list, so
+  // it is dropped rather than rendered as a row whose controls do nothing.
+  assert.deepEqual(resolveFeedRoles([null, 5, {}, { id: "" }], {}), []);
 });
 
-test("resolveRoles: prefix is empty for primary and the summary for everyone else", () => {
-  const items = [
-    { id: "p", summary: "user@example.com", primary: true },
-    { id: "k", summary: "Shared Household" },
-  ];
-  const byId = Object.fromEntries(resolveRoles(items, {}).map((c) => [c.id, c]));
-  assert.equal(byId.p.prefix, "");
-  assert.equal(byId.k.prefix, "Shared Household");
+test("resolveFeedRoles: sorted case-insensitively by display name", () => {
+  const out = resolveFeedRoles([feed({ id: "b", name: "zulu" }), feed({ id: "a", name: "Alpha" })], {});
+  assert.deepEqual(out.map((f) => f.name), ["Alpha", "zulu"]);
 });
 
-test("resolveRoles: a missing summary becomes an empty string, not undefined", () => {
-  const out = resolveRoles([{ id: "a" }], {});
-  assert.equal(out[0].summary, "");
-  assert.equal(out[0].prefix, "");
+test("resolveFeedRoles: the user's name wins, then X-WR-CALNAME, then a placeholder", () => {
+  assert.equal(resolveFeedRoles([feed({ name: "My Name", calName: "Theirs" })], {})[0].name, "My Name");
+  assert.equal(resolveFeedRoles([feed({ name: "", calName: "Theirs" })], {})[0].name, "Theirs");
+  assert.equal(resolveFeedRoles([feed({ name: "", calName: "" })], {})[0].name, "Untitled feed");
 });
 
-test("resolveRoles: primary is a boolean, normalised from a missing field", () => {
-  const out = resolveRoles([{ id: "a", summary: "Crew Schedule" }], {});
-  assert.equal(out[0].primary, false);
+// The URL is a capability secret. It must never become the thing on screen just
+// because the user did not type a name.
+test("resolveFeedRoles: the display name is NEVER the feed URL", () => {
+  const out = resolveFeedRoles([feed({ name: "", calName: "" })], {})[0];
+  assert.equal(out.name.includes("example.com"), false);
+  assert.equal(out.prefix.includes("example.com"), false);
 });
 
-// resolveRoles feeds bucketEvents directly, so its prefix must be the one that
-// keeps a primary event unprefixed end to end.
-test("resolveRoles + bucketEvents: primary events stay unprefixed", () => {
-  // Primary now defaults to OFF, so the user has to have turned it on for this
-  // path to exist at all.
-  const cal = resolveRoles([{ id: "p", summary: "user@example.com", primary: true }], {
-    p: "FLAG",
-  })[0];
-  const out = bucketEvents([timed("Dentist")], cal.role, RULE, cal.prefix);
-  assert.equal(out.soft[0][2], "Dentist");
+test("resolveFeedRoles: prefix is the display name, so a note says which feed it came from", () => {
+  const f = resolveFeedRoles([feed({ name: "Family" })], { f1: "FLAG" })[0];
+  const out = bucketEvents([timed("Dentist")], f.role, RULE, f.prefix);
+  assert.equal(out.soft[0][2], "Family · Dentist");
 });
 
+test("resolveFeedRoles: kind is normalised, defaulting to url", () => {
+  assert.equal(resolveFeedRoles([feed({ kind: "file" })], {})[0].kind, "file");
+  assert.equal(resolveFeedRoles([feed({ kind: "bogus" })], {})[0].kind, "url");
+});
+
+test("resolveFeedRoles: hasContent reports whether a file feed actually has bytes", () => {
+  const withText = feed({ kind: "file", content: "BEGIN:VCALENDAR" });
+  assert.equal(resolveFeedRoles([withText], {})[0].hasContent, true);
+  assert.equal(resolveFeedRoles([feed({ kind: "file", content: "   " })], {})[0].hasContent, false);
+  assert.equal(resolveFeedRoles([feed({ kind: "file" })], {})[0].hasContent, false);
+});
+
+test("resolveFeedRoles + bucketEvents: a REJECT feed still produces commitments", () => {
+  const f = resolveFeedRoles([feed()], { f1: "REJECT" })[0];
+  const out = bucketEvents([timed("Night Tour")], f.role, () => false, f.prefix);
+  assert.equal(out.commitments.length, 1);
+  // A REJECT commitment's triplet label is the per-event "show as" or "" — the
+  // reject chip uses the user's global commitment label, not the feed name.
+  assert.equal(out.commitments[0][2], "");
+});
+
+// ---------------------------------------------------------------------------
+// normalizeFeedUrl / redactFeedUrl — a subscription URL IS the credential
+// ---------------------------------------------------------------------------
+
+test("normalizeFeedUrl: webcal:// is rewritten to https://", () => {
+  assert.equal(normalizeFeedUrl("webcal://example.com/a.ics"), "https://example.com/a.ics");
+  assert.equal(normalizeFeedUrl("WEBCAL://example.com/a.ics"), "https://example.com/a.ics");
+});
+
+test("normalizeFeedUrl: https and http pass through, trimmed", () => {
+  assert.equal(normalizeFeedUrl("https://example.com/a.ics"), "https://example.com/a.ics");
+  assert.equal(normalizeFeedUrl("  https://example.com/a.ics  "), "https://example.com/a.ics");
+});
+
+// This value is stored config that later reaches fetch(). A scheme that is not
+// http(s) has no business there, so it is refused at the door.
+test("normalizeFeedUrl: a non-http(s) scheme is REFUSED", () => {
+  for (const bad of [
+    "javascript:alert(1)",
+    "data:text/calendar,BEGIN:VCALENDAR",
+    "file:///etc/passwd",
+    "ftp://example.com/a.ics",
+  ]) {
+    assert.equal(normalizeFeedUrl(bad), "", bad);
+  }
+});
+
+test("normalizeFeedUrl: junk and non-strings yield an empty string, never a throw", () => {
+  for (const bad of ["", "   ", "not a url", null, undefined, 42, {}]) {
+    assert.equal(normalizeFeedUrl(bad), "");
+  }
+});
+
+test("redactFeedUrl: keeps only the host — the secret token never renders", () => {
+  const secret = "https://calendar.example.com/ical/x/private-DEADBEEF/basic.ics";
+  const shown = redactFeedUrl(secret);
+  assert.equal(shown, "calendar.example.com/…");
+  assert.equal(shown.includes("DEADBEEF"), false, "the capability token must never be displayed");
+});
+
+test("redactFeedUrl: empty for no URL, and never throws on junk", () => {
+  assert.equal(redactFeedUrl(""), "");
+  assert.equal(redactFeedUrl(null), "");
+  assert.equal(redactFeedUrl("not a url"), "…");
+});
 // ---------------------------------------------------------------------------
 // ruleMatches — the user-editable RULE predicate
 // ---------------------------------------------------------------------------
@@ -946,63 +987,88 @@ test("summarizeTitles: null/undefined event list is safe", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveRoles — the widened calendarList fields
+// summarizeTitles — today-or-later declutter + recurring surfacing
 // ---------------------------------------------------------------------------
 
-test("resolveRoles: summaryOverride wins over summary for display, prefix and sort", () => {
-  const out = resolveRoles(
-    [{ id: "a", summary: "Owner's Name For It", summaryOverride: "My Squad" }],
-    {}
+// noon NY on 2026-08-15 — same clock convention as titleSampleWindow's tests.
+const TODAY_NOON = Date.parse("2026-08-15T16:00:00Z");
+
+test("summarizeTitles: a stale one-off (only past instances) is dropped entirely", () => {
+  const out = summarizeTitles(
+    [ev("Old Training", "2026-08-01T08:00:00-04:00", "2026-08-01T12:00:00-04:00")],
+    TODAY_NOON
   );
-  assert.equal(out[0].summary, "My Squad");
-  assert.equal(out[0].prefix, "My Squad");
+  assert.deepEqual(out, []);
 });
 
-test("resolveRoles: a blank summaryOverride falls back to summary", () => {
-  const out = resolveRoles([{ id: "a", summary: "Crew Schedule", summaryOverride: "  " }], {});
-  assert.equal(out[0].summary, "Crew Schedule");
-});
-
-test("resolveRoles: accessRole is carried through, defaulting to an empty string", () => {
-  const out = resolveRoles(
+test("summarizeTitles: a title with today-or-later AND past instances survives, count includes both", () => {
+  const out = summarizeTitles(
     [
-      { id: "a", summary: "Busy Only", accessRole: "freeBusyReader" },
-      { id: "b", summary: "No Field" },
+      ev("Desk", "2026-08-01T08:00:00-04:00", "2026-08-01T20:00:00-04:00"), // past
+      ev("Desk", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00"), // future
     ],
-    {}
+    TODAY_NOON
   );
-  assert.equal(out[0].accessRole, "freeBusyReader");
-  assert.equal(out[1].accessRole, "");
+  assert.equal(out.length, 1);
+  assert.equal(out[0].count, 2, "count reflects every instance once the title qualifies, not just future ones");
 });
 
-test("resolveRoles: selected is normalised to a boolean", () => {
-  const out = resolveRoles([{ id: "a", summary: "X", selected: true }, { id: "b", summary: "Y" }], {});
-  assert.equal(out[0].selected, true);
-  assert.equal(out[1].selected, false);
+test("summarizeTitles: an instance dated exactly today keeps the title", () => {
+  const out = summarizeTitles(
+    [ev("Desk", "2026-08-15T08:00:00-04:00", "2026-08-15T20:00:00-04:00")],
+    TODAY_NOON
+  );
+  assert.equal(out.length, 1);
 });
 
-test("resolveRoles: deleted and hidden calendars are filtered out", () => {
-  const out = resolveRoles(
-    [
-      { id: "a", summary: "Gone", deleted: true },
-      { id: "b", summary: "Hidden", hidden: true },
-      { id: "c", summary: "Kept" },
-      null,
-    ],
-    {}
-  );
-  assert.deepEqual(out.map((c) => c.id), ["c"]);
+test("summarizeTitles: recurring is true when ANY instance of the title is stamped recurring", () => {
+  const recurringEv = ev("Standing Tour", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  recurringEv.recurring = true;
+  const oneOff = ev("One-off Drill", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  oneOff.recurring = false;
+  const out = summarizeTitles([recurringEv, oneOff], TODAY_NOON);
+  assert.equal(out.find((t) => t.title === "Standing Tour").recurring, true);
+  assert.equal(out.find((t) => t.title === "One-off Drill").recurring, false);
 });
 
-test("resolveRoles: sorting uses the override name, not the owner's name", () => {
-  const out = resolveRoles(
-    [
-      { id: "z", summary: "Aardvark", summaryOverride: "Zulu" },
-      { id: "a", summary: "Mango" },
-    ],
-    {}
-  );
-  assert.deepEqual(out.map((c) => c.id), ["a", "z"]);
+test("summarizeTitles: a mix of recurring and standalone instances under the same title reads recurring", () => {
+  const a = ev("Desk", "2026-08-20T08:00:00-04:00", "2026-08-20T20:00:00-04:00");
+  a.recurring = false;
+  const b = ev("Desk", "2026-08-27T08:00:00-04:00", "2026-08-27T20:00:00-04:00");
+  b.recurring = true;
+  const out = summarizeTitles([a, b], TODAY_NOON);
+  assert.equal(out[0].recurring, true);
+});
+
+// ---------------------------------------------------------------------------
+// newTitlesForFeed — the "review new titles" nudge's core filter
+// ---------------------------------------------------------------------------
+
+test("newTitlesForFeed: a genuinely new title (not seen, not blocked, not noted) is flagged", () => {
+  const fresh = newTitlesForFeed(["ACME - Desk", "New Title"], ["ACME - Desk"], [], []);
+  assert.deepEqual(fresh, ["New Title"]);
+});
+
+test("newTitlesForFeed: a title already in seenTitles is not flagged", () => {
+  const fresh = newTitlesForFeed(["Old Title"], ["Old Title"], [], []);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: a title already covered by a ticked BLOCK title (by stem) is not flagged", () => {
+  // "ACME" is ticked; "ACME - Night Tour" is a new-looking title this run, but
+  // it already blocks — the same stem logic titlesToMatcher uses for scoring.
+  const fresh = newTitlesForFeed(["ACME - Night Tour"], [], ["ACME"], []);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: a title already in the NOTE list is not flagged", () => {
+  const fresh = newTitlesForFeed(["Music Class"], [], [], ["Music Class"]);
+  assert.deepEqual(fresh, []);
+});
+
+test("newTitlesForFeed: whitespace-normalized comparison — an NBSP variant of a seen title is not re-flagged", () => {
+  const fresh = newTitlesForFeed(["ACME - Desk"], ["ACME - Desk"], [], []);
+  assert.deepEqual(fresh, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -1181,7 +1247,7 @@ test("titlesToMatcher: junk entries inside a real ticked set are discarded, not 
 // ---------------------------------------------------------------------------
 // normalizeTitleWhitespace + non-ASCII whitespace in titles
 //
-// iCal/Outlook feed exports routinely write the separator with a NO-BREAK SPACE.
+// Real-world feed exports routinely write the separator with a NO-BREAK SPACE.
 // Before this, such a title never stemmed — titleStem handed back the whole
 // string — so the ticked title stopped matching its own siblings and the shift
 // was offered as free while the user was on a tour. The failure was asymmetric
@@ -1294,62 +1360,6 @@ test("titlesToMatcher: a non-Latin digit after the stem is still a word char", (
   assert.equal(m("Смена, Ночь"), true); // punctuation IS a boundary
 });
 
-// ---------------------------------------------------------------------------
-// resolveRoles — a hidden calendar must not silently lose its blocking role
-//
-// "Hide from list" in Google Calendar is a DISPLAY preference, not an
-// unsubscribe. Dropping such a calendar here meant a stored REJECT stopped being
-// consulted the moment the user tidied their sidebar: it silently stopped
-// blocking AND vanished from the options page, so the failure was invisible and
-// un-fixable. (listCalendars must also send showHidden=true, or Google never
-// returns the item at all — covered in sw_handlers.test.js.)
-// ---------------------------------------------------------------------------
-
-test("resolveRoles: a hidden calendar KEEPS its stored REJECT role", () => {
-  const out = resolveRoles([{ id: "h", summary: "Crew Schedule", hidden: true }], { h: "REJECT" });
-  assert.equal(out.length, 1, "a hidden calendar with a blocking role must not disappear");
-  assert.equal(out[0].role, "REJECT");
-  assert.equal(out[0].hiddenInGoogle, true);
-});
-
-test("resolveRoles: a hidden calendar keeps a stored FLAG or RULE role too", () => {
-  for (const role of ["FLAG", "RULE"]) {
-    const out = resolveRoles([{ id: "h", summary: "Crew Schedule", hidden: true }], { h: role });
-    assert.equal(out.length, 1, role);
-    assert.equal(out[0].role, role);
-  }
-});
-
-test("resolveRoles: an unconfigured or explicitly-OFF hidden calendar is still dropped", () => {
-  const item = [{ id: "h", summary: "Crew Schedule", hidden: true }];
-  assert.deepEqual(resolveRoles(item, {}), []);
-  assert.deepEqual(resolveRoles(item, { h: "OFF" }), []);
-  assert.deepEqual(resolveRoles(item, { h: "BOGUS" }), []);
-});
-
-test("resolveRoles: a deleted calendar is dropped even when it has a REJECT role", () => {
-  const out = resolveRoles([{ id: "d", summary: "Gone", deleted: true }], { d: "REJECT" });
-  assert.deepEqual(out, []);
-});
-
-test("resolveRoles: hiddenInGoogle is false for a normal calendar", () => {
-  const out = resolveRoles([{ id: "a", summary: "Crew Schedule" }], { a: "REJECT" });
-  assert.equal(out[0].hiddenInGoogle, false);
-});
-
-// The hidden calendar's events must actually reach the commitment list — the
-// point of keeping it is that it goes on blocking.
-test("resolveRoles + bucketEvents: a hidden REJECT calendar still produces commitments", () => {
-  const cal = resolveRoles([{ id: "h", summary: "Crew Schedule", hidden: true }], {
-    h: "REJECT",
-  })[0];
-  const out = bucketEvents([timed("Night Tour")], cal.role, () => false, cal.prefix);
-  assert.equal(out.commitments.length, 1);
-  // A REJECT commitment's triplet label is the per-event "show as" or "" — the
-  // reject chip uses the user's global commitment label, not the calendar name.
-  assert.equal(out.commitments[0][2], "");
-});
-
 test("defaultRole: no input of any shape yields REJECT, FLAG or RULE", () => {
   const inputs = [
     null,
@@ -1374,4 +1384,83 @@ test("defaultRole: no input of any shape yields REJECT, FLAG or RULE", () => {
       assert.notEqual(role, bad, `input ${JSON.stringify(it)} must not be ${bad}`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-feed commitment label (feedOpts.blockLabel) — what a reject chip says
+//
+// This is the seam that makes the label PER FEED. It has to be resolved here,
+// when the commitment triplet is built, because core/score.js merges overlapping
+// commitments and keeps only the first label — after that, which feed a rejection
+// came from is no longer knowable.
+// ---------------------------------------------------------------------------
+
+test("bucketEvents: a REJECT feed's own label lands on every commitment", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+test("bucketEvents: a RULE feed's label lands on a stem-matched block", () => {
+  const out = bucketEvents([timed("Work day")], "RULE", RULE, "Crew", [], {}, { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+test("bucketEvents: a per-event 'show as' still beats the feed's label", () => {
+  const out = bucketEvents([timed("Work day")], "RULE", RULE, "Crew", [], { "Work day": "Drill" },
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Drill", "the more specific override must win");
+});
+
+test("bucketEvents: no feed label leaves the triplet blank so the chip defaults", () => {
+  for (const opts of [undefined, {}, { blockLabel: "" }, { blockLabel: "   " }, { blockLabel: 42 }]) {
+    const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined, opts);
+    assert.equal(out.commitments[0][2], "", JSON.stringify(opts));
+  }
+});
+
+test("bucketEvents: the feed label is trimmed", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "  Fire Dept  " });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+});
+
+// The note prefix and the chip word are different things. Mixing them would put
+// a middot into a chip that is only ever meant to hold one short word.
+test("bucketEvents: the feed label is NEVER prefixed like a note", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew Schedule", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(out.commitments[0][2], "Fire Dept");
+  assert.equal(out.commitments[0][2].includes("·"), false);
+});
+
+test("bucketEvents: the feed label never reaches a note row", () => {
+  const ruled = bucketEvents([timed("Dentist")], "RULE", RULE, "Family", ["Dentist"], {},
+    { blockLabel: "Fire Dept" });
+  assert.equal(ruled.soft[0][2], "Family · Dentist");
+  const flagged = bucketEvents([timed("Dentist")], "FLAG", RULE, "Family", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(flagged.soft[0][2], "Family · Dentist");
+});
+
+test("bucketEvents: a feed label coexists with rest buffers on the same triplet", () => {
+  const out = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { before: 10, after: 2, blockLabel: "Fire Dept" });
+  assert.deepEqual(out.commitments[0].slice(2), ["Fire Dept", 10, 2]);
+});
+
+// End to end across the seam: triplet[2] is what score.js hands the display layer
+// as rejectLabel, and rejectChipLabel turns it into the chip.
+test("bucketEvents + rejectChipLabel: a feed's label becomes its reject chip", () => {
+  const labelled = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew", undefined, undefined,
+    { blockLabel: "Fire Dept" });
+  assert.equal(
+    rejectChipLabel({ rejectKind: "commitment", rejectLabel: labelled.commitments[0][2] }),
+    "✕ Fire Dept"
+  );
+  const bare = bucketEvents([timed("Night Tour")], "REJECT", RULE, "Crew");
+  assert.equal(
+    rejectChipLabel({ rejectKind: "commitment", rejectLabel: bare.commitments[0][2] }),
+    "✕ Commitment"
+  );
 });

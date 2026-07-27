@@ -21,15 +21,24 @@ import assert from "node:assert/strict";
 // ---------------------------------------------------------------------------
 
 let STORE = {}; // chrome.storage.local contents
-let CAL_ITEMS = []; // what calendarList.list returns
-let EVENTS = {}; // calendarId -> events[]
+let EVENTS = {}; // feedId -> events[] (declared normalized, served as .ics)
+let FEED_BODIES = {}; // feedId -> raw .ics text, when a test wants to control it
+let URL_TO_ID = {}; // feed URL -> feedId, for the fake fetch
 let FETCH_LOG = []; // every URL the worker requested, in order
+let FEED_STATUS_QUEUE = {}; // feedId -> [{status, retryAfter?}] popped per fetch; drives retry tests
+let SLEEP_LOG = []; // ms values the worker's feedSleep was asked to wait, in order
 
 function reset() {
   STORE = {};
-  CAL_ITEMS = [];
   EVENTS = {};
+  FEED_BODIES = {};
+  URL_TO_ID = {};
   FETCH_LOG = [];
+  FEED_STATUS_QUEUE = {};
+  SLEEP_LOG = [];
+  // The fetch de-dup cache is module-scope in sw.js and would otherwise carry a
+  // recent feed body from one test into the next (they reuse feed ids/urls).
+  if (typeof sw !== "undefined" && sw._resetFeedFetchCacheForTests) sw._resetFeedFetchCacheForTests();
 }
 
 // chrome.storage.local.get accepts a string, an array of keys, or an object of
@@ -54,14 +63,11 @@ function storageGet(keys) {
 
 const listeners = [];
 
+// No chrome.identity: there is no auth anywhere in this extension any more.
 globalThis.chrome = {
   runtime: {
     lastError: undefined,
     onMessage: { addListener: (fn) => listeners.push(fn) },
-  },
-  identity: {
-    getAuthToken: (_opts, cb) => cb("synthetic-token"),
-    removeCachedAuthToken: (_opts, cb) => cb(),
   },
   storage: {
     local: {
@@ -76,27 +82,92 @@ globalThis.chrome = {
   },
 };
 
-const CAL_BASE = "https://www.googleapis.com/calendar/v3";
+const FEED_HOST = "https://feeds.example.com";
+const feedUrlFor = (id) => `${FEED_HOST}/${id}.ics`;
+
+// "2026-08-04T08:00:00-04:00" -> "20260804T120000Z" (iCalendar UTC basic form).
+function icsStamp(isoish) {
+  return new Date(isoish).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+/**
+ * Serialize the normalized fixtures these tests already declare into a real
+ * .ics body. The worker then parses them back through core/ics.js, so every
+ * handler test exercises the actual feed path end to end rather than a stub.
+ */
+function icsFrom(events) {
+  const body = (events || [])
+    .map((ev, i) => {
+      const lines = [`UID:synthetic-${i}@example.com`, `SUMMARY:${ev.summary || ""}`];
+      if (ev.status === "cancelled") lines.push("STATUS:CANCELLED");
+      if (ev.start && ev.start.date) {
+        lines.push(`DTSTART;VALUE=DATE:${ev.start.date.replace(/-/g, "")}`);
+        if (ev.end && ev.end.date) lines.push(`DTEND;VALUE=DATE:${ev.end.date.replace(/-/g, "")}`);
+      } else {
+        lines.push(`DTSTART:${icsStamp(ev.start.dateTime)}`);
+        if (ev.end && ev.end.dateTime) lines.push(`DTEND:${icsStamp(ev.end.dateTime)}`);
+      }
+      return `BEGIN:VEVENT\r\n${lines.join("\r\n")}\r\nEND:VEVENT`;
+    })
+    .join("\r\n");
+  return `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nX-WR-TIMEZONE:America/New_York\r\n${body}\r\nEND:VCALENDAR\r\n`;
+}
+
+/**
+ * Declare the user's configured feeds. Each spec is { id, name, role?, kind? };
+ * a role is written into calRoles exactly as the options page would.
+ */
+function setFeeds(specs) {
+  STORE.feeds = specs.map((s) => {
+    const base = { id: s.id, name: s.name || s.id, kind: s.kind || "url" };
+    if (base.kind === "file") base.content = s.content !== undefined ? s.content : icsFrom(EVENTS[s.id] || []);
+    else base.url = feedUrlFor(s.id);
+    URL_TO_ID[feedUrlFor(s.id)] = s.id;
+    return base;
+  });
+  const roles = STORE.calRoles || {};
+  for (const s of specs) if (s.role) roles[s.id] = s.role;
+  STORE.calRoles = roles;
+}
+
+// A minimal Headers-like stub: only .get(name) is read by the worker.
+function fakeHeaders(map) {
+  const lower = {};
+  for (const k of Object.keys(map || {})) lower[k.toLowerCase()] = String(map[k]);
+  return { get: (name) => (Object.prototype.hasOwnProperty.call(lower, String(name).toLowerCase()) ? lower[String(name).toLowerCase()] : null) };
+}
 
 globalThis.fetch = async (url) => {
   FETCH_LOG.push(url);
-  const ok = (data) => ({ ok: true, status: 200, json: async () => data });
-
-  if (url.startsWith(`${CAL_BASE}/users/me/calendarList`)) {
-    return ok({ items: CAL_ITEMS });
+  const id = URL_TO_ID[url];
+  if (!id) throw new Error("unexpected fetch: " + url);
+  // A scripted status sequence (429s, a network throw, …) takes priority, one
+  // entry per fetch, so retry behaviour can be exercised deterministically.
+  const queue = FEED_STATUS_QUEUE[id];
+  if (Array.isArray(queue) && queue.length > 0) {
+    const step = queue.shift();
+    if (step && step.throw) throw new Error(step.throw === true ? "network down" : step.throw);
+    if (step && step.status && step.status !== 200) {
+      return { ok: false, status: step.status, headers: fakeHeaders(step.headers || (step.retryAfter != null ? { "Retry-After": step.retryAfter } : {})), text: async () => "" };
+    }
+    // status 200 (or unspecified) falls through to the normal body below.
   }
-  const m = url.match(/\/calendars\/([^/]+)\/events/);
-  if (m) {
-    const calId = decodeURIComponent(m[1]);
-    return ok({ items: EVENTS[calId] || [] });
+  if (Object.prototype.hasOwnProperty.call(FEED_BODIES, id)) {
+    const body = FEED_BODIES[id];
+    if (body === null) return { ok: false, status: 404, headers: fakeHeaders({}), text: async () => "" };
+    return { ok: true, status: 200, headers: fakeHeaders({}), text: async () => body };
   }
-  throw new Error("unexpected fetch: " + url);
+  return { ok: true, status: 200, headers: fakeHeaders({}), text: async () => icsFrom(EVENTS[id] || []) };
 };
 
 // Import AFTER the globals exist — sw.js registers its listener at module load.
 const sw = await import("../sw.js");
 assert.equal(listeners.length, 1, "sw.js should register exactly one message listener");
 const onMessage = listeners[0];
+
+// Never actually sleep in tests: record the requested waits and return at once,
+// so the retry schedule is asserted without wall-clock delay.
+sw._setFeedSleepForTests((ms) => { SLEEP_LOG.push(ms); return Promise.resolve(); });
 
 /** Drive the real handler the same way chrome.runtime.sendMessage would. */
 function send(msg) {
@@ -106,8 +177,7 @@ function send(msg) {
   });
 }
 
-const eventsFetchedFor = (calId) =>
-  FETCH_LOG.filter((u) => u.includes(`/calendars/${encodeURIComponent(calId)}/events`));
+const eventsFetchedFor = (feedId) => FETCH_LOG.filter((u) => u === feedUrlFor(feedId));
 
 function timed(summary, day) {
   return {
@@ -120,84 +190,356 @@ function timed(summary, day) {
 const WINDOW = { windowStart: "2026-08-01", windowEnd: "2026-08-31" };
 
 // ---------------------------------------------------------------------------
-// #2 — a hidden calendar must not silently lose its blocking role
+// #2 — a feed that cannot be read must never look like a feed with no events
 //
-// "Hide from list" in Google Calendar is a DISPLAY preference. Google omits
-// hidden calendars from calendarList.list unless the request passes
-// showHidden=true, so without it the stored REJECT role is never consulted: the
-// calendar stops blocking, and it also vanishes from the options page, so the
-// user can neither see the failure nor undo it.
+// A feed URL that 404s, expires, or answers with a login page must not degrade
+// to "no events" — if that happened every shift on the board would render as
+// free. A blocking-capable feed fails the whole refresh loudly; only notes-only
+// feeds are allowed to degrade gracefully.
 // ---------------------------------------------------------------------------
 
-test("listCalendars: the calendarList request asks for hidden calendars", async () => {
+test("listFeeds: returns the configured feeds with their stored roles", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-a", summary: "Crew Schedule" }];
-  await send({ type: "listCalendars", interactive: false });
+  setFeeds([
+    { id: "feed-fd", name: "Crew Schedule", role: "REJECT" },
+    { id: "feed-b", name: "Household" },
+  ]);
 
-  const listUrls = FETCH_LOG.filter((u) => u.includes("/users/me/calendarList"));
-  assert.equal(listUrls.length, 1);
-  assert.ok(
-    listUrls[0].includes("showHidden=true"),
-    "without showHidden=true Google never returns a hidden calendar at all: " + listUrls[0]
-  );
-  // showDeleted stays off — a deleted calendar really is gone.
-  assert.ok(!listUrls[0].includes("showDeleted=true"), listUrls[0]);
-});
-
-test("listCalendars: a hidden calendar with a stored REJECT role is still listed", async () => {
-  reset();
-  CAL_ITEMS = [
-    { id: "cal-fd", summary: "Crew Schedule", hidden: true },
-    { id: "cal-b", summary: "Household" },
-  ];
-  STORE.calRoles = { "cal-fd": "REJECT" };
-
-  const resp = await send({ type: "listCalendars", interactive: false });
+  const resp = await send({ type: "listFeeds" });
   assert.equal(resp.ok, true);
-  const fd = resp.calendars.find((c) => c.id === "cal-fd");
-  assert.ok(fd, "a hidden calendar the user configured to block must stay visible");
-  assert.equal(fd.role, "REJECT");
-  assert.equal(fd.hiddenInGoogle, true, "the panel has to be able to label it as hidden");
+  assert.equal(resp.feeds.find((f) => f.id === "feed-fd").role, "REJECT");
+  assert.equal(resp.feeds.find((f) => f.id === "feed-b").role, "OFF");
 });
 
-test("listCalendars: a hidden calendar the user never configured stays out of the list", async () => {
+test("listFeeds: never returns the feed URL, only its host", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-x", summary: "Some Feed", hidden: true }];
-  const resp = await send({ type: "listCalendars", interactive: false });
-  assert.deepEqual(resp.calendars, []);
+  setFeeds([{ id: "feed-a", name: "Crew Schedule", role: "REJECT" }]);
+  const resp = await send({ type: "listFeeds" });
+  assert.equal(resp.feeds[0].source, "feeds.example.com/…");
+  assert.equal(
+    JSON.stringify(resp.feeds).includes("feed-a.ics"),
+    false,
+    "the feed URL must never reach the panel"
+  );
 });
 
-// The point of keeping it: it goes on blocking.
-test("getCalendarData: a hidden REJECT calendar is still fetched and still blocks", async () => {
+test("listFeeds: needs no network at all", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-fd", summary: "Crew Schedule", hidden: true }];
-  STORE.calRoles = { "cal-fd": "REJECT" };
-  EVENTS["cal-fd"] = [timed("Night Tour", "15")];
+  setFeeds([{ id: "feed-a", name: "Crew Schedule", role: "REJECT" }]);
+  await send({ type: "listFeeds" });
+  assert.deepEqual(FETCH_LOG, [], "listing configured feeds must not fetch them");
+});
+
+test("getCalendarData: a REJECT feed that fails to load FAILS the refresh, loudly", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  FEED_BODIES["feed-fd"] = null; // 404
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false, "a blocking feed that did not load must not yield a scored board");
+  assert.match(resp.error, /feed_failed/);
+  assert.match(resp.error, /Crew Schedule/, "the error has to name the feed, or it is not fixable");
+});
+
+test("getCalendarData: a feed answering with HTML is an error, never an empty calendar", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  // An expired secret link or a captive portal answers with a login page.
+  FEED_BODIES["feed-fd"] = "<html><body>Sign in to continue</body></html>";
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false);
+  assert.match(resp.error, /feed_failed/);
+});
+
+// ---------------------------------------------------------------------------
+// Rate-limit retry. A 429/503 is "slow down", not "broken": the fetch backs off
+// and retries before ever reaching the stale-cache handling. Confirmed live —
+// a real feed host answered http_429 to close-together polling, which stranded
+// the drawer on the amber banner and made Resync (another immediate fetch) a
+// no-op. sleep is stubbed to a recorder, so these assert the schedule with no
+// wall-clock wait.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Freshness window. A plain page-load refresh reuses a recent cache instead of
+// re-fetching — a subscribed calendar changes on the order of hours, and the
+// re-fetch is what invited the 429. force:true (Resync, config change) bypasses
+// it. The 10-minute bound has vast margin over a sub-second test run, so a
+// fetchedAt of Date.now() is "fresh" and Date.now()-11min is "past".
+// ---------------------------------------------------------------------------
+
+const FRESH_CACHE = () => ({
+  fetchedAt: Date.now(),
+  commitments: [["2026-08-15 08:00", "2026-08-15 18:00", "Cached"]],
+  soft: [],
+  windowStart: "2026-08-01",
+  windowEnd: "2026-08-31",
+});
+
+test("getCalendarData: an unforced refresh inside the freshness window reuses the cache, no fetch", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = FRESH_CACHE();
 
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
   assert.equal(resp.ok, true);
-  assert.equal(
-    eventsFetchedFor("cal-fd").length,
-    1,
-    "hiding a calendar in Google must not stop the extension reading it"
-  );
+  assert.equal(resp.fromCache, true, "a fresh cache is reused, not re-fetched");
+  assert.equal(resp.stale, undefined, "reusing a fresh cache is not a stale state");
+  assert.deepEqual(resp.commitments, STORE.calCache.commitments);
+  assert.equal(eventsFetchedFor("feed-fd").length, 0, "the whole point: no network on a fresh reload");
+});
+
+test("getCalendarData: an unforced refresh past the freshness window fetches fresh", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = { ...FRESH_CACHE(), fetchedAt: Date.now() - 11 * 60 * 1000 };
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(resp.fromCache, false, "a stale-enough cache must actually re-fetch");
+  assert.equal(resp.commitments.length, 1, "and the commitments come from the live fetch, not the cache");
+  assert.equal(eventsFetchedFor("feed-fd").length, 1);
+});
+
+test("getCalendarData: force:true always fetches, even inside the freshness window", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  STORE.calCache = FRESH_CACHE(); // fresh — an unforced refresh would reuse it
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(resp.fromCache, false, "Resync / config change must bypass the window");
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "force:true fetches even when a fresh cache exists");
+});
+
+test("getCalendarData: an unforced refresh with no cache fetches", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // no STORE.calCache at all
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "nothing to reuse — a cold load must fetch");
+});
+
+test("getCalendarData: an unforced refresh whose cache does NOT cover the window fetches", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Fresh in time, but its window ends before the requested one — a partial
+  // cache would leave the uncovered dates unscored, so it must not be reused.
+  STORE.calCache = { ...FRESH_CACHE(), windowEnd: "2026-08-10" };
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "a non-covering cache is not reusable, fresh or not");
+});
+
+// ---------------------------------------------------------------------------
+// Fetch de-duplication. Within FEED_FETCH_DEDUP_MS (60s) every fetch of a feed —
+// a page-load refresh, a Resync, the options picker — collapses to ONE network
+// request, so the extension can't burst a Cloudflare-fronted feed into a 429.
+// feedNow is stubbed so the 60s window is exercised without waiting.
+// ---------------------------------------------------------------------------
+
+test("listFeedTitles right after a refresh reuses the fetched feed, no second request", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "RULE" }]);
+  STORE.calBlockTitles = { "feed-fd": ["Night Tour"] };
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    // The page-load refresh fetches the feed once...
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 1);
+
+    // ...and opening the picker 3s later (the exact review-flow burst) must NOT
+    // hit the network again — it rides the 3s-old fetch.
+    clock += 3000;
+    const titles = await send({ type: "listFeedTitles", feedId: "feed-fd", ...WINDOW });
+    assert.equal(titles.ok, true);
+    assert.equal(eventsFetchedFor("feed-fd").length, 1, "the picker reused the recent fetch — no burst");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
+});
+
+test("a fetch past the de-dup window does hit the network again", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 1);
+
+    clock += 61_000; // just past the 60s window
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 2, "past the window, a fetch is a real request again");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
+});
+
+test("a failed fetch is NOT cached — the next attempt tries the network at once", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Persistent 429 on the first refresh: exhausts retries, throws, caches nothing.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }, { status: 429 }];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    const first = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(first.ok, false, "no cache, persistent 429 → hard failure");
+    const afterFirst = eventsFetchedFor("feed-fd").length;
+
+    // 1s later (well inside the window) a retry must still reach the network —
+    // a failure is never cached, or a feed could never recover without waiting.
+    clock += 1000;
+    const second = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(second.ok, true, "the queue is drained, so now it succeeds");
+    assert.ok(eventsFetchedFor("feed-fd").length > afterFirst, "the failed fetch was not cached");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
+});
+
+test("getCalendarData: a 429 then a 200 succeeds — the retry rides out a rate limit", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }]; // first attempt 429, then the normal 200 body
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true, "a transient 429 must not drop the whole refresh");
+  assert.equal(resp.stale, undefined, "a recovered refresh is fresh, not stale");
   assert.equal(resp.commitments.length, 1);
-  // A REJECT commitment's triplet label is now "" (no per-event override), so
-  // the reject chip falls back to the user's global commitment label rather than
-  // the calendar name. The calendar still BLOCKS — that is the assertion above.
+  assert.equal(eventsFetchedFor("feed-fd").length, 2, "it must actually have retried once");
+  assert.deepEqual(SLEEP_LOG, [800], "one backoff wait, the first in the schedule");
+});
+
+test("getCalendarData: a persistent 429 with no cache fails after a bounded number of retries", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  // Enough 429s to outlast every retry — the loop must give up, not spin.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }, { status: 429 }, { status: 429 }];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false, "no cache to fall back on — a persistent limit is a hard failure");
+  assert.match(resp.error, /http_429/);
+  assert.equal(eventsFetchedFor("feed-fd").length, 3, "3 attempts total: the first plus two retries");
+  assert.deepEqual(SLEEP_LOG, [800, 2500], "the fixed backoff schedule, then it stops");
+});
+
+test("getCalendarData: a 404 is NOT retried — a dead link fails fast", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  FEED_BODIES["feed-fd"] = null; // 404 on every fetch
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, false);
+  assert.match(resp.error, /http_404/);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1, "an expired link must not be retried");
+  assert.deepEqual(SLEEP_LOG, [], "no backoff for a non-retryable status");
+});
+
+test("getCalendarData: a Retry-After header overrides the default backoff", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Server asks for 2 seconds; the worker must honor it instead of its own 800ms.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429, retryAfter: 2 }];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(SLEEP_LOG, [2000], "honored the server's Retry-After, in ms");
+});
+
+test("getCalendarData: a 429 recovers into a served cache as fresh, not stale", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }]; // both retries 429, then 200 on the 3rd
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true, "two 429s then a 200 still recovers within the retry budget");
+  assert.equal(resp.stale, undefined);
+  assert.equal(eventsFetchedFor("feed-fd").length, 3);
+  assert.deepEqual(SLEEP_LOG, [800, 2500]);
+});
+
+test("getCalendarData: a FLAG feed that fails only warns — notes are cosmetic", async () => {
+  reset();
+  setFeeds([
+    { id: "feed-note", name: "Family", role: "FLAG" },
+    { id: "feed-fd", name: "Crew Schedule", role: "REJECT" },
+  ]);
+  FEED_BODIES["feed-note"] = null; // 404
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true, "losing notes must not cost the user their scoring");
+  assert.equal(resp.commitments.length, 1);
+  assert.ok(
+    resp.warnings.some((w) => w.includes("Family")),
+    "the failure still has to be visible: " + JSON.stringify(resp.warnings)
+  );
+});
+
+test("getCalendarData: a REJECT feed blocks, end to end through the real .ics path", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(eventsFetchedFor("feed-fd").length, 1);
+  assert.equal(resp.commitments.length, 1);
+  // A REJECT commitment's triplet label is "" (no per-event override), so the
+  // reject chip falls back to the user's global commitment label.
   assert.equal(resp.commitments[0][2], "");
 });
 
-test("getCalendarData: a deleted calendar is never fetched, whatever role it carries", async () => {
+test("getCalendarData: an uploaded file feed blocks without touching the network", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-gone", summary: "Gone", deleted: true }];
-  STORE.calRoles = { "cal-gone": "REJECT" };
-  EVENTS["cal-gone"] = [timed("Night Tour", "15")];
+  EVENTS["feed-up"] = [timed("Night Tour", "15")];
+  setFeeds([{ id: "feed-up", name: "Uploaded", role: "REJECT", kind: "file" }]);
 
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
   assert.equal(resp.ok, true);
-  assert.equal(eventsFetchedFor("cal-gone").length, 0);
-  assert.equal(resp.commitments.length, 0);
+  assert.equal(resp.commitments.length, 1);
+  assert.deepEqual(FETCH_LOG, [], "a file feed must never hit the network");
+});
+
+test("getCalendarData: a recurring commitment expands and blocks every occurrence", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  // Raw RRULE, as published by calendar feeds.
+  FEED_BODIES["feed-fd"] =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+    "BEGIN:VEVENT\r\nUID:r1\r\nSUMMARY:Night Tour\r\n" +
+    "DTSTART;TZID=America/New_York:20260804T080000\r\n" +
+    "DTEND;TZID=America/New_York:20260804T180000\r\n" +
+    "RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(
+    resp.commitments.map((c) => c[0]),
+    ["2026-08-04 08:00", "2026-08-11 08:00", "2026-08-18 08:00"],
+    "an unexpanded recurrence would leave two of these three tours looking free"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -206,7 +548,7 @@ test("getCalendarData: a deleted calendar is never fetched, whatever role it car
 
 test("getCalendarData: a RULE calendar with [] ticked produces ZERO commitments", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-r": "RULE" };
   STORE.calBlockTitles = { "cal-r": [] }; // the user un-ticked everything
   EVENTS["cal-r"] = [timed("Work day", "10"), timed("Work from home", "11")];
@@ -225,7 +567,7 @@ test("getCalendarData: a RULE calendar with [] ticked produces ZERO commitments"
 
 test("getCalendarData: an absent calBlockTitles entry also blocks nothing", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-r": "RULE" };
   EVENTS["cal-r"] = [timed("Work day", "10")];
 
@@ -237,7 +579,7 @@ test("getCalendarData: an absent calBlockTitles entry also blocks nothing", asyn
 
 test("getCalendarData: the pattern hatch blocks only once explicitly armed", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-r": "RULE" };
   STORE.calBlockTitles = { "cal-r": [] };
   STORE.ruleInclude = "^Work\\b";
@@ -285,7 +627,7 @@ test("setEventRules: writes all four per-calendar keys in one shot", async () =>
   reset();
   const resp = await send({
     type: "setEventRules",
-    calendarId: "cal-1",
+    feedId: "cal-1",
     block: ["Crew - Desk"],
     note: ["Music Class"],
     labels: { "Crew - Desk": "Desk", "Music Class": "Music" },
@@ -302,7 +644,7 @@ test("setEventRules: trims and de-dupes arrays and drops empty-string titles", a
   reset();
   const resp = await send({
     type: "setEventRules",
-    calendarId: "cal-1",
+    feedId: "cal-1",
     block: ["  Crew - Desk  ", "Crew - Desk", "", "   ", 5, null],
     note: ["Music Class", "Music Class", ""],
     labels: { "Crew - Desk": "  Desk  ", "": "x", "Music Class": "   " },
@@ -321,7 +663,7 @@ test("setEventRules: an empty calLabel removes a previously stored override", as
   reset();
   STORE.calLabelOverride = { "cal-1": "Fam" };
   const resp = await send({
-    type: "setEventRules", calendarId: "cal-1", block: [], note: [], labels: {}, calLabel: "",
+    type: "setEventRules", feedId: "cal-1", block: [], note: [], labels: {}, calLabel: "",
   });
   assert.equal(resp.ok, true);
   assert.equal("cal-1" in STORE.calLabelOverride, false);
@@ -331,20 +673,20 @@ test("setEventRules: bad shapes are refused and nothing is written", async () =>
   reset();
   assert.deepEqual(
     await send({ type: "setEventRules", block: [], note: [], labels: {}, calLabel: "" }),
-    { ok: false, error: "bad_calendar_id" }
+    { ok: false, error: "bad_feed_id" }
   );
   assert.deepEqual(
-    await send({ type: "setEventRules", calendarId: "c", block: "nope", note: [], labels: {}, calLabel: "" }),
+    await send({ type: "setEventRules", feedId: "c", block: "nope", note: [], labels: {}, calLabel: "" }),
     { ok: false, error: "bad_block" }
   );
   assert.deepEqual(
-    await send({ type: "setEventRules", calendarId: "c", block: [], note: "nope", labels: {}, calLabel: "" }),
+    await send({ type: "setEventRules", feedId: "c", block: [], note: "nope", labels: {}, calLabel: "" }),
     { ok: false, error: "bad_note" }
   );
   // A non-plain-object (including an array) is not a valid labels map.
   for (const bad of [null, "x", 5, ["a"]]) {
     assert.deepEqual(
-      await send({ type: "setEventRules", calendarId: "c", block: [], note: [], labels: bad, calLabel: "" }),
+      await send({ type: "setEventRules", feedId: "c", block: [], note: [], labels: bad, calLabel: "" }),
       { ok: false, error: "bad_labels" }
     );
   }
@@ -358,7 +700,7 @@ test("setEventRules: merges into the maps, preserving OTHER calendars", async ()
   STORE.calBlockTitles = { "cal-other": ["Keep"] };
   STORE.calNoteTitles = { "cal-other": ["KeepNote"] };
   const resp = await send({
-    type: "setEventRules", calendarId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
+    type: "setEventRules", feedId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
   });
   assert.equal(resp.ok, true);
   assert.deepEqual(STORE.calBlockTitles["cal-other"], ["Keep"]);
@@ -371,7 +713,7 @@ test("setEventRules: drops the calCache so stale rules are not served", async ()
   STORE.calCache = {
     fetchedAt: 1, commitments: [], soft: [], windowStart: "2026-08-01", windowEnd: "2026-08-31",
   };
-  await send({ type: "setEventRules", calendarId: "cal-1", block: [], note: [], labels: {}, calLabel: "" });
+  await send({ type: "setEventRules", feedId: "cal-1", block: [], note: [], labels: {}, calLabel: "" });
   assert.equal(STORE.calCache, undefined);
 });
 
@@ -381,7 +723,7 @@ test("setEventRules: drops the calCache so stale rules are not served", async ()
 // "Crew Schedule · Music Class" instead.
 test("getCalendarData: calLabelOverride prefixes the notes from a calendar", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-r": "RULE" };
   STORE.calNoteTitles = { "cal-r": ["Music Class"] };
   STORE.calLabelOverride = { "cal-r": "Fam" };
@@ -396,7 +738,7 @@ test("getCalendarData: calLabelOverride prefixes the notes from a calendar", asy
 // A block title's per-event label reaches the commitment triplet end to end.
 test("getCalendarData: a Block title's per-event label becomes the commitment label", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-r", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-r": "RULE" };
   STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
   STORE.calTitleLabels = { "cal-r": { "Crew - Desk": "Desk" } };
@@ -407,9 +749,9 @@ test("getCalendarData: a Block title's per-event label becomes the commitment la
   assert.deepEqual(resp.commitments.map((r) => r[2]), ["Desk"]);
 });
 
-test("listCalendarTitles: echoes back the full three-way state for restore", async () => {
+test("listFeedTitles: echoes back the full three-way state for restore", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-on", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-on": "RULE" };
   STORE.calBlockTitles = { "cal-on": ["Crew - Desk"] };
   STORE.calNoteTitles = { "cal-on": ["Music Class"] };
@@ -417,7 +759,7 @@ test("listCalendarTitles: echoes back the full three-way state for restore", asy
   STORE.calLabelOverride = { "cal-on": "Fam" };
   EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-on" });
   assert.equal(resp.ok, true);
   assert.deepEqual(resp.blockTitles, ["Crew - Desk"]);
   assert.deepEqual(resp.noteTitles, ["Music Class"]);
@@ -434,41 +776,41 @@ test("listCalendarTitles: echoes back the full three-way state for restore", asy
 // against an EMPTY map and then read whatever calendarId it was handed.
 // ---------------------------------------------------------------------------
 
-test("listCalendarTitles: an OFF calendar is refused and never read", async () => {
+test("listFeedTitles: an OFF calendar is refused and never read", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-private", summary: "Personal" }]; // no stored role ⇒ OFF
+  setFeeds([{ id: "cal-private", name: "Personal" }]); // no stored role ⇒ OFF
   EVENTS["cal-private"] = [timed("Therapy", "12")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-private" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-private" });
   assert.equal(resp.ok, false);
-  assert.equal(resp.error, "calendar_off");
+  assert.equal(resp.error, "feed_off");
   assert.equal(
     eventsFetchedFor("cal-private").length,
     0,
-    "an OFF calendar's events must never leave Google"
+    "an OFF feed's events must never be fetched"
   );
   assert.equal(resp.titles, undefined);
 });
 
-test("listCalendarTitles: an explicitly OFF calendar is refused too", async () => {
+test("listFeedTitles: an explicitly OFF calendar is refused too", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-off", summary: "Personal" }];
+  setFeeds([{ id: "cal-off", name: "Personal" }]);
   STORE.calRoles = { "cal-off": "OFF" };
   EVENTS["cal-off"] = [timed("Therapy", "12")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-off" });
-  assert.equal(resp.error, "calendar_off");
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-off" });
+  assert.equal(resp.error, "feed_off");
   assert.equal(eventsFetchedFor("cal-off").length, 0);
 });
 
-test("listCalendarTitles: a switched-on calendar is read normally", async () => {
+test("listFeedTitles: a switched-on calendar is read normally", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-on", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-on": "RULE" };
   STORE.calBlockTitles = { "cal-on": ["ACME - Desk"] };
   EVENTS["cal-on"] = [timed("ACME - Desk", "10"), timed("ACME - Desk", "12")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-on" });
   assert.equal(resp.ok, true);
   assert.deepEqual(
     resp.titles.map((t) => [t.title, t.count]),
@@ -480,15 +822,15 @@ test("listCalendarTitles: a switched-on calendar is read normally", async () => 
 // The legitimate flow the gate must not deadlock: the options page toggles a
 // calendar ON and asks for its titles immediately afterwards. It awaits
 // setCalendarRole first, so the role is already persisted when this runs.
-test("listCalendarTitles: works immediately after setCalendarRole turns a calendar on", async () => {
+test("listFeedTitles: works immediately after setCalendarRole turns a calendar on", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-new", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-new", name: "Crew Schedule" }]);
   EVENTS["cal-new"] = [timed("Night Tour", "10")];
 
-  const set = await send({ type: "setCalendarRole", calendarId: "cal-new", role: "FLAG" });
+  const set = await send({ type: "setCalendarRole", feedId: "cal-new", role: "FLAG" });
   assert.equal(set.ok, true);
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-new" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-new" });
   assert.equal(resp.ok, true, "the just-toggled-on calendar must be readable: " + resp.error);
   assert.deepEqual(
     resp.titles.map((t) => t.title),
@@ -496,11 +838,11 @@ test("listCalendarTitles: works immediately after setCalendarRole turns a calend
   );
 });
 
-test("listCalendarTitles: an unknown calendar id is refused before any events request", async () => {
+test("listFeedTitles: an unknown calendar id is refused before any events request", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-a", summary: "Crew Schedule" }];
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-nope" });
-  assert.equal(resp.error, "unknown_calendar");
+  setFeeds([{ id: "cal-a", name: "Crew Schedule" }]);
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-nope" });
+  assert.equal(resp.error, "unknown_feed");
   assert.equal(FETCH_LOG.filter((u) => u.includes("/events")).length, 0);
 });
 
@@ -510,10 +852,10 @@ test("listCalendarTitles: an unknown calendar id is refused before any events re
 
 test("getCalendarData: OFF calendars are never fetched", async () => {
   reset();
-  CAL_ITEMS = [
-    { id: "cal-on", summary: "Crew Schedule" },
-    { id: "cal-off", summary: "Personal" },
-  ];
+  setFeeds([
+    { id: "cal-on", name: "Crew Schedule" },
+    { id: "cal-off", name: "Personal" },
+  ]);
   STORE.calRoles = { "cal-on": "REJECT" };
   EVENTS["cal-on"] = [timed("Night Tour", "10")];
   EVENTS["cal-off"] = [timed("Therapy", "11")];
@@ -536,7 +878,7 @@ test("setCalendarBuffer: writes both calBufferBefore/After for the calendar and 
   STORE.calCache = {
     fetchedAt: 1, commitments: [], soft: [], windowStart: "2026-08-01", windowEnd: "2026-08-31",
   };
-  const resp = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: 6, after: 12.5 });
+  const resp = await send({ type: "setCalendarBuffer", feedId: "cal-1", before: 6, after: 12.5 });
   assert.equal(resp.ok, true);
   assert.equal(STORE.calBufferBefore["cal-1"], 6);
   assert.equal(STORE.calBufferAfter["cal-1"], 12.5);
@@ -546,9 +888,9 @@ test("setCalendarBuffer: writes both calBufferBefore/After for the calendar and 
 test("setCalendarBuffer: NaN/negative/Infinity are all refused as bad_buffer, nothing written", async () => {
   reset();
   for (const bad of [NaN, -1, Infinity, -Infinity]) {
-    const resp = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: bad, after: 0 });
+    const resp = await send({ type: "setCalendarBuffer", feedId: "cal-1", before: bad, after: 0 });
     assert.deepEqual(resp, { ok: false, error: "bad_buffer" }, `before=${bad}`);
-    const resp2 = await send({ type: "setCalendarBuffer", calendarId: "cal-1", before: 0, after: bad });
+    const resp2 = await send({ type: "setCalendarBuffer", feedId: "cal-1", before: 0, after: bad });
     assert.deepEqual(resp2, { ok: false, error: "bad_buffer" }, `after=${bad}`);
   }
   assert.equal(STORE.calBufferBefore, undefined);
@@ -558,14 +900,14 @@ test("setCalendarBuffer: NaN/negative/Infinity are all refused as bad_buffer, no
 test("setCalendarBuffer: missing calendarId is refused as bad_calendar_id", async () => {
   reset();
   const resp = await send({ type: "setCalendarBuffer", before: 1, after: 1 });
-  assert.deepEqual(resp, { ok: false, error: "bad_calendar_id" });
+  assert.deepEqual(resp, { ok: false, error: "bad_feed_id" });
 });
 
 test("setEventRules: persists eventBuffers alongside block/note/labels/calLabel", async () => {
   reset();
   const resp = await send({
     type: "setEventRules",
-    calendarId: "cal-1",
+    feedId: "cal-1",
     block: ["Crew - Desk"],
     note: [],
     labels: {},
@@ -581,51 +923,51 @@ test("setEventRules: omitting eventBuffers leaves the calendar's stored override
   reset();
   STORE.calEventBuffers = { "cal-1": { "Crew - Desk": { before: 4, after: 10 } } };
   const resp = await send({
-    type: "setEventRules", calendarId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
+    type: "setEventRules", feedId: "cal-1", block: ["Crew - Desk"], note: [], labels: {}, calLabel: "",
   });
   assert.equal(resp.ok, true);
   assert.deepEqual(STORE.calEventBuffers["cal-1"], { "Crew - Desk": { before: 4, after: 10 } });
 });
 
-test("listCalendars: each calendar gets bufferBefore/bufferAfter, default 0 when unconfigured", async () => {
+test("listFeeds: each calendar gets bufferBefore/bufferAfter, default 0 when unconfigured", async () => {
   reset();
-  CAL_ITEMS = [
-    { id: "cal-a", summary: "Crew Schedule" },
-    { id: "cal-b", summary: "Household" },
-  ];
+  setFeeds([
+    { id: "cal-a", name: "Crew Schedule" },
+    { id: "cal-b", name: "Household" },
+  ]);
   STORE.calBufferBefore = { "cal-a": 6 };
   STORE.calBufferAfter = { "cal-a": 12 };
 
-  const resp = await send({ type: "listCalendars", interactive: false });
+  const resp = await send({ type: "listFeeds" });
   assert.equal(resp.ok, true);
-  const a = resp.calendars.find((c) => c.id === "cal-a");
-  const b = resp.calendars.find((c) => c.id === "cal-b");
+  const a = resp.feeds.find((c) => c.id === "cal-a");
+  const b = resp.feeds.find((c) => c.id === "cal-b");
   assert.equal(a.bufferBefore, 6);
   assert.equal(a.bufferAfter, 12);
   assert.equal(b.bufferBefore, 0);
   assert.equal(b.bufferAfter, 0);
 });
 
-test("listCalendarTitles: echoes eventBuffers for the calendar (default {})", async () => {
+test("listFeedTitles: echoes eventBuffers for the calendar (default {})", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-on", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-on": "RULE" };
   STORE.calBlockTitles = { "cal-on": ["Crew - Desk"] };
   STORE.calEventBuffers = { "cal-on": { "Crew - Desk": { before: 4, after: 10 } } };
   EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-on" });
   assert.equal(resp.ok, true);
   assert.deepEqual(resp.eventBuffers, { "Crew - Desk": { before: 4, after: 10 } });
 });
 
-test("listCalendarTitles: a calendar with no stored eventBuffers echoes {}", async () => {
+test("listFeedTitles: a calendar with no stored eventBuffers echoes {}", async () => {
   reset();
-  CAL_ITEMS = [{ id: "cal-on", summary: "Crew Schedule" }];
+  setFeeds([{ id: "cal-on", name: "Crew Schedule" }]);
   STORE.calRoles = { "cal-on": "RULE" };
   EVENTS["cal-on"] = [timed("Crew - Desk", "10")];
 
-  const resp = await send({ type: "listCalendarTitles", calendarId: "cal-on" });
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-on" });
   assert.equal(resp.ok, true);
   assert.deepEqual(resp.eventBuffers, {});
 });
@@ -677,7 +1019,7 @@ test("bucketEvents: a per-event buffer override beats the calendar default", () 
 // feed title silently drops the override and falls back to the calendar default
 // — the exact failure a reviewer caught.
 test("bucketEvents: a per-event buffer override still applies when the title has a non-break space", () => {
-  const NBSP = "Crew - Tour"; // no-break spaces around the dash, as iCal/Outlook feeds emit
+  const NBSP = "Crew - Tour"; // no-break spaces around the dash, as real-world feeds emit
   const events = [timed(NBSP, "10")];
   const { commitments } = sw.bucketEvents(
     events,
@@ -700,4 +1042,355 @@ test("bucketEvents: with no bufferOpts at all, the commitment triplet defaults b
   assert.equal(commitments.length, 1);
   assert.equal(commitments[0][3], 0);
   assert.equal(commitments[0][4], 0);
+});
+
+// ---------------------------------------------------------------------------
+// Per-feed commitment label, and the migration off the old single global one
+// ---------------------------------------------------------------------------
+
+test("setFeedBlockLabel: stores the trimmed word and drops the cache", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calCache = { fetchedAt: 1, commitments: [], soft: [] };
+
+  const resp = await send({ type: "setFeedBlockLabel", feedId: "f1", label: "  Fire Dept  " });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Fire Dept" });
+  assert.equal("calCache" in STORE, false, "a stale cache would keep serving the old chip word");
+});
+
+test("setFeedBlockLabel: a blank value REMOVES the entry rather than storing an empty string", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  await send({ type: "setFeedBlockLabel", feedId: "f1", label: "   " });
+  assert.deepEqual(STORE.calBlockLabel, {}, "unset must have exactly one representation");
+});
+
+test("setFeedBlockLabel: a missing feed id is refused", async () => {
+  reset();
+  const resp = await send({ type: "setFeedBlockLabel", label: "Fire Dept" });
+  assert.equal(resp.ok, false);
+  assert.equal(resp.error, "bad_feed_id");
+});
+
+test("getCalendarData: a feed's label rides on its commitment triplets", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.commitments[0][2], "Fire Dept");
+});
+
+// The whole point of the change: one word per feed, not one for the board.
+test("getCalendarData: two feeds keep their own separate words", async () => {
+  reset();
+  setFeeds([
+    { id: "f1", name: "Crew Schedule", role: "REJECT" },
+    { id: "f2", name: "Family", role: "REJECT" },
+  ]);
+  STORE.calBlockLabel = { f1: "Fire Dept", f2: "Family" };
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+  EVENTS["f2"] = [timed("Recital", "16")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.deepEqual(resp.commitments.map((c) => c[2]).sort(), ["Family", "Fire Dept"]);
+});
+
+test("listFeeds: echoes each feed's label back to the panel", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }, { id: "f2", name: "Family" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  const resp = await send({ type: "listFeeds" });
+  assert.equal(resp.feeds.find((f) => f.id === "f1").blockLabel, "Fire Dept");
+  assert.equal(resp.feeds.find((f) => f.id === "f2").blockLabel, "");
+});
+
+test("removeFeed: deletes the feed's label along with the rest of its config", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.calBlockLabel = { f1: "Fire Dept" };
+  await send({ type: "removeFeed", feedId: "f1" });
+  assert.deepEqual(STORE.calBlockLabel, {});
+});
+
+// MIGRATION. The label used to be ONE global word. Deleting that setting without
+// moving its value would silently turn a deliberate "✕ Fire Dept" into
+// "✕ Commitment" — config disarmed with no signal, which is the exact class of
+// bug this codebase has shipped before and now refuses to.
+test("migration: a stored global label is copied onto every feed, then deleted", async () => {
+  reset();
+  setFeeds([
+    { id: "f1", name: "Crew Schedule", role: "REJECT" },
+    { id: "f2", name: "Family", role: "FLAG" },
+  ]);
+  STORE.commitmentLabel = "Fire Dept";
+
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Fire Dept", f2: "Fire Dept" });
+  assert.equal("commitmentLabel" in STORE, false, "the legacy key must be gone once moved");
+});
+
+test("migration: never overwrites a per-feed label the user already set", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }, { id: "f2", name: "B", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+  STORE.calBlockLabel = { f1: "Station 3" };
+
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Station 3", f2: "Fire Dept" });
+});
+
+test("migration: is idempotent — a later re-run cannot resurrect the old word", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+
+  await send({ type: "listFeeds" });
+  await send({ type: "setFeedBlockLabel", feedId: "f1", label: "Changed" });
+  await send({ type: "listFeeds" });
+  assert.deepEqual(STORE.calBlockLabel, { f1: "Changed" });
+});
+
+test("migration: a blank global label is simply dropped, seeding nothing", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "A", role: "REJECT" }]);
+  STORE.commitmentLabel = "   ";
+
+  await send({ type: "listFeeds" });
+  assert.equal("commitmentLabel" in STORE, false);
+  assert.deepEqual(STORE.calBlockLabel || {}, {});
+});
+
+test("migration: the migrated word is what rejects actually say", async () => {
+  reset();
+  setFeeds([{ id: "f1", name: "Crew Schedule", role: "REJECT" }]);
+  STORE.commitmentLabel = "Fire Dept";
+  EVENTS["f1"] = [timed("Night Tour", "15")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.commitments[0][2], "Fire Dept",
+    "a pre-upgrade word must survive the upgrade end to end");
+});
+
+// ---------------------------------------------------------------------------
+// New-title review nudge — the picker's data layer (declutter + recurring +
+// "you have not reviewed this title yet")
+//
+// The gate is exact: only a RULE feed actually deciding its blocking set from
+// ticked titles (calendarRule(...).mode === "titles") is tracked here. A feed
+// qualifies the moment it has at least one usable ticked title.
+// ---------------------------------------------------------------------------
+
+test("getCalendarData: first sync for a RULE/titles feed seeds calSeenTitles and flags nothing", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "a user's very first sync must not flag every title they already own"
+  );
+  assert.deepEqual(
+    (STORE.calSeenTitles["cal-r"] || []).slice().sort(),
+    ["Brand New Training", "Crew - Desk"],
+    "the baseline is seeded to the current today-or-later title set"
+  );
+});
+
+test("getCalendarData: an EMPTY calSeenTitles entry is a review, not a first sync", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  // PRESENT but empty: the user has reviewed this feed before, at a moment when
+  // it genuinely had no titles. That is NOT the same as never having reviewed
+  // it, and the difference decides whether a title appearing now is new. A
+  // truthiness check cannot tell the two apart -- only key presence can.
+  STORE.calSeenTitles = { "cal-r": [] };
+  // "Crew - Desk" is the ticked title (it is what gives this feed mode
+  // "titles"), and a ticked title is never flagged -- it already blocks. The
+  // untouched one is the one that must surface.
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(
+    STORE.newTitlesByFeed["cal-r"],
+    { feedName: "Crew Schedule", titles: ["Brand New Training"] },
+    "an empty baseline means anything unticked present now arrived since the last review"
+  );
+});
+
+test("getCalendarData: a RULE feed with nothing ticked (mode none) is never tracked", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  // RULE, but no ticked titles -- calendarRule resolves to mode "none", so this
+  // feed blocks nothing and has no hand-picked set to review against. The role
+  // half of the gate passes here; only the mode half excludes it.
+  STORE.calBlockTitles = { "cal-r": [] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "nothing is ticked, so there is no hand-picked set for a new title to be new against"
+  );
+});
+
+test("getCalendarData: a title new since the last review IS flagged in newTitlesByFeed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] }; // already reviewed once
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.newTitlesByFeed["cal-r"], {
+    feedName: "Crew Schedule",
+    titles: ["Brand New Training"],
+  });
+});
+
+test("getCalendarData: a new title already covered by a ticked BLOCK title (by stem) is NOT flagged", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk", "Crew - Night Tour"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Crew - Night Tour", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    STORE.newTitlesByFeed["cal-r"],
+    undefined,
+    "a title that already blocks shifts must not also nag"
+  );
+});
+
+test("getCalendarData: a new title already in the NOTE list is NOT flagged", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calNoteTitles = { "cal-r": ["Music Class"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Music Class", "12")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.equal(STORE.newTitlesByFeed["cal-r"], undefined);
+});
+
+test("getCalendarData: a REJECT feed (no picker) never populates newTitlesByFeed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["cal-r"] = [timed("Anything", "10")];
+
+  const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
+  assert.equal(resp.ok, true);
+  assert.deepEqual(STORE.newTitlesByFeed, {}, "REJECT has no picker and must never be tracked");
+});
+
+test("listFeedTitles: isNew reflects the PRE-review state, then marks the feed reviewed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.newTitlesByFeed = { "cal-r": { feedName: "Crew Schedule", titles: ["Brand New Training"] } };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10"), timed("Brand New Training", "12")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  const byTitle = Object.fromEntries(resp.titles.map((t) => [t.title, t.isNew]));
+  assert.equal(byTitle["Brand New Training"], true);
+  assert.equal(byTitle["Crew - Desk"], false);
+
+  // Opening the picker IS the review: the baseline advances and the nudge
+  // clears, so the drawer's banner is gone on the next paint.
+  assert.deepEqual(
+    STORE.calSeenTitles["cal-r"].slice().sort(),
+    ["Brand New Training", "Crew - Desk"]
+  );
+  assert.equal(STORE.newTitlesByFeed["cal-r"], undefined);
+});
+
+test("listFeedTitles: a flagged title the picker cannot list is still marked reviewed", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  STORE.calBlockTitles = { "cal-r": ["Crew - Desk"] };
+  STORE.calSeenTitles = { "cal-r": ["Crew - Desk"] };
+  // Flagged by a refresh over the SCORING window (four months out) but absent
+  // from this picker's own sample (30 back / 60 forward) -- the two windows
+  // genuinely differ. A baseline of only the visible titles would never absorb
+  // it, so the next refresh would flag it again: a banner the user cannot
+  // dismiss by doing exactly what it asks.
+  STORE.newTitlesByFeed = { "cal-r": { feedName: "Crew Schedule", titles: ["Far Future Drill"] } };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    resp.titles.some((t) => t.title === "Far Future Drill"),
+    false,
+    "precondition: the off-sample title is genuinely not listable here"
+  );
+  assert.deepEqual(
+    STORE.calSeenTitles["cal-r"].slice().sort(),
+    ["Crew - Desk", "Far Future Drill"],
+    "opening the picker means the whole feed is reviewed, including what it could not show"
+  );
+});
+
+test("listFeedTitles: the very first time a feed's picker is opened, nothing is flagged isNew", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  EVENTS["cal-r"] = [timed("Crew - Desk", "10")];
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  assert.equal(
+    resp.titles.every((t) => t.isNew === false),
+    true,
+    "no prior baseline to compare against — nothing can honestly be called new yet"
+  );
+  assert.deepEqual(STORE.calSeenTitles["cal-r"], ["Crew - Desk"]);
+});
+
+test("listFeedTitles: recurring is true for a series title, false for a standalone one", async () => {
+  reset();
+  setFeeds([{ id: "cal-r", name: "Crew Schedule" }]);
+  STORE.calRoles = { "cal-r": "RULE" };
+  FEED_BODIES["cal-r"] =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+    "BEGIN:VEVENT\r\nUID:r1\r\nSUMMARY:Standing Tour\r\n" +
+    "DTSTART;TZID=America/New_York:20260804T080000\r\n" +
+    "DTEND;TZID=America/New_York:20260804T180000\r\n" +
+    "RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n" +
+    "BEGIN:VEVENT\r\nUID:s1\r\nSUMMARY:One-off Drill\r\n" +
+    "DTSTART;TZID=America/New_York:20260805T080000\r\n" +
+    "DTEND;TZID=America/New_York:20260805T180000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+  const resp = await send({ type: "listFeedTitles", feedId: "cal-r" });
+  assert.equal(resp.ok, true);
+  const byTitle = Object.fromEntries(resp.titles.map((t) => [t.title, t.recurring]));
+  assert.equal(byTitle["Standing Tour"], true);
+  assert.equal(byTitle["One-off Drill"], false);
 });

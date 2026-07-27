@@ -9,10 +9,10 @@
  * color palette used consistently across the project, plus the FAM purple
  * (#b48cff).
  *
- * No external network references anywhere in this file (MV3 CSP: no Google
- * Fonts CDN, no CDN of any kind) -- font stacks below are local-fallback
- * only, and the @font-face block that would load packaged woff2 files is
- * commented out until assets/fonts/*.woff2 actually exist.
+ * No external network references anywhere in this file (MV3 CSP: no external
+ * fonts or CDN of any kind) -- font stacks below are local-fallback only, and
+ * the @font-face block that would load packaged woff2 files is commented out
+ * until assets/fonts/*.woff2 actually exist.
  */
 
 :host {
@@ -214,10 +214,14 @@
   font-family: var(--font-head);
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  font-size: 10px;
+  /* was 10px; "NEW MEDIC SHIFTS SINCE LAST VISIT" is longer than the old
+     "SINCE LAST VISIT" and the drawer is only ~300px wide -- dropped a notch
+     so the whole label still fits on one line instead of wrapping. */
+  font-size: 8.5px;
   color: var(--dim);
   font-weight: 600;
   margin-bottom: 3px;
+  white-space: nowrap;
 }
 
 .since-segs {
@@ -456,37 +460,10 @@
   border-top: 1px solid var(--line);
 }
 
-.scan-btn {
-  width: 100%;
-  font-family: var(--font-head);
-  font-weight: 700;
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  background: transparent;
-  color: var(--amber);
-  border: 1px solid var(--amber);
-  padding: 8px 0;
-  cursor: pointer;
-  border-radius: 2px;
-}
-
-.scan-btn:hover:not(:disabled) {
-  background: var(--amber);
-  color: #1a1204;
-}
-
-.scan-btn:disabled {
-  color: var(--dim);
-  border-color: var(--line);
-  cursor: default;
-}
-
 .footer-note {
   text-align: center;
   color: var(--dim);
   font-size: 11px;
-  margin-top: 8px;
 }
 
 /* ---------- 9. Compose-text (row checkboxes, compose bar, preview) ---------- */
@@ -723,6 +700,121 @@
 }
 
 .deconf-cta:hover {
+  opacity: 0.9;
+}
+
+/* Resync -- a secondary, outlined sibling of .deconf-cta so the red "Fix
+   feed" CTA (the destination fix) still reads as primary; Resync (a retry
+   that isn't a page reload) is the lower-commitment action next to it. */
+.deconf-cta-secondary {
+  background: transparent;
+  color: var(--red);
+  margin-right: 6px;
+}
+
+.deconf-cta-secondary:hover {
+  background: rgba(255, 93, 71, 0.15);
+}
+
+/* ---------- 11. Stale-cache banner (calStale: still scored, cache is old) ---------- */
+
+.stale-banner {
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  background: rgba(255, 180, 40, 0.1);
+  border: 1px solid var(--amber);
+  border-left: 3px solid var(--amber);
+  flex: 0 0 auto;
+}
+
+.stale-head {
+  font-family: var(--font-head);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 12px;
+  color: var(--amber);
+  margin-bottom: 4px;
+}
+
+.stale-body {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+
+.stale-cta {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--amber);
+  color: #1a1204;
+  border: 1px solid var(--amber);
+  border-radius: 2px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.stale-cta:hover {
+  opacity: 0.9;
+}
+
+.stale-cta-secondary {
+  background: transparent;
+  color: var(--amber);
+  margin-right: 6px;
+}
+
+.stale-cta-secondary:hover {
+  background: rgba(255, 180, 40, 0.15);
+}
+
+/* ---------- 12. New-calendar-events banner (blue, purely informational) ---------- */
+
+.newevents-banner {
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  background: rgba(90, 169, 255, 0.1);
+  border: 1px solid var(--blue);
+  border-left: 3px solid var(--blue);
+  flex: 0 0 auto;
+}
+
+.newevents-head {
+  font-family: var(--font-head);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 12px;
+  color: var(--blue);
+  margin-bottom: 4px;
+}
+
+.newevents-body {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+
+.newevents-cta {
+  font-family: var(--font-head);
+  font-weight: 700;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--blue);
+  color: #06121f;
+  border: 1px solid var(--blue);
+  border-radius: 2px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.newevents-cta:hover {
   opacity: 0.9;
 }
 

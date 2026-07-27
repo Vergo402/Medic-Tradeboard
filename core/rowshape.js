@@ -141,31 +141,32 @@ export function posterNote(rec) {
  * change, and a user whose commitment label happens to read like another
  * reject category ("My Shifts") would collide with it.
  *
- * Only the "commitment" kind carries the user's configured label; the other
- * kinds are board-wide concepts with fixed wording. A commitment reject may
- * also carry a per-event `rejectLabel` (the overlapping commitment's "show as"
- * override): when it is a non-empty string it wins over the global label, so a
- * single blocked title can read "✕ Drill" while the rest read "✕ Fire Dept".
- * An empty/absent `rejectLabel` falls back to the global commitmentLabel, then
- * to DEFAULT_COMMITMENT_LABEL. `rejectGapHours` is the smallest FAILING gap
- * (evaluate() computes it; do not substitute `score`, which also counts gaps
- * that passed the tour check) and is rounded with `Math.round`. Unknown/absent
- * kinds fall back to "✕ REJECTED", and a buffer reject with no gap number to
- * "✕ BUFFER".
+ * Only the "commitment" kind carries a user-configured word; the other kinds
+ * are board-wide concepts with fixed wording.
+ *
+ * `rejectLabel` is the overlapping commitment's triplet label, and by the time
+ * it reaches here it has ALREADY been resolved by sw.js's bucketEvents to the
+ * most specific thing the user configured — the per-event "show as" if there is
+ * one, else the feed's own commitment word. That resolution has to happen there,
+ * not here, because score.js merges overlapping commitments and keeps only the
+ * first label, so which feed a rejection came from is no longer knowable at this
+ * point. An empty/absent `rejectLabel` means the user configured nothing for
+ * that feed and falls back to DEFAULT_COMMITMENT_LABEL.
+ *
+ * `rejectGapHours` is the smallest FAILING gap (evaluate() computes it; do not
+ * substitute `score`, which also counts gaps that passed the tour check) and is
+ * rounded with `Math.round`. Unknown/absent kinds fall back to "✕ REJECTED", and
+ * a buffer reject with no gap number to "✕ BUFFER".
  * @param {{rejectKind?:string|null, rejectLabel?:string|null, rejectGapHours?:number|null}|null|undefined} reject
  *   the evaluate() result (or the row built from it)
- * @param {string} [commitmentLabel] the user's configured commitment label
  * @returns {string} short chip label, e.g. "✕ Fire Dept", "✕ Drill", "✕ BUFFER 10h"
  */
-export function rejectChipLabel(reject, commitmentLabel) {
+export function rejectChipLabel(reject) {
   const kind = reject && reject.rejectKind;
   if (kind === "commitment") {
-    // A per-event "show as" override wins over the global label when present.
     const custom = reject.rejectLabel;
     if (typeof custom === "string" && custom.trim()) return `✕ ${custom.trim()}`;
-    const label = (typeof commitmentLabel === "string" && commitmentLabel.trim())
-      || DEFAULT_COMMITMENT_LABEL;
-    return `✕ ${label.trim()}`;
+    return `✕ ${DEFAULT_COMMITMENT_LABEL}`;
   }
   if (kind === "my_shift") return "✕ Medic Shift";
   if (kind === "buffer") {
