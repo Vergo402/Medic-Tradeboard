@@ -105,9 +105,15 @@ the default at both save and read time.
 
 ## Install
 
-There is no Chrome Web Store listing yet (the planned listing is unlisted,
-link-only — see [`STORE_SUBMISSION.md`](STORE_SUBMISSION.md)). To run it from
-source:
+Install it from the Chrome Web Store:
+
+**[Medic Tradeboard on the Chrome Web Store](https://chromewebstore.google.com/detail/medic-tradeboard/mpjjpccpmfmjfjpcgfmniijnhilpdigm)**
+
+The listing is **unlisted** (link-only): it won't turn up in store search, so
+bookmark or share the link above. After installing, open the extension's
+**Options** page and add a feed (see the next section).
+
+To run it from source instead:
 
 1. Clone this repository.
 2. Go to `chrome://extensions`, enable **Developer mode**.
