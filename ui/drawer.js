@@ -33,16 +33,32 @@
 import { composeMessage } from "../core/compose.js";
 
 const WIDTH_PX = 300;
+const FONT_STYLE_ID = "medic-drawer-fonts";
+
+/**
+ * Registers the packaged woff2 fonts at DOCUMENT level. Chrome never
+ * registers @font-face rules found in a shadow-tree stylesheet (crbug
+ * 336876 lineage) -- the identical block in ui/drawer.css is a no-op there
+ * -- but families registered on the document DO resolve inside shadow
+ * trees, so one guarded <style> in document.head lights up the drawer.
+ * URLs must be absolute chrome-extension:// here (relative would resolve
+ * against the W2W page); assets/fonts/* is web_accessible_resources.
+ */
+function injectFontFaces() {
+  if (document.getElementById(FONT_STYLE_ID)) return;
+  const face = (family, file, weight) =>
+    `@font-face{font-family:"${family}";src:url("${chrome.runtime.getURL(`assets/fonts/${file}`)}") format("woff2");font-weight:${weight};font-display:swap;}`;
+  const style = document.createElement("style");
+  style.id = FONT_STYLE_ID;
+  style.textContent =
+    face("Barlow Condensed", "barlow-condensed-500.woff2", 500) +
+    face("IBM Plex Mono", "ibm-plex-mono-400.woff2", 400) +
+    face("IBM Plex Mono", "ibm-plex-mono-500.woff2", 500);
+  document.head.appendChild(style);
+}
 const COLLAPSED_PX = 24;
 const Z_INDEX = 2147483000;
 const HOST_ID = "medic-shift-drawer-host";
-
-const TOUR_PILL = {
-  day: { bg: "#3a2f14", color: "#ffb428" },
-  night: { bg: "#16243a", color: "#5aa9ff" },
-};
-const NEW_PILL = { bg: "#33290f", color: "#ffb428" };
-const TIER_COLOR = { t1: "#3fd68f", t2: "#ffb428", t3: "#8b98ab" };
 
 function escapeHtml(value) {
   return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
@@ -132,8 +148,8 @@ function unitOptions(state) {
   return Array.from(seen).sort();
 }
 
-function pillHtml(text, bg, color, extraClass) {
-  return `<span class="pill${extraClass ? " " + extraClass : ""}" style="background:${bg};color:${color};">${escapeHtml(text)}</span>`;
+function pillHtml(text, extraClass) {
+  return `<span class="pill ${extraClass}">${escapeHtml(text)}</span>`;
 }
 
 function noticeHtml(notice) {
@@ -299,9 +315,8 @@ function checkboxHtml(x, checked) {
 
 function rowHtml(row, checked, muted) {
   const tk = tourKey(row.tour);
-  const pill = TOUR_PILL[tk];
-  const tourPill = pillHtml(String(row.tour || "").toUpperCase(), pill.bg, pill.color, `pill-${tk}`);
-  const newPill = row.isNew ? " " + pillHtml("NEW", NEW_PILL.bg, NEW_PILL.color, "pill-new") : "";
+  const tourPill = pillHtml(String(row.tour || "").toUpperCase(), `pill-${tk}`);
+  const newPill = row.isNew ? " " + pillHtml("NEW", "pill-new") : "";
   const line2 = (row.famLabels && row.famLabels.length)
     ? `<span class="fam-line">${escapeHtml(row.famLabels.join(" · "))}</span>`
     : `<span class="loc-line">${escapeHtml(row.locLine)}</span>`;
@@ -320,8 +335,8 @@ function rowHtml(row, checked, muted) {
     <div class="row-score row-score-muted">?</div>
   </div>`;
   }
-  const tierColor = TIER_COLOR[row.tier] || TIER_COLOR.t3;
-  const rowClass = row.tier === "t3" ? "row row-dim" : "row";
+  const tier = row.tier || "t3";
+  const rowClass = tier === "t3" ? `row row-${tier} row-dim` : `row row-${tier}`;
   return `<div class="${rowClass}" data-action="row-click" data-id="${escapeHtml(row.w2w_id)}" role="button" tabindex="0">
     ${checkboxHtml(row, checked)}
     <div class="row-rank">#${escapeHtml(row.rank)}</div>
@@ -329,14 +344,13 @@ function rowHtml(row, checked, muted) {
       <div class="row-line1">${boldDayNumber(row.dateLabel)} ${tourPill} <span class="row-pos">${escapeHtml(row.pos)}</span>${newPill}</div>
       <div class="row-line2">${line2}</div>
     </div>
-    <div class="row-score" style="color:${tierColor};">${scoreText(row.score)}h</div>
+    <div class="row-score score-${tier}">${scoreText(row.score)}h</div>
   </div>`;
 }
 
 function rejectHtml(reject, checked, muted) {
   const tk = tourKey(reject.tour);
-  const pill = TOUR_PILL[tk];
-  const tourPill = pillHtml(String(reject.tour || "").toUpperCase(), pill.bg, pill.color, `pill-${tk}`);
+  const tourPill = pillHtml(String(reject.tour || "").toUpperCase(), `pill-${tk}`);
   const rowClass = muted ? "reject-row reject-row-muted" : "reject-row";
   return `<div class="${rowClass}">
     ${checkboxHtml(reject, checked)}
@@ -385,9 +399,11 @@ function footerHtml() {
   </div>`;
 }
 
-function headerHtml() {
+function headerHtml(attention) {
+  const attnClass = attention ? " settings-attention" : "";
   return `<div class="header">
     <span class="header-title">MEDIC SHIFT <span class="accent">SCANNER</span></span>
+    <button type="button" class="settings-btn${attnClass}" data-action="open-setup" title="Calendar setup" aria-label="Calendar setup">⚙ SETTINGS</button>
     <button type="button" class="chevron" data-action="toggle-collapse" title="Collapse" aria-label="Collapse drawer">›</button>
   </div>`;
 }
@@ -435,6 +451,8 @@ export function initDrawer(callbacks) {
   document.body.appendChild(host);
 
   const shadow = host.attachShadow({ mode: "open" });
+
+  injectFontFaces();
 
   const link = document.createElement("link");
   link.rel = "stylesheet";
@@ -506,14 +524,14 @@ export function initDrawer(callbacks) {
     }
 
     if (state.notice) {
-      root.innerHTML = `${headerHtml()}${noticeHtml(state.notice)}`;
+      root.innerHTML = `${headerHtml(!state.anyCalendarBlocks)}${noticeHtml(state.notice)}`;
       return;
     }
 
     if (composeOpen) {
       // STATE 2: header + preview view + footer ONLY -- status line, stats,
       // filter row, rows, rejected section, and compose bar are all hidden.
-      root.innerHTML = `${headerHtml()}${composeViewHtml(selectedShifts(), copyFlash)}${footerHtml()}`;
+      root.innerHTML = `${headerHtml(!state.anyCalendarBlocks)}${composeViewHtml(selectedShifts(), copyFlash)}${footerHtml()}`;
       return;
     }
 
@@ -540,11 +558,11 @@ export function initDrawer(callbacks) {
     const feedBroken = noData && Boolean(state.calError);
     const muted = !state.anyCalendarBlocks || noData;
 
-    let html = headerHtml();
-    // Gear, always present, at the end of the status line. It pulses amber
-    // (gear-attention) whenever nothing is set to block, calm otherwise.
-    const gearClass = state.anyCalendarBlocks ? "gear-btn" : "gear-btn gear-attention";
-    html += `<div class="status-line">${escapeHtml(state.monthLabel)} · CAL ${calSegmentHtml(state)} · MYSCHED ${myschedHtml(state.myschedStatus)}<button type="button" class="${gearClass}" data-action="open-setup" title="Calendar setup" aria-label="Calendar setup">⚙</button></div>`;
+    // Settings now lives in the header (see headerHtml) rather than at the
+    // end of the status line; it pulses amber (settings-attention) whenever
+    // nothing is set to block, calm otherwise.
+    let html = headerHtml(!state.anyCalendarBlocks);
+    html += `<div class="status-line">${escapeHtml(state.monthLabel)} · CAL ${calSegmentHtml(state)} · MYSCHED ${myschedHtml(state.myschedStatus)}</div>`;
 
     // Banner stack order is severity-first, most-actionable on top: the feed
     // state (a correctness warning -- something may be wrong with what's

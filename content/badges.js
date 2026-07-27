@@ -15,11 +15,15 @@
 (function () {
   "use strict";
 
-  var TIER_COLOR = { t1: "#3fd68f", t2: "#ffb428", t3: "#8b98ab" };
-  var AMBER = "#ffb428";
-  var PURPLE = "#b48cff";
-  var PANEL = "#161b23";
-  var CHIP_FONT = 'bold 11px "IBM Plex Mono", ui-monospace, Menlo, monospace';
+  // Mirrors ui/drawer.css :host tokens (documented duplication -- this is a
+  // classic script painting into W2W's page, so it can't read the drawer's
+  // shadow-scoped CSS vars; keep in sync with drawer.css when tokens change).
+  var THEME = {
+    t1: "#3fd68f", t2: "#ffb428", t3: "#8b98ab",
+    amber: "#ffb428", green: "#3fd68f", purple: "#b48cff", panel: "#161b23",
+    rejectBorder: "#6b7686", rejectInk: "#8b98ab",
+  };
+  var CHIP_FONT = '500 10px "IBM Plex Mono", ui-monospace, Menlo, monospace';
   var CHIP_SELECTOR = "a[onclick*=\"CCL(this,\"]";
   var FLASH_MS = 2000;
 
@@ -66,8 +70,8 @@
     span.className = "medic-chip";
     span.textContent = text;
     span.style.cssText =
-      "display:inline-block;background:" + PANEL + ";border:1px solid " + color + ";" +
-      "color:" + color + ";border-radius:8px;font:" + CHIP_FONT + ";" +
+      "display:inline-block;background:" + THEME.panel + ";border:1px solid " + color + ";" +
+      "color:" + color + ";border-radius:6px;font:" + CHIP_FONT + ";" +
       "padding:1px 6px;line-height:1.6;" + (extraStyle || "");
     return span;
   }
@@ -212,17 +216,17 @@
       container.className = "medic-chips";
       container.style.cssText = "display:block;margin-top:2px;";
 
-      var scoreColor = TIER_COLOR[row.tier] || TIER_COLOR.t3;
+      var scoreColor = THEME[row.tier] || THEME.t3;
       var line1 = document.createElement("span");
       line1.style.cssText = "display:inline-flex;gap:4px;align-items:center;flex-wrap:wrap;";
       line1.appendChild(makeChip(Math.round(row.score) + "h", scoreColor));
-      if (row.isNew) line1.appendChild(makeChip("NEW", AMBER));
+      if (row.isNew) line1.appendChild(makeChip("NEW", THEME.green));
       container.appendChild(line1);
 
       if (row.famLabels && row.famLabels.length) {
         var famChip = makeChip(
           row.famLabels.join(" · "),
-          PURPLE,
+          THEME.purple,
           "white-space:normal;max-width:100%;margin-top:2px;"
         );
         container.appendChild(famChip);
@@ -254,7 +258,7 @@
       var rejContainer = document.createElement("span");
       rejContainer.className = "medic-chips";
       rejContainer.style.cssText = "display:inline-block;margin-left:4px;vertical-align:middle;";
-      rejContainer.appendChild(makeChip(rej.chipLabel, TIER_COLOR.t3));
+      rejContainer.appendChild(makeChip(rej.chipLabel, THEME.rejectBorder, "color:" + THEME.rejectInk + ";"));
       rejAnchor.insertAdjacentElement("afterend", rejContainer);
     }
   }
@@ -276,7 +280,7 @@
     var prevTransition = anchor.style.transition;
 
     anchor.style.transition = "outline-color .2s ease, background-color .2s ease";
-    anchor.style.outline = "2px solid " + AMBER;
+    anchor.style.outline = "2px solid " + THEME.amber;
     anchor.style.backgroundColor = "rgba(255,180,40,.25)";
 
     setTimeout(function () {

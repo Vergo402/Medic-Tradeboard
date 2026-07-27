@@ -9,10 +9,9 @@
  * color palette used consistently across the project, plus the FAM purple
  * (#b48cff).
  *
- * No external network references anywhere in this file (MV3 CSP: no external
- * fonts or CDN of any kind) -- font stacks below are local-fallback only, and
- * the @font-face block that would load packaged woff2 files is commented out
- * until assets/fonts/*.woff2 actually exist.
+ * No external network references anywhere in this file (MV3 CSP: no Google
+ * Fonts CDN, no CDN of any kind) -- packaged woff2 files are registered at
+ * document level by ui/drawer.js injectFontFaces() (see comment below).
  */
 
 :host {
@@ -29,6 +28,17 @@
   --dim: #8b98ab;
   --font-head: "Barlow Condensed", "Arial Narrow", "Avenir Next Condensed", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --t1: #3fd68f;
+  --t2: #ffb428;
+  --t3: #4a5567;
+  --on-amber: #1a1204;
+  --on-blue: #06121f;
+  --pill-day-bg: #2a3547;
+  --pill-day-ink: #ffd98a;
+  --pill-night-bg: #122036;
+  --pill-night-ink: #5aa9ff;
+  --pill-new-bg: #1d3a2b;
+  --pill-new-ink: #3fd68f;
 
   position: fixed;
   top: 0;
@@ -38,32 +48,11 @@
 }
 
 /*
- * Ready to enable once assets/fonts/*.woff2 land (both files are
- * already declared under web_accessible_resources in manifest.json as
- * "assets/fonts/*"). Paths are relative to this stylesheet's own URL
- * (ui/drawer.css), which the browser resolves correctly without
- * needing chrome.runtime.getURL() from inside CSS (impossible -- CSS can't
- * call JS). Until these files exist, the font-family stacks above fall
- * back to system fonts.
- *
- * @font-face {
- *   font-family: "Barlow Condensed";
- *   src: url("../assets/fonts/barlow-condensed-500.woff2") format("woff2");
- *   font-weight: 500;
- *   font-display: swap;
- * }
- * @font-face {
- *   font-family: "Barlow Condensed";
- *   src: url("../assets/fonts/barlow-condensed-700.woff2") format("woff2");
- *   font-weight: 700;
- *   font-display: swap;
- * }
- * @font-face {
- *   font-family: "IBM Plex Mono";
- *   src: url("../assets/fonts/ibm-plex-mono-400.woff2") format("woff2");
- *   font-weight: 400;
- *   font-display: swap;
- * }
+ * Packaged fonts (extension/assets/fonts/*.woff2, OFL-licensed) are NOT
+ * declared here: Chrome ignores @font-face rules inside shadow-tree
+ * stylesheets (crbug 336876 lineage). ui/drawer.js injectFontFaces()
+ * registers them at document level instead, which shadow content resolves
+ * against; the stacks below then pick them up by family name.
  */
 
 * {
@@ -87,15 +76,16 @@
 .header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   flex: 0 0 auto;
 }
 
 .header-title {
+  flex: 1 1 auto;
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 15px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
@@ -103,6 +93,43 @@
 
 .header-title .accent {
   color: var(--amber);
+}
+
+.settings-btn {
+  font-family: var(--font-head);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings-btn:hover {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+/* Nothing is set to block: pull the eye to settings so the fix is one click
+   away. Persistent amber emphasis, ported from the old .gear-attention pulse
+   (kept as a gentle opacity pulse, disabled for reduced-motion users). */
+.settings-attention {
+  color: var(--amber);
+  border-color: var(--amber);
+  animation: settings-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes settings-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-attention { animation: none; }
 }
 
 .chevron {
@@ -134,7 +161,7 @@
 
 .edge-tab-label {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 12px;
   letter-spacing: 0.12em;
   color: var(--amber);
@@ -179,7 +206,7 @@
 
 .chip {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 10.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -197,7 +224,7 @@
 
 .chip-connect:hover {
   background: var(--amber);
-  color: #1a1204;
+  color: var(--on-amber);
 }
 
 /* ---------- 3. Since-last-visit banner ---------- */
@@ -219,7 +246,7 @@
      so the whole label still fits on one line instead of wrapping. */
   font-size: 8.5px;
   color: var(--dim);
-  font-weight: 600;
+  font-weight: 500;
   margin-bottom: 3px;
   white-space: nowrap;
 }
@@ -248,13 +275,14 @@
   border-top: 2px solid var(--line);
   padding: 6px 6px;
   text-align: center;
+  border-radius: 0 0 4px 4px;
 }
 
 .stat-tile b {
   display: block;
   font-family: var(--font-head);
   font-size: 16px;
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .stat-tile span {
@@ -299,9 +327,9 @@
 
 .filter-btn.active {
   background: var(--blue);
-  color: #06121f;
+  color: var(--on-blue);
   border-color: var(--blue);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 /* ---------- 6. Ranked rows ---------- */
@@ -316,7 +344,7 @@
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 8px 12px 8px 9px;
   border-top: 1px solid var(--line);
   cursor: pointer;
 }
@@ -330,13 +358,17 @@
 }
 
 .row-dim {
-  opacity: 0.6;
+  opacity: 0.65;
 }
+
+.row-t1 { border-left: 3px solid var(--t1); }
+.row-t2 { border-left: 3px solid var(--t2); }
+.row-t3 { border-left: 3px solid var(--t3); }
 
 .row-rank {
   flex: 0 0 auto;
   color: var(--amber);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 11px;
   padding-top: 1px;
 }
@@ -355,6 +387,13 @@
   color: var(--ink);
 }
 
+/* Day number -- UA default for <b> is 700, which Chrome would synthesize
+ * (only 400/500 woff2s ship); render it as a larger 500 instead. */
+.row-line1 b {
+  font-weight: 500;
+  font-size: 14px;
+}
+
 .row-line2 {
   font-size: 10.5px;
   color: var(--dim);
@@ -368,18 +407,26 @@
 .row-score {
   flex: 0 0 auto;
   font-family: var(--font-mono);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 14px;
   white-space: nowrap;
 }
 
+.score-t1 { color: var(--t1); }
+.score-t2 { color: var(--t2); }
+.score-t3 { color: var(--dim); }
+
 .pill {
   display: inline-block;
-  border-radius: 8px;
+  border-radius: 3px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   padding: 1px 6px;
 }
+
+.pill-day { background: var(--pill-day-bg); color: var(--pill-day-ink); }
+.pill-night { background: var(--pill-night-bg); color: var(--pill-night-ink); }
+.pill-new { background: var(--pill-new-bg); color: var(--pill-new-ink); }
 
 .empty-msg {
   text-align: center;
@@ -407,7 +454,7 @@
   letter-spacing: 0.06em;
   font-size: 11.5px;
   color: var(--dim);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .rejected-header:hover {
@@ -494,7 +541,7 @@
 
 .compose-count {
   color: var(--amber);
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .compose-clear {
@@ -516,11 +563,11 @@
 
 .compose-btn {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 12px;
   letter-spacing: 0.04em;
   background: var(--amber);
-  color: #1a1204;
+  color: var(--on-amber);
   border: 1px solid var(--amber);
   border-radius: 2px;
   padding: 4px 10px;
@@ -564,7 +611,7 @@
 
 .preview-title {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 12px;
   letter-spacing: 0.06em;
   color: var(--dim);
@@ -592,11 +639,11 @@
   padding: 8px 0;
   text-align: center;
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 12px;
   letter-spacing: 0.04em;
   background: var(--amber);
-  color: #1a1204;
+  color: var(--on-amber);
   border: 1px solid var(--amber);
   border-radius: 2px;
   cursor: pointer;
@@ -625,39 +672,11 @@
   padding: 0 12px 12px;
 }
 
-/* ---------- 10. Calendar-setup gear + de-confidence state ---------- */
+/* ---------- 10. Calendar-setup de-confidence state ---------- */
 
-/* Gear ported verbatim from the reverted per-calendar-role commit (49dee18);
-   only the amber-attention modifier below is new. */
-.gear-btn {
-  background: transparent;
-  border: 0;
-  color: var(--dim);
-  cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
-  padding: 0 2px;
-}
-
-.gear-btn:hover {
-  color: var(--ink);
-}
-
-/* Nothing is set to block: pull the eye to the gear so the fix is one click
-   away. A gentle opacity pulse, disabled for reduced-motion users. */
-.gear-attention {
-  color: var(--amber);
-  animation: gear-pulse 2.2s ease-in-out infinite;
-}
-
-@keyframes gear-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .gear-attention { animation: none; }
-}
+/* The settings button + its attention state now live in the header (see
+   .settings-btn / .settings-attention above); this section only covers the
+   de-confidence banners below it. */
 
 .deconf-banner {
   margin: 8px 12px 0;
@@ -670,7 +689,7 @@
 
 .deconf-head {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 12px;
@@ -687,7 +706,7 @@
 
 .deconf-cta {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 11.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -729,7 +748,7 @@
 
 .stale-head {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 12px;
@@ -746,12 +765,12 @@
 
 .stale-cta {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 11.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   background: var(--amber);
-  color: #1a1204;
+  color: var(--on-amber);
   border: 1px solid var(--amber);
   border-radius: 2px;
   padding: 6px 12px;
@@ -785,7 +804,7 @@
 
 .newevents-head {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 12px;
@@ -802,12 +821,12 @@
 
 .newevents-cta {
   font-family: var(--font-head);
-  font-weight: 700;
+  font-weight: 500;
   font-size: 11.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   background: var(--blue);
-  color: #06121f;
+  color: var(--on-blue);
   border: 1px solid var(--blue);
   border-radius: 2px;
   padding: 6px 12px;
