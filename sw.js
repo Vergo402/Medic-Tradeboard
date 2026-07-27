@@ -1837,23 +1837,27 @@ async function handleListFeedTitles(msg) {
       isNew: newSet.has(normalizeTitleWhitespace(t.title).trim()),
     }));
 
-    // Mark reviewed: this feed's baseline becomes the set the user is looking
-    // at right now, and any pending nudge for it is cleared.
+    // Mark reviewed: GROW this feed's baseline, never shrink it. The seen set is
+    // the UNION of three things — the prior baseline, everything the picker just
+    // showed, and everything pending — deduped by the same normalized identity
+    // newTitlesForFeed compares on.
     //
-    // The baseline UNIONS the pending flagged titles rather than being just the
-    // visible ones, because the two windows genuinely differ: refreshCalendarData
-    // flags against the SCORING window (four months out, see boot.js) while this
-    // picker samples titleSampleWindow (30 back / 60 forward). A title whose only
-    // instance lands past day 60 is therefore flaggable but un-listable — so a
-    // baseline of only what's on screen would never contain it, and the next
-    // refresh would flag it again. That is a banner the user cannot dismiss by
-    // doing exactly what it asks. Opening the picker means "I have reviewed this
-    // feed", so everything outstanding for it is absorbed.
+    // The prior baseline is the load-bearing part. The two windows genuinely
+    // differ: refreshCalendarData flags against the SCORING window (four months
+    // out, see boot.js) while this picker samples titleSampleWindow (30 back / 60
+    // forward, and the options page sends no window of its own). A title whose
+    // only instance lands past day 60 is in the scoring set but NOT on screen
+    // here — so rebuilding the baseline from just the visible titles would drop
+    // it every review, and the next refresh would re-flag it as "new". That is
+    // the exact false-positive nag this union prevents: reviewing a feed can
+    // only ADD to what is known, so a title once seen is never forgotten.
+    // (pending is folded in for the same reason from the flagged side.)
     const pendingRaw = (stored[NEW_TITLES_KEY] || {})[feedId];
     const pending = pendingRaw && Array.isArray(pendingRaw.titles) ? pendingRaw.titles : [];
-    const seenNorm = new Set(currentTitleStrings.map((t) => normalizeTitleWhitespace(t).trim()));
-    const nextSeen = [...currentTitleStrings];
-    for (const t of pending) {
+    const priorSeen = Array.isArray(seenMap[feedId]) ? seenMap[feedId] : [];
+    const seenNorm = new Set();
+    const nextSeen = [];
+    for (const t of [...priorSeen, ...currentTitleStrings, ...pending]) {
       if (typeof t !== "string") continue;
       const norm = normalizeTitleWhitespace(t).trim();
       if (norm === "" || seenNorm.has(norm)) continue;
