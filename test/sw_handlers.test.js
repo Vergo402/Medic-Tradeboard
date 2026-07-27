@@ -36,6 +36,9 @@ function reset() {
   FETCH_LOG = [];
   FEED_STATUS_QUEUE = {};
   SLEEP_LOG = [];
+  // The fetch de-dup cache is module-scope in sw.js and would otherwise carry a
+  // recent feed body from one test into the next (they reuse feed ids/urls).
+  if (typeof sw !== "undefined" && sw._resetFeedFetchCacheForTests) sw._resetFeedFetchCacheForTests();
 }
 
 // chrome.storage.local.get accepts a string, an array of keys, or an object of
@@ -335,6 +338,81 @@ test("getCalendarData: an unforced refresh whose cache does NOT cover the window
   const resp = await send({ type: "getCalendarData", mode: "refresh", ...WINDOW });
   assert.equal(resp.ok, true);
   assert.equal(eventsFetchedFor("feed-fd").length, 1, "a non-covering cache is not reusable, fresh or not");
+});
+
+// ---------------------------------------------------------------------------
+// Fetch de-duplication. Within FEED_FETCH_DEDUP_MS (60s) every fetch of a feed —
+// a page-load refresh, a Resync, the options picker — collapses to ONE network
+// request, so the extension can't burst a Cloudflare-fronted feed into a 429.
+// feedNow is stubbed so the 60s window is exercised without waiting.
+// ---------------------------------------------------------------------------
+
+test("listFeedTitles right after a refresh reuses the fetched feed, no second request", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "RULE" }]);
+  STORE.calBlockTitles = { "feed-fd": ["Night Tour"] };
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    // The page-load refresh fetches the feed once...
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 1);
+
+    // ...and opening the picker 3s later (the exact review-flow burst) must NOT
+    // hit the network again — it rides the 3s-old fetch.
+    clock += 3000;
+    const titles = await send({ type: "listFeedTitles", feedId: "feed-fd", ...WINDOW });
+    assert.equal(titles.ok, true);
+    assert.equal(eventsFetchedFor("feed-fd").length, 1, "the picker reused the recent fetch — no burst");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
+});
+
+test("a fetch past the de-dup window does hit the network again", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 1);
+
+    clock += 61_000; // just past the 60s window
+    await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(eventsFetchedFor("feed-fd").length, 2, "past the window, a fetch is a real request again");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
+});
+
+test("a failed fetch is NOT cached — the next attempt tries the network at once", async () => {
+  reset();
+  setFeeds([{ id: "feed-fd", name: "Crew Schedule", role: "REJECT" }]);
+  EVENTS["feed-fd"] = [timed("Night Tour", "15")];
+  // Persistent 429 on the first refresh: exhausts retries, throws, caches nothing.
+  FEED_STATUS_QUEUE["feed-fd"] = [{ status: 429 }, { status: 429 }, { status: 429 }];
+
+  let clock = 1_000_000;
+  sw._setFeedNowForTests(() => clock);
+  try {
+    const first = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(first.ok, false, "no cache, persistent 429 → hard failure");
+    const afterFirst = eventsFetchedFor("feed-fd").length;
+
+    // 1s later (well inside the window) a retry must still reach the network —
+    // a failure is never cached, or a feed could never recover without waiting.
+    clock += 1000;
+    const second = await send({ type: "getCalendarData", mode: "refresh", force: true, ...WINDOW });
+    assert.equal(second.ok, true, "the queue is drained, so now it succeeds");
+    assert.ok(eventsFetchedFor("feed-fd").length > afterFirst, "the failed fetch was not cached");
+  } finally {
+    sw._setFeedNowForTests(() => Date.now());
+  }
 });
 
 test("getCalendarData: a 429 then a 200 succeeds — the retry rides out a rate limit", async () => {

@@ -1061,6 +1061,28 @@ function feedRetryWaitMs(resp, attempt) {
   return FEED_RETRY_BACKOFF_MS[Math.min(attempt, FEED_RETRY_BACKOFF_MS.length - 1)];
 }
 
+// De-duplicate feed fetches to stay under a burst rate-limit. A real feed host
+// (HFD's, Cloudflare-fronted) 429s several requests in quick succession and
+// sends no Retry-After — and the extension's own review flow invites exactly
+// that burst: a page-load refresh fetches the feed, then the drawer's new-events
+// banner sends the user to the options picker, which fetches the SAME feed
+// seconds later. So every fetch of a URL within FEED_FETCH_DEDUP_MS collapses to
+// ONE network request: a recent success is replayed, and a fetch already in
+// flight is shared by later callers. In-memory is enough — the burst window is
+// short enough that the (ephemeral MV3) worker stays alive across it, and two
+// requests far enough apart to lose this cache are not a burst. Resync/config
+// changes ride it too: ≤60s-old feed bytes are current, and re-fetching them is
+// the exact thing that earns the 429.
+const FEED_FETCH_DEDUP_MS = 60 * 1000;
+const feedTextCache = new Map(); // url -> { at:number, text:string } — a recent success
+const feedTextInflight = new Map(); // url -> Promise<string> — a fetch currently running
+
+// Test seams: a clock for the dedup window and a reset, so the maps don't leak
+// between tests. Mirrors feedSleep's convention.
+let feedNow = () => Date.now();
+export function _setFeedNowForTests(fn) { feedNow = fn; }
+export function _resetFeedFetchCacheForTests() { feedTextCache.clear(); feedTextInflight.clear(); }
+
 async function fetchFeedText(feed) {
   if (feed.kind === "file") {
     if (typeof feed.content !== "string" || feed.content.trim() === "") {
@@ -1070,6 +1092,27 @@ async function fetchFeedText(feed) {
   }
   const url = normalizeFeedUrl(feed.url);
   if (!url) throw taggedError("feed_bad_url", "not a usable https feed URL");
+
+  const cached = feedTextCache.get(url);
+  if (cached && feedNow() - cached.at < FEED_FETCH_DEDUP_MS) return cached.text;
+  const inflight = feedTextInflight.get(url);
+  if (inflight) return inflight; // a concurrent caller already has this feed in flight
+
+  const running = fetchFeedTextLive(url);
+  feedTextInflight.set(url, running);
+  try {
+    const text = await running;
+    feedTextCache.set(url, { at: feedNow(), text }); // cache successes only — a failure must be retryable at once
+    return text;
+  } finally {
+    feedTextInflight.delete(url);
+  }
+}
+
+// The actual network read for one URL, with the 429/503/blip retry. Split out so
+// fetchFeedText can wrap it with the dedup cache above without the retry loop
+// having to know about caching.
+async function fetchFeedTextLive(url) {
   // attempt 0 is the first try; attempts 1..N are retries, N = backoff length.
   for (let attempt = 0; ; attempt++) {
     let resp;

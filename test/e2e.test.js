@@ -56,7 +56,7 @@ globalThis.fetch = async (url) => {
   return { ok: true, status: 200, text: async () => FEED_TEXT[id] };
 };
 
-await import("../sw.js");
+const sw = await import("../sw.js");
 const onMessage = listeners[0];
 const send = (msg) => new Promise((resolve) => onMessage(msg, {}, resolve));
 
@@ -86,6 +86,9 @@ function ics(events) {
 function reset() {
   STORE = {};
   FEED_TEXT = {};
+  // sw.js's fetch de-dup cache is module-scope; these tests reuse the same feed
+  // ids/urls with different bodies, so a prior test's body must not be replayed.
+  if (sw._resetFeedFetchCacheForTests) sw._resetFeedFetchCacheForTests();
 }
 
 /** Configure one feed exactly as the options page would. */
