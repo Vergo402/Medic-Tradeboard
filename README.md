@@ -21,8 +21,11 @@ See [`PRIVACY.md`](PRIVACY.md) for the full data-handling policy.
 On a supported tradeboard page, the extension:
 
 1. Reads the posted shifts directly from the page DOM.
-2. Fetches the calendar feeds you added (cached locally, refreshed
-   periodically).
+2. Fetches the calendar feeds you added and caches them locally. There is no
+   background timer: a feed is read when you open the tradeboard, when you
+   change a feed's settings, or when you click **Resync** — and a page load
+   reuses a recent cache rather than re-fetching, so a feed host is never
+   polled more than it needs to be.
 3. Scores each open shift: does it overlap something you're already
    committed to? Is it too close to another commitment to leave a realistic
    gap to work it?
@@ -32,6 +35,12 @@ On a supported tradeboard page, the extension:
    check off (date-sorted lines like `* Th Jul 23, D 7am-7pm`). There's no
    `sms:` link and no recipient — it's copy-to-clipboard only, so nothing is
    ever auto-sent.
+
+If a feed fails to refresh, the drawer never silently pretends every shift is
+free. It keeps scoring against the last good sync and shows an amber "showing
+last sync" banner with a **Resync** button; only when there is no usable cached
+data at all does it stop scoring and say so in red. A feed that answers with a
+rate-limit is retried with backoff rather than treated as broken.
 
 Shifts are classified Day when their start time falls in `[07:00, 19:00)` and
 Night otherwise; that split drives the drawer's pills, filters, and the
@@ -50,18 +59,23 @@ every feed you add plays one of four roles:
 | **OFF** | Never fetched. The extension ignores it completely. |
 | **FLAG** | Soft signal only. Events on this calendar annotate a shift (e.g. "you also have X that day") but never block it. |
 | **REJECT** | Hard commitment. Any shift overlapping an event here is rejected outright. |
-| **RULE** | A pattern you supply splits this calendar's events between REJECT and FLAG — for example, "events starting with 'On-Duty' are hard commitments; everything else on this calendar is just a flag." |
+| **RULE** ("only some events") | You hand-pick, per event title, what each one means: **Block** (a hard commitment), **Note** (a soft flag), or **Ignore**. Everything you don't mark is ignored, so the calendar stays quiet by default. |
 
-Today, the options page exposes the RULE role's split as two pattern fields —
-an include regex and a comma-separated exclude list — plus the label shown on
-a rejected shift ("Commitment" by default; set it to whatever you call the
-thing that blocks you). A full per-calendar picker in the UI is planned; the
-role concept above is the target design and the mental model to use when
-configuring what's there now.
+For a RULE feed, the options page shows a **title picker**: every event title on
+that calendar, grouped into **Recurring** and **One-time** sections and sorted
+alphabetically, each with a Block / Note / Ignore control and an optional "show
+as" label. When a sync surfaces a title you have never reviewed, the drawer
+raises a "new calendar events" nudge and the picker highlights it with a **NEW**
+badge, so a new kind of commitment can't be silently scored as free. The picker
+only lists titles with an upcoming instance, so stale one-off events from the
+past don't clutter it.
 
-The include pattern can never be left blank: an empty regex matches every
-event title, which would turn a RULE calendar into a blanket block on every
-shift, so a blank value is reset to the default at both save and read time.
+An advanced regex hatch (an include pattern plus a comma-separated exclude list)
+is still available for a RULE feed that has nothing ticked, but the picker is the
+primary, recommended way to configure one. That legacy include pattern can never
+be left blank — an empty regex matches every event title, which would turn a
+RULE calendar into a blanket block on every shift, so a blank value is reset to
+the default at both save and read time.
 
 ## Install (from source)
 
