@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Medic Tradeboard — store shot</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 1280px; height: 800px; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { background: #eef1f4; }
+  .hero { position: absolute; left: 0; top: 0; width: 940px; height: 800px;
+    display: flex; flex-direction: column; justify-content: center; padding: 0 80px; box-sizing: border-box; }
+  .kicker { color: #2E9E5B; font-size: 15px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; margin: 0 0 18px; }
+  h1 { color: #16191d; font-size: 46px; line-height: 1.12; font-weight: 600; margin: 0 0 22px; letter-spacing: -0.01em; }
+  p { color: #5b6472; font-size: 20px; line-height: 1.55; margin: 0; max-width: 640px; }
+  .marks { display: flex; gap: 26px; margin-top: 40px; }
+  .mark { display: flex; align-items: center; gap: 10px; color: #16191d; font-size: 16px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+</style>
+<div class="hero">
+  <p class="kicker">Medic Tradeboard</p>
+  <h1>See which open shifts<br>you're actually free to take.</h1>
+  <p>Every posted shift on your WhenToWork tradeboard, scored against your own
+     read-only calendars — ranked, with conflicts filtered out.</p>
+  <div class="marks">
+    <span class="mark"><span class="dot" style="background:#2E9E5B"></span>Read-only, no sign-in</span>
+    <span class="mark"><span class="dot" style="background:#F5A623"></span>Ranked by real hours</span>
+    <span class="mark"><span class="dot" style="background:#1F6FB2"></span>Nothing auto-sent</span>
+  </div>
+</div>
+
+<script>
+  window.chrome = { runtime: { getURL: (p) => new URL("/" + p, location.href).href } };
+</script>
+<script type="module">
+  import { initDrawer } from "/ui/drawer.js";
+
+  const rows = [
+    { rank: 1, w2w_id: "a", date: "2026-07-23", dateLabel: "Thu Jul 23", tour: "Day",
+      start: "07:00", end: "19:00", pos: "Medic 9", locLine: "Northgate", famLabels: [], isNew: false, score: 52, tier: "t1" },
+    { rank: 2, w2w_id: "b", date: "2026-07-25", dateLabel: "Sat Jul 25", tour: "Night",
+      start: "19:00", end: "07:00", pos: "Medic 1", locLine: "Lakeview", famLabels: [], isNew: false, score: 31, tier: "t2" },
+    { rank: 3, w2w_id: "c", date: "2026-07-27", dateLabel: "Mon Jul 27", tour: "Night",
+      start: "23:00", end: "06:00", pos: "Medic 9", locLine: "Northgate", famLabels: [], isNew: false, score: 27, tier: "t2" },
+    { rank: 4, w2w_id: "d", date: "2026-07-28", dateLabel: "Tue Jul 28", tour: "Day",
+      start: "07:30", end: "13:30", pos: "Medic 1", locLine: "Northgate", famLabels: [], isNew: true, score: 26, tier: "t2" },
+    { rank: 5, w2w_id: "e", date: "2026-07-29", dateLabel: "Wed Jul 29", tour: "Night",
+      start: "00:00", end: "06:00", pos: "Medic 9", locLine: "Lakeview", famLabels: [], isNew: false, score: 24, tier: "t3" },
+  ];
+  const rejects = [
+    { w2w_id: "f", date: "2026-07-24", start: "07:00", end: "19:00", dateLabel: "Fri Jul 24",
+      tour: "Day", pos: "Medic 1", locLine: "Lakeview", reason: "overlaps a commitment" },
+    { w2w_id: "g", date: "2026-07-30", start: "19:00", end: "07:00", dateLabel: "Thu Jul 30",
+      tour: "Night", pos: "Medic 9", locLine: "Northgate", reason: "no full open tour in the gap" },
+  ];
+
+  const controller = initDrawer({ onRowClick() {}, onOpenSetup() {}, onResync() {} });
+  controller.update({
+    monthLabel: "JUL 2026", calAgeMs: 2 * 60 * 1000, calError: null, calStale: false,
+    hasCalData: true, newCalendarTitles: null, myschedStatus: "ok", banner: null,
+    stats: { elig: rows.length, rej: rejects.length, best: 52, topCount: 1 },
+    rows, rejects, anyCalendarBlocks: true,
+  });
+</script>
