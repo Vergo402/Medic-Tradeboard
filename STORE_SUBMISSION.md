@@ -1,5 +1,9 @@
 # Chrome Web Store — submission kit
 
+> **Status: published.** Live since 2026-07-27 (v0.1.0), unlisted:
+> <https://chromewebstore.google.com/detail/medic-tradeboard/mpjjpccpmfmjfjpcgfmniijnhilpdigm>
+> The checklist below is kept as the record of what was submitted.
+
 Everything to paste into the Web Store developer dashboard for **Medic Tradeboard**.
 Target visibility: **Unlisted** (link-only). This file is a dev doc — the packaging
 script excludes all `*.md`, so it is never shipped in the extension.
